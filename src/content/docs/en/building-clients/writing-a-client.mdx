@@ -1,0 +1,333 @@
+---
+title: 'Writing a Client'
+description: 'Connect to a server over stdio or Streamable HTTP with the TypeScript and Python SDKs, list and call tools, read resources, test in-process, and answer elicitation requests.'
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## A client is a connection plus typed calls
+
+Both official SDKs give you the same shape: construct a client with a name and version, pick a transport, connect, and then call methods that map one-to-one onto protocol requests (`tools/list`, `tools/call`, `resources/read`, `prompts/get`). The SDK fills in `_meta` — protocol version, your declared capabilities, your identity — on every request.
+
+<Mermaid title="What one client does" code={clientDiagram} />
+
+export const clientDiagram = `sequenceDiagram
+  participant H as Host code
+  participant C as Client (SDK)
+  participant S as Server
+  H->>C: connect(transport)
+  C->>S: server/discover
+  S-->>C: supportedVersions, capabilities
+  H->>C: listTools()
+  C->>S: tools/list (+ _meta)
+  S-->>C: tools[], ttlMs
+  H->>C: callTool(name, args)
+  C->>S: tools/call (+ _meta)
+  S-->>C: content[], isError`;
+
+## Install
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```bash
+    npm install @modelcontextprotocol/client
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```bash
+    uv add mcp
+    ```
+  </TabItem>
+</Tabs>
+
+## Connecting over stdio
+
+For a local server the client launches the process itself and talks over its standard streams.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Client } from '@modelcontextprotocol/client';
+    import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+
+    const client = new Client({ name: 'my-first-client', version: '1.0.0' });
+
+    const transport = new StdioClientTransport({
+      command: 'npx',
+      args: ['tsx', 'src/index.ts'],
+    });
+
+    await client.connect(transport);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+    from mcp.client.stdio import stdio_client
+
+    async def main() -> None:
+        transport = stdio_client(command="uv", args=["run", "server.py"])
+        async with Client(transport) as client:
+            result = await client.list_tools()
+            print([t.name for t in result.tools])
+    ```
+  </TabItem>
+</Tabs>
+
+The client owns the subprocess: it closes the server's stdin on shutdown and restarts the process if it exits unexpectedly (in-flight requests are simply retried, because the protocol is stateless).
+
+## Connecting over Streamable HTTP
+
+For a remote server you give the client the MCP endpoint URL. Each request becomes its own HTTP POST with the required headers; the SDK handles JSON versus SSE responses for you.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+
+    const client = new Client({ name: 'my-client', version: '1.0.0' });
+    const transport = new StreamableHTTPClientTransport(new URL('http://localhost:3000/mcp'));
+
+    await client.connect(transport);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+
+    async def main() -> None:
+        # A URL string is shorthand for the Streamable HTTP transport.
+        async with Client("http://127.0.0.1:8000/mcp") as client:
+            result = await client.list_tools()
+            print([t.name for t in result.tools])
+    ```
+  </TabItem>
+</Tabs>
+
+If the server needs a bearer token, give the transport a provider that returns the current token (TypeScript `authProvider: { token: async () => ... }`; Python passes an `httpx2.AsyncClient(auth=...)` into `streamable_http_client(url, http_client=...)`). The full OAuth flow is covered in the [security module](/mcp/en/security-and-auth/).
+
+## Listing and calling tools
+
+`listTools` returns the tool definitions exactly as the server describes them: `name`, optional `title`, `description`, `inputSchema`, optional `outputSchema` and `annotations`. `callTool` sends the arguments and returns the result.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const { tools } = await client.listTools();
+    for (const tool of tools) console.log(tool.name, tool.description);
+
+    const result = await client.callTool({
+      name: 'calculate-bmi',
+      arguments: { weightKg: 70, heightM: 1.75 },
+    });
+
+    // Tool-level errors are returned in the result, not thrown
+    if (result.isError) {
+      console.error('Tool error:', result.content);
+      return;
+    }
+    console.log(result.content);           // content blocks
+    console.log(result.structuredContent); // present if the tool has an outputSchema
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.types import TextContent
+
+    result = await client.call_tool("lookup_book", {"title": "Dune"})
+
+    for block in result.content:
+        if isinstance(block, TextContent):
+            print(block.text)
+
+    print(result.structured_content)
+    print(result.is_error)
+    ```
+  </TabItem>
+</Tabs>
+
+The distinction between the two error channels is a design decision you must respect in a host:
+
+- **Protocol errors** (unknown tool, malformed request) come back as JSON-RPC errors. The SDK raises them. The model is unlikely to fix these; log them and tell the user.
+- **Tool execution errors** ("date must be in the future") come back as a normal result with `isError: true`. Do not throw them away — feed the text back to the model so it can correct itself and retry.
+
+## Reading resources and getting prompts
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const { resources } = await client.listResources();
+    const read = await client.readResource({ uri: 'file:///project/README.md' });
+    for (const c of read.contents) {
+      if ('text' in c) console.log(c.text);
+    }
+
+    const prompt = await client.getPrompt({
+      name: 'review-code',
+      arguments: { language: 'typescript' },
+    });
+    console.log(prompt.messages);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    listing = await client.list_resources()
+    read = await client.read_resource("file:///project/README.md")
+    for c in read.contents:
+        if hasattr(c, "text"):
+            print(c.text)
+
+    prompt = await client.get_prompt("review_code", {"language": "python"})
+    print(prompt.messages)
+    ```
+  </TabItem>
+</Tabs>
+
+Remember the interaction models from the [server primitives module](/mcp/en/server-primitives/): tools are for the model to call, resources are for the application to attach as context, prompts are for the user to pick. A client exposes all three; the host decides how each surfaces in the UI.
+
+## Testing in-process
+
+You do not need a network or a subprocess to test a server. Both SDKs let a client talk to a server object directly, which makes unit tests fast and deterministic.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+
+    const handler = createMcpHandler(() => {
+      const server = new McpServer({ name: 'pricing', version: '1.0.0' });
+      // ...registerTool(...)
+      return server;
+    });
+
+    // Route the transport's fetch straight into the handler — no port opened.
+    const transport = new StreamableHTTPClientTransport(new URL('http://test.local/mcp'), {
+      fetch: (url, init) => handler.fetch(new Request(url, init)),
+    });
+
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await client.connect(transport);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("Bookshop")
+
+    @mcp.tool()
+    def search_books(query: str, limit: int = 10) -> str:
+        """Search the catalog by title or author."""
+        return f"Found 3 books matching {query!r}."
+
+    async def test_search() -> None:
+        # Pass the server object itself: in-memory transport.
+        async with Client(mcp) as client:
+            result = await client.call_tool("search_books", {"query": "dune"})
+            assert not result.is_error
+    ```
+  </TabItem>
+</Tabs>
+
+## Answering server input requests (MRTR)
+
+Under the 2026-07-28 protocol a server never sends its own requests to the client. When a tool needs user input it returns an `InputRequiredResult`; the SDK client resolves the embedded `elicitation/create` request through a handler you register, then retries the original call with `inputResponses` and the opaque `requestState`. See the [client interaction module](/mcp/en/client-interaction/) for the wire details.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    client.setRequestHandler('elicitation/create', async (request) => {
+      if (request.params.mode === 'url') {
+        // Show the full URL, get consent, open it in the system browser.
+        return { action: 'accept' };
+      }
+      // Render request.params.requestedSchema as a form; return what the user entered.
+      return { action: 'accept', content: { city: 'Lisbon' } };
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+    from mcp.client import ClientRequestContext
+    from mcp.types import ElicitRequestParams, ElicitResult
+
+    async def handle_elicitation(context: ClientRequestContext, params: ElicitRequestParams) -> ElicitResult:
+        # Present params.message and params.requested_schema to the user.
+        return ElicitResult(action="accept", content={"region": "eu-west-1"})
+
+    async def main() -> None:
+        async with Client("http://127.0.0.1:8000/mcp", elicitation_callback=handle_elicitation) as client:
+            result = await client.call_tool("provision", {"name": "orders"})
+            print(result.content)
+    ```
+  </TabItem>
+</Tabs>
+
+Declaring the handler is also what makes the SDK advertise `elicitation` in `clientCapabilities` on each request. A server must not send an input request for a capability you did not declare.
+
+## Design notes
+
+- **Keep the client thin.** Routing, namespacing, consent, and caching are host concerns. If your client class grows a "which server?" branch, you have put host logic in the wrong layer.
+- **Treat every result as untrusted input.** Tool text, resource contents, and annotations come from the server. Validate before showing to a user or feeding to a model.
+- **Set timeouts.** A `tools/call` can hang. Bound it, and surface a clear error rather than freezing the conversation.
+- **Cache the discovery result.** `server/discover` and `tools/list` carry `ttlMs`; reuse them until they expire or a `list_changed` notification arrives.
+
+<Callout title="The one-line takeaway">
+A client is `connect` plus a handful of typed calls: list tools, call tools, read resources, get prompts. Tool errors come back as `isError` results (feed them to the model), protocol errors are thrown (log them), and elicitation is answered by a handler you register before connecting.
+</Callout>
+
+export const quizClient = [
+  {
+    q: 'How does the TypeScript client report a tool execution error such as "invalid date"?',
+    options: [
+      'It throws an exception',
+      'It returns a result with isError: true and the error text in content',
+      'It returns null',
+      'It closes the transport',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which transport does a Python Client use when you pass it a plain URL string?',
+    options: [
+      'stdio',
+      'The deprecated HTTP+SSE transport',
+      'Streamable HTTP',
+      'WebSocket',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What is the point of passing the MCPServer object directly to Client(mcp) in Python?',
+    options: [
+      'It enables OAuth',
+      'It runs the server in-process for fast, deterministic tests with no subprocess or port',
+      'It makes the server stateful',
+      'It disables elicitation',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Under the 2026-07-28 protocol, how does a server obtain user input during a tool call?',
+    options: [
+      'It sends its own JSON-RPC request to the client on an SSE stream',
+      'It returns an InputRequiredResult and the client retries the original call with inputResponses',
+      'It opens a WebSocket back to the client',
+      'It cannot; only clients can ask questions',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/writing-a-client" questions={quizClient} />
+
+<ProgressTracker client:visible id="building-clients/writing-a-client" />

@@ -1,0 +1,304 @@
+---
+title: 'Tools'
+description: 'นิยามของ tool, กฎการตั้งชื่อ, tools/list และ tools/call บน wire, content type ของผลลัพธ์ และ error สองช่องทาง — พร้อม tool ตัวเดียวกันใน TypeScript และ Python'
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## action ที่ model อาจลงมือทำ
+
+**tool** คือ function ที่ language model ตัดสินใจเรียกได้เอง server อธิบายมันด้วยชื่อ, description และ JSON Schema ของ input; host ส่ง description นั้นให้ model; model ออกคำสั่งเรียก; host ส่งต่อเป็น `tools/call` แล้วป้อนผลลัพธ์กลับเข้าบทสนทนา
+
+<Mermaid title="ค้นพบ เลือก แล้วเรียก" code={toolFlow} />
+
+export const toolFlow = `sequenceDiagram
+  participant M as LLM
+  participant C as Client / Host
+  participant S as Server
+  C->>S: tools/list
+  S-->>C: tool definitions (ttlMs, cacheScope)
+  C->>M: definitions กลายเป็น tool list ของ model
+  M->>C: call search_catalog(query: "mug")
+  C->>S: tools/call name=search_catalog
+  S-->>C: content[] (+ structuredContent)
+  C->>M: ผลลัพธ์ถูกส่งกลับเป็น context`;
+
+เพราะคนเลือกคือ *model* description และ schema จึงไม่ใช่เอกสารประกอบ — มันคือ interface ตัวจริง description ที่คลุมเครือหรือ schema ที่หลวมจะทำให้เรียกผิด ออกแบบมันให้รอบคอบเท่ากับ public API
+
+## นิยามของ tool
+
+```json
+{
+  "name": "search_catalog",
+  "title": "Search the product catalog",
+  "description": "Find products by a case-insensitive substring of their name. Returns at most `limit` matches (default 10, max 50).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string", "description": "Substring to match against product names" },
+      "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+    },
+    "required": ["query"]
+  }
+}
+```
+
+| Field | จำเป็น | หน้าที่ |
+|-------|----------|---------|
+| `name` | ใช่ | ตัวระบุที่ไม่ซ้ำภายใน server นี้ เป็นชื่อที่ model ใช้เรียก |
+| `title` | ไม่ | ป้ายชื่อที่คนอ่านได้สำหรับ UI |
+| `description` | ไม่ (แต่ควรเขียนเสมอ) | ทำอะไร, ใช้เมื่อไร, คืนอะไรกลับมา |
+| `inputSchema` | ใช่ | JSON Schema (ค่าเริ่มต้นคือ 2020-12) สำหรับ `arguments`; ต้องเป็น schema object ที่ถูกต้อง ห้ามเป็น `null` |
+| `outputSchema` | ไม่ | schema ของ `structuredContent` — ดู[บทถัดไป](/mcp/th/server-primitives/structured-output-and-annotations/) |
+| `annotations` | ไม่ | behavior hint (`readOnlyHint`, `destructiveHint`, …) |
+| `icons` | ไม่ | ตัวระบุแบบภาพสำหรับ UI |
+
+tool ที่ **ไม่มี parameter** ก็ยังควรประกาศ schema รูปแบบที่แนะนำคือรับเฉพาะ object ว่าง:
+
+```json
+{ "name": "get_current_time", "inputSchema": { "type": "object", "additionalProperties": false } }
+```
+
+### กฎการตั้งชื่อ
+
+- ยาว 1–128 ตัวอักษร, case-sensitive, ไม่ซ้ำภายใน server
+- ใช้ได้เฉพาะตัวอักษร ASCII, ตัวเลข, `_`, `-` และ `.` — ห้ามมีช่องว่างหรือจุลภาค `getUser`, `DATA_EXPORT_v2` และ `admin.tools.list` ใช้ได้ทั้งหมด
+- ความไม่ซ้ำมีขอบเขตแค่ *server เดียว* host ที่รวม tool จากหลาย server อาจเจอ tool ชื่อ `search` สองตัว การแยกให้ต่างกันเป็นหน้าที่ของ host ซึ่งมักทำโดยเติม prefix เป็นตัวระบุ server อย่าพึ่ง `serverInfo.name` สำหรับเรื่องนี้ — มันเป็นค่าที่ server รายงานเอง และไม่การันตีว่าไม่ซ้ำ
+
+เลือกชื่อที่ model อ่านรู้เรื่อง: `search_catalog` ดีกว่า `sc` และ `create_issue` ดีกว่า `issue` (ซึ่งอ่านได้ทั้งว่าอ่านหรือสร้าง)
+
+## `tools/list`
+
+การค้นพบเป็น request ธรรมดาที่มี cursor แนบไปหรือไม่ก็ได้:
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": { "cursor": "optional" } }
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "tools": [ { "name": "search_catalog", "...": "..." } ],
+    "nextCursor": "next-page-cursor",
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+```
+
+สามอย่างที่ควรสังเกต:
+
+- **Pagination** ถ้ามี `nextCursor` ให้เรียกอีกครั้งโดยส่งค่านั้นเป็น `cursor` cursor เป็นค่าทึบ ห้ามตีความ
+- **Caching** `ttlMs` บอกว่า cache list นี้ได้นานแค่ไหน; `cacheScope` บอกว่า intermediary ที่ใช้ร่วมกันจะ cache ได้ (`public`) หรือเฉพาะผู้เรียกรายนี้ (`private`) ทั้งสอง field เป็นข้อบังคับบนผลลัพธ์แบบ list ใน revision 2026-07-28
+- **ลำดับที่แน่นอน** server ควรคืน tool ในลำดับเดิมทุกครั้งตราบใดที่ชุดยังไม่เปลี่ยน host จะเอา tool definition ไปวางไว้ใน prompt prefix ของ model ถ้าลำดับสลับไปมา prompt cache ของ LLM จะพัง
+
+## `tools/call`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": { "name": "search_catalog", "arguments": { "query": "mug", "limit": 5 } }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "content": [ { "type": "text", "text": "Travel mug\nEspresso cup" } ],
+    "isError": false
+  }
+}
+```
+
+(ตัวอย่างทั้งสองตัด field `_meta` ต่อ request ออกเพื่อความกระชับ request จริงทุกตัวต้องมี — ดู [Foundations](/mcp/th/mcp-foundations/json-rpc-and-meta/))
+
+### content type ของผลลัพธ์
+
+`content` เป็น array ดังนั้นผลลัพธ์เดียวผสมหลาย type ได้:
+
+| `type` | Field | ใช้สำหรับ |
+|--------|--------|---------|
+| `text` | `text` | ค่าเริ่มต้น สิ่งที่ model อ่าน |
+| `image` | `data` (base64), `mimeType` | screenshot, chart |
+| `audio` | `data` (base64), `mimeType` | เสียงบันทึก, ผลลัพธ์ TTS |
+| `resource_link` | `uri`, `name`, `description`, `mimeType` | ชี้ไปที่ resource โดยไม่ฝังเนื้อหา (ไม่การันตีว่าจะโผล่ใน `resources/list`) |
+| `resource` | `resource: { uri, mimeType, text หรือ blob }` | ฝังเนื้อหาของ resource ลงไปเลย |
+
+content block ทุกตัวแนบ `annotations` (`audience`, `priority`, `lastModified`) ได้ — รูปแบบเดียวกับที่ resource ใช้
+
+## tool ตัวเดียวกันในสอง SDK
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    const catalog = [
+      { name: 'Espresso cup', price: 12 },
+      { name: 'Travel mug', price: 24 },
+    ];
+
+    const server = new McpServer({ name: 'catalog', version: '1.0.0' });
+
+    server.registerTool(
+      'search_catalog',
+      {
+        title: 'Search the product catalog',
+        description: 'Find products by a case-insensitive substring of their name.',
+        inputSchema: z.object({
+          query: z.string().describe('Substring to match against product names'),
+          limit: z.number().int().min(1).max(50).optional(),
+        }),
+      },
+      async ({ query, limit }) => {
+        const hits = catalog.filter((p) => p.name.toLowerCase().includes(query.toLowerCase()));
+        if (hits.length === 0) {
+          // execution error: model อ่านข้อความนี้แล้วลองใหม่ได้
+          return { content: [{ type: 'text', text: `No products match "${query}". Try a shorter substring.` }], isError: true };
+        }
+        const names = hits.slice(0, limit ?? 10).map((p) => p.name);
+        return { content: [{ type: 'text', text: names.join('\n') }] };
+      },
+    );
+    ```
+    Zod schema จะถูกแปลงเป็น JSON Schema สำหรับ `tools/list` และใช้ validate `arguments` ก่อน handler ของคุณจะรัน ถ้า schema ไม่ผ่านจะกลายเป็น protocol error ไม่ใช่การเรียกเข้าโค้ดของคุณ
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    CATALOG = [
+        {"name": "Espresso cup", "price": 12},
+        {"name": "Travel mug", "price": 24},
+    ]
+
+    mcp = MCPServer("catalog")
+
+
+    @mcp.tool(title="Search the product catalog")
+    def search_catalog(query: str, limit: int = 10) -> str:
+        """Find products by a case-insensitive substring of their name."""
+        hits = [p for p in CATALOG if query.lower() in p["name"].lower()]
+        if not hits:
+            # ToolError กลายเป็น isError: true โดยใช้ข้อความนี้เป็น text
+            raise ToolError(f"No products match {query!r}. Try a shorter substring.")
+        return "\n".join(p["name"] for p in hits[:limit])
+    ```
+    signature ของ function กลายเป็น `inputSchema` (type hint, ค่า default, `required`) และ docstring กลายเป็น `description` การ raise `ToolError` ทำให้เกิด tool execution error; exception อื่นก็ถูกรายงานเป็น error เช่นกัน แต่ `ToolError` ให้คุณควบคุมข้อความที่ model จะเห็นได้
+  </TabItem>
+</Tabs>
+
+## error สองช่องทาง
+
+tool ล้มเหลวได้ **สอง** แบบที่ต่างกันชัดเจน และการเลือกให้ถูกสำคัญเพราะมันไปถึง model คนละทาง
+
+**Protocol error** คือ JSON-RPC error: ตัว request เองผิด เช่นชื่อ tool ไม่รู้จัก, argument ไม่ผ่าน `inputSchema`, หรือ crash ภายใน model ไม่น่าจะแก้เรื่องพวกนี้ได้ด้วยการเรียบเรียงใหม่ และ client อาจซ่อนมันจาก model
+
+```json
+{ "jsonrpc": "2.0", "id": 3, "error": { "code": -32602, "message": "Unknown tool: search_catalogue" } }
+```
+
+**Tool execution error** คือ response ที่ *สำเร็จ* แต่มี `isError: true` request ถูกต้องดี แต่ operation ล้มเหลวด้วยเหตุผลที่ model จัดการต่อได้ — วันที่อยู่ในอดีต, ไม่พบ record, upstream API ปฏิเสธ client ควรแสดงสิ่งเหล่านี้ให้ model เห็นเพื่อให้มันแก้ตัวเองได้
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "resultType": "complete",
+    "content": [ { "type": "text", "text": "Invalid departure date: must be in the future. Current date is 2026-09-10." } ],
+    "isError": true
+  }
+}
+```
+
+กฎการออกแบบ: **ทำให้ execution error นำไปแก้ต่อได้** "Error 500" ไม่สอนอะไร model เลย; "limit must be between 1 and 50, you sent 200" ทำให้มันลองใหม่ได้ถูกในเทิร์นถัดไป ใส่ข้อจำกัด, ค่าที่ผิด และถ้ามีประโยชน์ก็ใส่สถานะปัจจุบันด้วย (อย่างวันที่ในตัวอย่างข้างบน)
+
+## state โดยไม่มี session
+
+MCP ไม่มี session ระดับ protocol ดังนั้น tool พึ่ง "สิ่งที่ client นี้ทำไปก่อนหน้า" ไม่ได้ ถ้าต้องการ state ข้ามการเรียก — ตะกร้าสินค้า, browser tab, transaction — ให้สร้าง **handle** ขึ้นมาชัด ๆ แล้วส่งไปส่งกลับเป็น argument ธรรมดา:
+
+```json
+{ "name": "create_basket", "arguments": {} }
+```
+
+```json
+{ "content": [ { "type": "text", "text": "Created basket bsk_a1b2c3" } ], "structuredContent": { "basket_id": "bsk_a1b2c3" } }
+```
+
+```json
+{ "name": "add_item", "arguments": { "basket_id": "bsk_a1b2c3", "sku": "MUG-24" } }
+```
+
+model เป็นคนถือ `basket_id` ต่อไปเอง ตอนออกแบบ handle: ทำให้มันทึบและมี entropy สูง, ผูกมันฝั่ง server เข้ากับ user ที่ผ่านการยืนยันตัวตนแล้ว (handle คือ *ชื่อ* ไม่ใช่ credential), ระบุอายุของมันใน description ของ tool ที่สร้าง ("baskets expire after 24 hours") และคืน execution error ที่ชัดเจนเมื่อ handle หมดอายุ เพื่อให้ model สร้างใหม่ได้
+
+## checklist ด้าน security สำหรับ tool server
+
+spec กำหนดสิ่งเหล่านี้เป็น **MUST** สำหรับ server: validate input ทั้งหมด, ทำ access control, rate-limit การเรียก, sanitize output และเตือน host ว่าควรมีคนที่ปฏิเสธ tool call ได้เสมอ — ซึ่งเป็นเหตุผลว่าทำไม [annotation](/mcp/th/server-primitives/structured-output-and-annotations/) ของคุณจึงสำคัญ
+
+<Callout title="สรุปหนึ่งบรรทัด">
+tool คือ function ที่ model เรียกได้ อธิบายด้วยชื่อ, description และ JSON Schema; `tools/list` ค้นพบมัน (แบ่งหน้าได้, cache ได้, ลำดับแน่นอน) และ `tools/call` รันมัน เมื่อ request ผิดรูปให้ตอบด้วย protocol error และเมื่อ operation ล้มเหลวให้ตอบ `isError: true` พร้อมข้อความที่นำไปแก้ต่อได้ — และเก็บ state ข้ามการเรียกใน handle ที่ชัดเจน ไม่ใช่ใน connection
+</Callout>
+
+export const quizTools = [
+  {
+    q: 'ชื่อ tool ตัวไหนใช้ไม่ได้ตามกฎการตั้งชื่อของ spec?',
+    options: [
+      'DATA_EXPORT_v2',
+      'admin.tools.list',
+      'search catalog',
+      'getUser',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'tool ถูกเรียกด้วย request ที่ถูกต้อง แต่ record ที่ขอไม่มีอยู่ server ควรรายงานอย่างไร?',
+    options: [
+      'JSON-RPC error code -32602',
+      'ผลลัพธ์แบบสำเร็จที่มี isError: true พร้อมข้อความที่ model นำไปจัดการต่อได้',
+      'HTTP 404',
+      'content array ว่าง',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม tools/list ควรคืน tool ในลำดับที่แน่นอน?',
+    options: [
+      'JSON-RPC บังคับให้ array ต้องเรียงลำดับ',
+      'host วาง definition ไว้ใน prompt prefix ของ model และ list ที่สลับลำดับจะทำให้ prompt cache ของ LLM พัง',
+      'ไม่อย่างนั้น pagination cursor จะใช้ไม่ได้',
+      'Inspector ไม่รับ list ที่ไม่เรียงลำดับ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'server ควรเก็บตะกร้าสินค้าข้ามการเรียก tool หลายครั้งอย่างไร?',
+    options: [
+      'เก็บผูกกับ connection แล้วค้นหาในการเรียกครั้งถัด ๆ ไป',
+      'คืน handle ของตะกร้าออกมาชัด ๆ จาก tool ที่สร้าง แล้วรับมันเป็น argument ในการเรียกครั้งถัดไป',
+      'ใช้ header Mcp-Session-Id',
+      'เข้ารหัสไว้ในชื่อ tool',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/tools" questions={quizTools} />
+
+<ProgressTracker client:visible id="server-primitives/tools" />

@@ -1,0 +1,274 @@
+---
+title: 'Multi Round-Trip Requests (MRTR)'
+description: 'The pattern that replaces server-initiated requests — InputRequiredResult, inputRequests and inputResponses, the opaque requestState, and how to keep it honest without server-side state.'
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The problem MRTR solves
+
+Legacy MCP (2025-11-25 and earlier) let a server send `elicitation/create`, `sampling/createMessage`, or `roots/list` as JSON-RPC *requests* to the client, over a session. That works on stdio, but it forces a remote server to keep per-session state and a live back-channel — which breaks the moment you put a load balancer in front of two replicas. Whichever replica gets the retry has to know what the other one asked.
+
+**Multi Round-Trip Requests (MRTR)** removes the back-channel. The server never asks; it *answers with a question*, and the client re-issues the original request carrying the answer. Any replica can finish the job because everything it needs is in that retry.
+
+## The four-step flow
+
+1. The client sends a normal request — say `tools/call`.
+2. The server realizes it needs more information and responds with an `InputRequiredResult`.
+3. The client gathers the requested input (from the user, or elsewhere), then **retries the original request** with the input attached.
+4. The server now has enough, does the work, and returns the final result.
+
+<Mermaid title="MRTR: two independent requests, one logical operation" code={mrtrDiagram} />
+
+export const mrtrDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (id 1, params)
+  Note over S: needs input
+  S-->>C: result resultType input_required (inputRequests, requestState)
+  Note over C: request 1 is finished
+  Note over C: gather input from the user
+  C->>S: tools/call (id 2, same params + inputResponses + requestState)
+  Note over S: reconstitute from requestState, run
+  S-->>C: result resultType complete`;
+
+Note what the diagram does *not* show: any state held on the server between step 2 and step 3. Request 1 is finished the moment the server responds. Request 2 is a brand-new, self-contained request.
+
+## The three types
+
+### InputRequiredResult
+
+A result whose `resultType` is `"input_required"`. It carries up to two fields:
+
+- `inputRequests` — a map of server-assigned string keys to request objects the client must fulfil.
+- `requestState` — an opaque string meaningful only to the server.
+
+A server **must** include at least one of the two. It may include only `requestState` (meaning "just retry later, I've stashed what I need in here"), or only `inputRequests`.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "input_required",
+    "inputRequests": {
+      "pick_region": {
+        "method": "elicitation/create",
+        "params": {
+          "mode": "form",
+          "message": "Which region should the database live in?",
+          "requestedSchema": {
+            "type": "object",
+            "properties": {
+              "region": { "type": "string", "enum": ["eu-west-1", "us-east-1", "ap-southeast-1"] }
+            },
+            "required": ["region"]
+          }
+        }
+      }
+    },
+    "requestState": "v1.eyJuYW1lIjoib3JkZXJzIn0.h2Kq..."
+  }
+}
+```
+
+### InputRequests
+
+The values in `inputRequests` are ordinary MCP request shapes — one of `ElicitRequest`, `CreateMessageRequest` (sampling), or `ListRootsRequest`. The keys are chosen by the server and must be unique within that one response. A single `InputRequiredResult` may bundle several questions.
+
+### InputResponses
+
+On the retry, the client sends `inputResponses` — the same keys, each mapped to the matching *result* type (`ElicitResult`, `CreateMessageResult`, `ListRootsResult`):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "provision_database",
+    "arguments": { "name": "orders" },
+    "inputResponses": {
+      "pick_region": {
+        "action": "accept",
+        "content": { "region": "eu-west-1" }
+      }
+    },
+    "requestState": "v1.eyJuYW1lIjoib3JkZXJzIn0.h2Kq...",
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": { "form": {} } }
+    }
+  }
+}
+```
+
+Three rules about the retry:
+
+- The JSON-RPC `id` **must differ** from the first attempt — they are independent requests.
+- The original `name` and `arguments` are sent again, unchanged.
+- `requestState` is echoed **byte for byte** if the server sent one, and omitted if it did not. The client must never parse, modify, or reason about it.
+
+## Where MRTR is allowed
+
+Only three client requests may receive an `InputRequiredResult`:
+
+| Client request | May return `input_required` |
+|----------------|------------------------------|
+| `tools/call` | yes |
+| `resources/read` | yes |
+| `prompts/get` | yes |
+| everything else (`tools/list`, `server/discover`, …) | no |
+
+If you find yourself wanting to elicit during `tools/list`, the design is wrong: listings must not vary per connection or as a side effect of other requests.
+
+## Server requirements
+
+- **Never request what the client cannot do.** If the client's `io.modelcontextprotocol/clientCapabilities` did not declare `elicitation`, the server must not put an `elicitation/create` in `inputRequests`. Check the capabilities on *this* request — there is no earlier handshake to remember.
+- **Never assume the retry will come.** The user may decline, the client may give up. Do not pre-allocate resources on the first leg that only the second leg would clean up.
+- **Missing input is not an error.** If the retry arrives without something you asked for and you still need it, return a new `InputRequiredResult` asking again — not a JSON-RPC error.
+- **Ignore what you did not ask for.** Extra keys in `inputResponses` are ignored.
+- **You may loop.** A server can return `input_required` on several successive attempts, asking one thing at a time, until it has what it needs.
+
+## requestState is attacker-controlled
+
+Because `requestState` leaves the server and comes back through the client, a malicious or compromised client can tamper with it. The spec is blunt: if `requestState` influences authorization, resource access, or business logic, the server **must** protect its integrity — HMAC it, or seal it with an AEAD — and reject anything that fails verification.
+
+To bound replay, put these inside the protected payload and check them on receipt:
+
+- **the authenticated principal** — reject state presented by a different user;
+- **a short TTL** — reject stale state;
+- **an identifier for the originating request** — method name plus a digest of the salient params, so state minted for `provision_database("orders")` cannot be replayed on `delete_database("orders")`.
+
+Those measures bound the window; they do not guarantee single use. If a given state must be consumed at most once (a one-time redemption), enforce that server-side with a store. Integrity protection may be skipped *only* when tampering can cause nothing worse than the request failing.
+
+## What the SDKs do for you
+
+You will rarely build `InputRequiredResult` by hand. Both official SDKs let you write a handler as if the question were synchronous, and split it into the two legs behind the scenes.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    const server = new McpServer({ name: 'infra', version: '1.0.0' });
+
+    server.registerTool(
+      'provision_database',
+      { description: 'Create a database', inputSchema: z.object({ name: z.string() }) },
+      async ({ name }, ctx) => {
+        // Looks synchronous. On the wire this returns input_required,
+        // and the handler is re-run on the retry with the answer available.
+        const answer = await ctx.mcpReq.elicitInput({
+          mode: 'form',
+          message: `Which region should ${name} live in?`,
+          requestedSchema: {
+            type: 'object',
+            properties: { region: { type: 'string', enum: ['eu-west-1', 'us-east-1'] } },
+            required: ['region'],
+          },
+        });
+        if (answer.action !== 'accept') {
+          return { content: [{ type: 'text', text: 'Provisioning cancelled.' }] };
+        }
+        return { content: [{ type: 'text', text: `Created ${name} in ${answer.content?.region}` }] };
+      }
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from typing import Annotated
+
+    from pydantic import BaseModel
+
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver import Elicit, Resolve
+
+    mcp = MCPServer("infra")
+
+
+    class Region(BaseModel):
+        region: str
+
+
+    async def ask_region(name: str) -> Elicit[Region]:
+        return Elicit(f"Which region should {name} live in?", Region)
+
+
+    # The Resolve parameter is filled from inputResponses on the retry.
+    # The tool body only runs once the answer is present.
+    @mcp.tool()
+    async def provision_database(
+        name: str, where: Annotated[Region, Resolve(ask_region)]
+    ) -> str:
+        return f"Created {name} in {where.region}"
+    ```
+  </TabItem>
+</Tabs>
+
+The Python `Resolve` form is the era-portable one: it produces a clean two-leg MRTR exchange on modern clients and still works with legacy clients that expect a pushed request. The important mental model either way: **your handler may run more than once**. Keep side effects after the point where all inputs are known.
+
+## Design notes
+
+- **One question per round when it needs sequencing; many when it doesn't.** `inputRequests` is a map, so independent questions can travel together and save a round trip.
+- **Keep `requestState` small.** It rides through the client twice and into logs. Encode ids and digests, not whole documents.
+- **Idempotent retries.** The retry re-sends the original arguments. If leg one already did something irreversible, leg two must not do it again — another reason to defer side effects.
+
+<Callout title="The one-line takeaway">
+MRTR turns "the server asks the client" into "the server returns `input_required` and the client retries the same request with `inputResponses`" — two independent requests, a new id on the retry, an echoed opaque `requestState`, and no state on the server. Sign or seal `requestState` whenever it affects anything that matters.
+</Callout>
+
+export const quizMrtr = [
+  {
+    q: 'What must a client do after receiving an InputRequiredResult with inputRequests?',
+    options: [
+      'Send the answers as a JSON-RPC response to the server',
+      'Gather the input, then retry the ORIGINAL request with inputResponses (and requestState if given) under a new id',
+      'Open a subscriptions/listen stream and wait',
+      'Call server/discover again',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which client requests may legitimately receive resultType "input_required"?',
+    options: [
+      'Any request at all',
+      'Only server/discover',
+      'tools/call, resources/read, and prompts/get',
+      'tools/list and resources/list',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'What is the client allowed to do with requestState?',
+    options: [
+      'Parse it to pre-fill the form',
+      'Echo it back unchanged on the retry — nothing else',
+      'Store it and reuse it on unrelated requests',
+      'Strip it to save bandwidth',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why must a server HMAC or AEAD-protect requestState that affects authorization?',
+    options: [
+      'Because JSON-RPC requires signed params',
+      'Because it passes through the client and could be tampered with or replayed',
+      'Because the transport is unencrypted',
+      'Because the SDK cannot serialize it otherwise',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-interaction/multi-round-trip-requests" questions={quizMrtr} />
+
+<ProgressTracker client:visible id="client-interaction/multi-round-trip-requests" />

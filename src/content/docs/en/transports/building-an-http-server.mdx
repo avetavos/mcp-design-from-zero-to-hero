@@ -1,0 +1,207 @@
+---
+title: 'Building an HTTP Server'
+description: 'Serve the same McpServer over Streamable HTTP with createMcpHandler in TypeScript and mcp.run() in Python, test it in-process, and design it stateless so it scales behind a plain load balancer.'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## From a stdio script to a service
+
+Nothing about your tools changes when you move to HTTP. What changes is who owns the process and how requests arrive. The SDKs hide the transport mechanics; your job is the part they cannot do for you — making the server correct when many clients share it and no two requests are guaranteed to hit the same instance.
+
+<Mermaid title="A stateless HTTP server scales sideways" code={scaleDiagram} />
+
+export const scaleDiagram = `flowchart LR
+  c1["Client A"] --> lb["Load balancer"]
+  c2["Client B"] --> lb
+  lb --> i1["Instance 1"]
+  lb --> i2["Instance 2"]
+  lb --> i3["Instance 3"]
+  i1 --> db[("Shared state keyed by explicit handles")]
+  i2 --> db
+  i3 --> db`;
+
+## The factory pattern
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    In the TypeScript SDK, `createMcpHandler` takes a **factory** that builds an `McpServer`. The factory runs per request, so register every tool, resource and prompt *inside* it — the returned handler speaks web-standard `Request`/`Response`.
+
+    ```ts
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    export const handler = createMcpHandler(() => {
+      const server = new McpServer({ name: 'notes', version: '1.0.0' });
+      server.registerTool(
+        'add-note',
+        { description: 'Save a note', inputSchema: z.object({ text: z.string() }) },
+        async ({ text }) => ({ content: [{ type: 'text', text: `Saved: ${text}` }] }),
+      );
+      return server;
+    });
+    ```
+
+    On a web-standard runtime (Cloudflare Workers, Deno, Bun) the handler *is* the app:
+
+    ```ts
+    export default handler;
+    ```
+
+    On Node, adapt it with `toNodeHandler` and mount it on Express via the SDK's helper, which wires up host and `Origin` checks for you:
+
+    ```ts
+    import { createMcpExpressApp } from '@modelcontextprotocol/express';
+    import { toNodeHandler } from '@modelcontextprotocol/node';
+
+    const app = createMcpExpressApp({ host: '0.0.0.0', allowedHosts: ['api.example.com'] });
+    const node = toNodeHandler(handler);
+    app.all('/mcp', (req, res) => void node(req, res, req.body));
+    app.listen(3000);
+    ```
+
+    Install: `npm install @modelcontextprotocol/server @modelcontextprotocol/node @modelcontextprotocol/express zod`.
+  </TabItem>
+  <TabItem label="Python">
+    In the Python SDK, the same `MCPServer` object runs over HTTP by changing the `run()` transport. Transport options are arguments to `run()`, not the constructor.
+
+    ```python
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("notes")
+
+    @mcp.tool()
+    def add_note(text: str) -> str:
+        """Save a note."""
+        return f"Saved: {text}"
+
+    if __name__ == "__main__":
+        mcp.run(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=9000,
+            json_response=True,     # answer with plain JSON unless streaming is needed
+            stateless_http=True,    # no per-connection state
+        )
+    ```
+
+    `streamable_http_path` sets the endpoint path if you do not want the default. Bind `host="127.0.0.1"` for local-only servers.
+  </TabItem>
+</Tabs>
+
+## Test it in-process
+
+You do not need a port to test an HTTP server. The TypeScript handler exposes `fetch`, and the client transport accepts a custom `fetch`, so the two connect in memory:
+
+```ts
+import assert from 'node:assert/strict';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+
+const transport = new StreamableHTTPClientTransport(new URL('http://test.local/mcp'), {
+  fetch: (url, init) => handler.fetch(new Request(url, init)),
+});
+const client = new Client({ name: 'test', version: '1.0.0' });
+await client.connect(transport);
+
+const result = await client.callTool({ name: 'add-note', arguments: { text: 'hi' } });
+assert.equal(result.isError, undefined);
+```
+
+In Python, `Client(mcp)` connects straight to the server object with no transport at all — see [testing and debugging](/mcp/en/production-and-ecosystem/testing-and-debugging/).
+
+## Designing for statelessness
+
+MCP is a stateless protocol: every request carries everything needed to process it, and a server **must not** infer anything from earlier requests on the same connection. Over HTTP that has concrete consequences.
+
+### Handles, not sessions
+
+There is no session ID to hang state on. If a tool needs state across calls — a shopping cart, an open browser context, a transaction — return an explicit **handle** from a creation tool and accept it as an argument on later calls:
+
+```jsonc
+// tools/call create_basket → result
+{ "content": [{ "type": "text", "text": "Created basket bsk_a1b2c3" }],
+  "structuredContent": { "basket_id": "bsk_a1b2c3" } }
+
+// tools/call add_item
+{ "name": "add_item", "arguments": { "basket_id": "bsk_a1b2c3", "sku": "MUG-24" } }
+```
+
+The model carries `basket_id` forward; the server stores the cart under that key in shared storage. Design rules for handles: make them opaque and high-entropy (a UUIDv4 if unauthenticated), give them a bounded lifetime and say so in the tool description, validate the caller's authorization against the handle on every call, and return a clear tool error on an expired handle so the model can create a new one.
+
+### Scale behind a plain load balancer
+
+Because nothing is pinned to a connection, any instance can serve any request. No sticky sessions, no shared in-memory registry, no coordination. Keep instances free of per-client memory and put anything durable in a store every instance can reach.
+
+### Deterministic tool order
+
+Return tools from `tools/list` in the same order every time. Clients cache the list, and LLM providers cache the prompt prefix that contains it — a reshuffled list is a cache miss on both sides.
+
+### Authorization is per request
+
+Credentials arrive on each request as a bearer token. The tool set **may** vary by the scopes on that token (return only what the caller is allowed to use), but it **must not** vary per connection or as a side effect of earlier requests.
+
+## JSON or SSE?
+
+The server chooses per request:
+
+- Return **JSON** when the result is ready quickly and there is nothing to report along the way. It is cheaper for intermediaries and trivially cacheable.
+- Return **SSE** when you will emit `notifications/progress` or `notifications/message` before the result, or when the work takes long enough that a proxy might time out a silent response. Remember `X-Accel-Buffering: no`.
+
+For work that runs for minutes, neither is right — return a task handle instead; see the [Tasks extension](/mcp/en/client-interaction/tasks-extension/).
+
+<Callout title="The one-line takeaway">
+Build the server once, serve it with `createMcpHandler` (web-standard, or `toNodeHandler` on Node) or `mcp.run(transport="streamable-http")`, test it in-process, and design it stateless: explicit handles instead of sessions, deterministic tool order, per-request auth — so any instance behind a plain load balancer can answer any request.
+</Callout>
+
+export const quizBuild = [
+  {
+    q: 'Why does createMcpHandler take a factory function rather than a server instance?',
+    options: [
+      'To lazy-load the SDK',
+      'The factory runs per request, so each request gets a fresh, fully registered server',
+      'Because TypeScript cannot pass objects',
+      'To disable tools by default',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A tool needs to remember a shopping cart between calls. What is the MCP-native approach?',
+    options: [
+      'Use the Mcp-Session-Id header',
+      'Return an explicit basket_id handle and accept it on later calls',
+      'Store the cart in a connection-scoped variable',
+      'Require the client to reuse the same TCP connection',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which is a legitimate reason for tools/list to differ between two requests?',
+    options: [
+      'They arrived on different connections',
+      'One caller’s bearer token has fewer scopes',
+      'The server likes to randomize order',
+      'The previous request was a tools/call',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'When should a server answer a request with SSE instead of JSON?',
+    options: [
+      'Always — SSE is the default',
+      'When it will send progress or log notifications before the final result',
+      'Only for notifications',
+      'When the client sent Accept: application/json',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="transports/building-an-http-server" questions={quizBuild} />
+
+<ProgressTracker client:visible id="transports/building-an-http-server" />

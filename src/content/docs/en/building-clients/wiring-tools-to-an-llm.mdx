@@ -1,0 +1,288 @@
+---
+title: 'Wiring MCP Tools to an LLM'
+description: 'Turn tools/list into model tool definitions, run the agent loop that routes tool_use blocks to the right server, and return every tool_result so the model can act and self-correct.'
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The protocol stops at the tool list
+
+MCP tells you how to discover and invoke tools. It says nothing about language models. The bridge between the two is host code you write: convert MCP tool definitions into whatever your model provider expects, let the model pick a tool, route the call to the right client, and feed the result back. This is the **agent loop**, and every MCP host has one.
+
+<Mermaid title="The agent loop inside a host" code={loopDiagram} />
+
+export const loopDiagram = `sequenceDiagram
+  participant U as User
+  participant H as Host
+  participant M as LLM
+  participant C as MCP client
+  participant S as MCP server
+  U->>H: message
+  H->>C: tools/list (once, cached)
+  C->>S: tools/list
+  S-->>C: tools[]
+  H->>M: messages + tool definitions
+  M-->>H: tool_use (name, input)
+  H->>H: ask user? (annotations)
+  H->>C: callTool(name, input)
+  C->>S: tools/call
+  S-->>C: content[], isError
+  H->>M: tool_result blocks
+  M-->>H: final text
+  H-->>U: answer`;
+
+## Step 1: map tool definitions
+
+An MCP tool has `name`, `description`, and a JSON Schema `inputSchema`. The Anthropic Messages API wants `name`, `description`, and `input_schema`. The mapping is nearly a rename — the important host decision is **namespacing**: prefix each name with the server it came from so two servers that both expose `search` do not collide, and so you can route the call back later.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import type Anthropic from '@anthropic-ai/sdk';
+    import type { Client } from '@modelcontextprotocol/client';
+
+    type Route = { client: Client; toolName: string };
+    const routes = new Map<string, Route>();
+
+    async function collectTools(servers: Record<string, Client>): Promise<Anthropic.Tool[]> {
+      const defs: Anthropic.Tool[] = [];
+      for (const [serverName, client] of Object.entries(servers)) {
+        const { tools } = await client.listTools();
+        for (const t of tools) {
+          const name = `${serverName}__${t.name}`;
+          routes.set(name, { client, toolName: t.name });
+          defs.push({
+            name,
+            description: t.description ?? '',
+            input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
+          });
+        }
+      }
+      return defs;
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+
+    routes: dict[str, tuple[Client, str]] = {}
+
+    async def collect_tools(servers: dict[str, Client]) -> list[dict]:
+        defs: list[dict] = []
+        for server_name, client in servers.items():
+            listing = await client.list_tools()
+            for t in listing.tools:
+                name = f"{server_name}__{t.name}"
+                routes[name] = (client, t.name)
+                defs.append({
+                    "name": name,
+                    "description": t.description or "",
+                    "input_schema": t.input_schema,
+                })
+        return defs
+    ```
+  </TabItem>
+</Tabs>
+
+Keep tool order **stable** between turns. Servers are asked to return `tools/list` in a deterministic order for exactly this reason: the `tools` array is part of the cached prompt prefix, and reshuffling it invalidates the cache.
+
+## Step 2: map tool results
+
+An MCP result is a `content` array of blocks (`text`, `image`, `audio`, `resource_link`, `resource`) plus optional `structuredContent` and `isError`. A `tool_result` block for the Messages API accepts text and image content. Convert what maps, summarize what does not, and — crucially — pass `isError` through as `is_error` so the model knows to try again.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    function toToolResult(
+      toolUseId: string,
+      result: Awaited<ReturnType<Client['callTool']>>,
+    ): Anthropic.ToolResultBlockParam {
+      const content: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
+      for (const block of result.content as any[]) {
+        if (block.type === 'text') content.push({ type: 'text', text: block.text });
+        else if (block.type === 'image')
+          content.push({ type: 'image', source: { type: 'base64', media_type: block.mimeType, data: block.data } });
+        else content.push({ type: 'text', text: `[${block.type}] ${block.uri ?? ''}` });
+      }
+      return { type: 'tool_result', tool_use_id: toolUseId, content, is_error: result.isError === true };
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.types import ImageContent, TextContent
+
+    def to_tool_result(tool_use_id: str, result) -> dict:
+        content = []
+        for block in result.content:
+            if isinstance(block, TextContent):
+                content.append({"type": "text", "text": block.text})
+            elif isinstance(block, ImageContent):
+                content.append({"type": "image", "source": {
+                    "type": "base64", "media_type": block.mime_type, "data": block.data}})
+            else:
+                content.append({"type": "text", "text": f"[{block.type}] {getattr(block, 'uri', '')}"})
+        return {"type": "tool_result", "tool_use_id": tool_use_id,
+                "content": content, "is_error": bool(result.is_error)}
+    ```
+  </TabItem>
+</Tabs>
+
+## Step 3: the loop
+
+Call the model. If it stops with `tool_use`, execute **every** `tool_use` block in that turn (they may be parallel), collect the results, and return them all in **one** user message. Splitting results across several messages silently teaches the model to stop parallelizing. Loop until the stop reason is something else.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import Anthropic from '@anthropic-ai/sdk';
+
+    const anthropic = new Anthropic();
+
+    async function runAgent(userText: string, tools: Anthropic.Tool[]) {
+      const messages: Anthropic.MessageParam[] = [{ role: 'user', content: userText }];
+
+      while (true) {
+        const response = await anthropic.messages.create({
+          model: 'claude-opus-5',
+          max_tokens: 16000,
+          tools,
+          messages,
+        });
+        messages.push({ role: 'assistant', content: response.content });
+
+        if (response.stop_reason !== 'tool_use') return response;
+
+        const uses = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use');
+        const results = await Promise.all(
+          uses.map(async (use) => {
+            const route = routes.get(use.name)!;
+            if (!(await userApproves(use))) {
+              return { type: 'tool_result', tool_use_id: use.id, content: 'User denied this call.', is_error: true } as const;
+            }
+            const result = await route.client.callTool({ name: route.toolName, arguments: use.input as Record<string, unknown> });
+            return toToolResult(use.id, result);
+          }),
+        );
+        messages.push({ role: 'user', content: results }); // all results, one message
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import anthropic
+
+    client = anthropic.Anthropic()
+
+    async def run_agent(user_text: str, tools: list[dict]):
+        messages = [{"role": "user", "content": user_text}]
+
+        while True:
+            response = client.messages.create(
+                model="claude-opus-5",
+                max_tokens=16000,
+                tools=tools,
+                messages=messages,
+            )
+            messages.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason != "tool_use":
+                return response
+
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                mcp_client, tool_name = routes[block.name]
+                if not await user_approves(block):
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": "User denied this call.", "is_error": True})
+                    continue
+                result = await mcp_client.call_tool(tool_name, dict(block.input))
+                results.append(to_tool_result(block.id, result))
+
+            messages.append({"role": "user", "content": results})  # all results, one message
+    ```
+  </TabItem>
+</Tabs>
+
+Two details are easy to miss. First, always parse `tool_use.input` as JSON data, never by string-matching the serialized form. Second, when the user denies a call, still return a `tool_result` for that `tool_use_id` — marked `is_error` — so the conversation stays well-formed and the model can explain or choose another route.
+
+## Where consent goes
+
+The spec asks hosts to keep a human in the loop with the power to deny any invocation. Tool `annotations` are the cheapest signal you have:
+
+| Annotation | Reasonable host policy |
+|------------|------------------------|
+| `readOnlyHint: true` | Auto-approve, show in a log |
+| `destructiveHint: true` | Always prompt, show the exact arguments |
+| `idempotentHint: true` | Safe to retry after a timeout |
+| `openWorldHint: true` | Warn that the tool reaches external systems |
+
+Annotations are **hints from the server**, and the spec says to treat them as untrusted unless the server is trusted. A malicious server can label a destructive tool as read-only. Use annotations to reduce friction for servers you trust, never as the only gate for servers you do not.
+
+## Design notes
+
+- **Cache `tools/list`.** Respect `ttlMs`; refresh when `notifications/tools/list_changed` arrives on your `subscriptions/listen` stream.
+- **Budget tool output.** A tool that returns 200 KB of JSON will eat the context window. Truncate or summarize host-side, and prefer `structuredContent` when the tool has an `outputSchema`.
+- **Bound every call.** Use a timeout per `tools/call`; on timeout, return an `is_error` result rather than hanging the loop.
+- **Log for audit.** Record which server ran which tool with which arguments. Servers may be third parties.
+
+<Callout title="The one-line takeaway">
+The agent loop is host code: rename `inputSchema` to `input_schema`, namespace by server, let the model choose, route each `tool_use` to its client, run parallel calls together, and return every `tool_result` — errors included — in a single user message until the model stops asking for tools.
+</Callout>
+
+export const quizLoop = [
+  {
+    q: 'When the model returns three tool_use blocks in one turn, how should the host return the results?',
+    options: [
+      'Three separate user messages, one per result',
+      'One user message containing all three tool_result blocks',
+      'Only the first result; drop the others',
+      'As a single concatenated string',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why prefix MCP tool names with the server name before giving them to the model?',
+    options: [
+      'The Messages API rejects names without a prefix',
+      'To avoid collisions between servers and to route the call back to the right client',
+      'To make tools sort alphabetically',
+      'Because MCP requires it',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A tool returns isError: true with the text "quantity must be positive". What should the host do?',
+    options: [
+      'Throw an exception and end the conversation',
+      'Return it to the model as a tool_result with is_error so the model can correct the arguments',
+      'Retry the same call three times',
+      'Silently drop it',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How should a host treat a tool whose annotations say readOnlyHint: true from an unknown server?',
+    options: [
+      'Trust it completely and auto-run without any logging',
+      'Treat the annotation as an untrusted hint; it may lower friction for trusted servers but is not a security gate',
+      'Refuse to list the tool',
+      'Convert it to a resource',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/wiring-tools-to-an-llm" questions={quizLoop} />
+
+<ProgressTracker client:visible id="building-clients/wiring-tools-to-an-llm" />

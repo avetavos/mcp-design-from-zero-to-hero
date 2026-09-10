@@ -1,0 +1,240 @@
+---
+title: 'stdio'
+description: 'transport แบบ local: client spawn server, JSON-RPC message ที่คั่นด้วย newline หนึ่งตัวต่อบรรทัด, stdout สงวนไว้สำหรับ protocol, stderr สำหรับ log — พร้อม shutdown, restart, cancellation และ probe สำหรับ legacy'
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## client เป็นเจ้าของ process
+
+ใน transport แบบ **stdio** MCP client เปิด server เป็น subprocess ทั้งสองฝั่งคุยกันผ่าน standard stream ของ child process:
+
+- server อ่าน JSON-RPC จาก `stdin` และเขียน JSON-RPC ลง `stdout`
+- แต่ละ message คือ JSON-RPC request, notification หรือ response หนึ่งตัว
+- message คั่นด้วย newline และ **ห้าม** มี newline ฝังอยู่ข้างใน
+
+ไม่มีการตั้ง connection ไม่มี port ไม่มี TLS pipe มีอยู่เพราะ process มีอยู่ และหายไปเมื่อ process หายไป
+
+<Mermaid title="stdio: ช่องทางร่วมหนึ่งช่องในแต่ละทิศทาง" code={stdioDiagram} />
+
+export const stdioDiagram = `sequenceDiagram
+  participant C as Client (host)
+  participant S as Server (child process)
+  C->>S: spawn (command, args, env)
+  C->>S: stdin: tools/call (id 1)
+  S-->>C: stdout: notifications/progress
+  S-->>C: stdout: response (id 1)
+  S-->>C: stderr: "cache warm" (log, ถูกเพิกเฉยหรือเก็บไว้)
+  C->>S: ปิด stdin
+  S-->>C: exit 0`;
+
+## กฎของ stdout
+
+นี่คือกฎที่คนทำผิดบ่อยที่สุด และมันเด็ดขาด:
+
+- server **ห้าม** เขียนอะไรลง `stdout` ที่ไม่ใช่ MCP message ที่ถูกต้อง
+- client **ห้าม** เขียนอะไรลง `stdin` ของ server ที่ไม่ใช่ MCP message ที่ถูกต้อง
+
+`console.log("starting…")` หรือ `print("debug")` ที่หลุดมาจะไปตกอยู่กลาง JSON stream และ client จะ parse message ถัดไปไม่ได้ ให้ส่ง log ไป **stderr** แทน server **อาจ** เขียน UTF-8 ลง stderr สำหรับ output แบบ informational, debug และ error; client **อาจ** เก็บ, ส่งต่อ หรือเพิกเฉยมัน และ **ไม่ควร** ถือว่า output บน stderr แปลว่าเกิด error
+
+```ts
+// TypeScript — never console.log in a stdio server
+console.error('cache warm');           // fine: stderr
+process.stdout.write('hello');         // corrupts the protocol stream
+```
+
+```python
+# Python — same rule
+import sys
+print("cache warm", file=sys.stderr)   # fine
+print("hello")                          # corrupts the protocol stream
+```
+
+## ใครเขียนอะไร
+
+แต่ละฝั่งเขียนได้เฉพาะ message บางประเภท:
+
+| ทิศทาง | Request | Notification | Response |
+|-----------|----------|---------------|-----------|
+| Client → server (stdin) | ได้ | ได้ (เช่น `notifications/cancelled`) | **ไม่ได้เด็ดขาด** |
+| Server → client (stdout) | **ไม่ได้เด็ดขาด** | ได้ (progress, log, subscription event) | ได้ |
+
+server ไม่เคยเขียน JSON-RPC *request* เมื่อมันต้องการอะไรจาก client — input จากผู้ใช้, completion, รายการ roots — มันจะ return `InputRequiredResult` แล้ว client retry พร้อมคำตอบ นั่นคือแพทเทิร์น [Multi Round-Trip Requests](/mcp/th/client-interaction/multi-round-trip-requests/) และมันคือสิ่งที่ทำให้ stdio ยังคงเป็นช่องทาง request/response ธรรมดา
+
+เพราะ message ทั้งหมดของ server ใช้ `stdout` เดียวกัน client จึงจับคู่มันด้วย `id` (response) หรือด้วย `_meta["io.modelcontextprotocol/subscriptionId"]` (notification จาก request `subscriptions/listen`) ไม่มี stream แยกต่อ request
+
+## request metadata อยู่ inline
+
+stdio ไม่มีชั้น header protocol version, capability ต่อ request และตัวตนของ client (ถ้ามี) อยู่ใน `_meta.io.modelcontextprotocol/*` ภายในแต่ละ request; method และ argument อยู่ตรงที่ JSON-RPC กำหนด ไม่มีอะไรถูก mirror ไปที่อื่น
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_weather","arguments":{"city":"Bangkok"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ExampleClient","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}
+```
+
+บรรทัดเดียว ไม่ต้อง pretty-print
+
+## Cancellation
+
+ไม่มี stream ต่อ request ให้ปิด client จึง cancel ด้วยการส่ง notification ที่อ้างถึง ID ของ request:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"user clicked stop"}}
+```
+
+server **ควร** หยุดงานทันทีที่ทำได้ และ **ห้าม** ส่ง message ใด ๆ สำหรับ request นั้นอีก
+
+## Shutdown
+
+client **ควร** ปิด server ตามลำดับนี้:
+
+1. ปิด `stdin` ของ child process
+2. รอให้ process ออก
+3. ถ้าไม่ออกภายในเวลาที่เหมาะสม ให้ terminate มัน — บน POSIX ไล่จาก `SIGTERM` ไป `SIGKILL`; บน Windows ใช้ `TerminateProcess` หรือ Job Object
+
+server **ควร** ออกทันทีเมื่อ `stdin` ถึง end-of-file นั่นคือสัญญาณ graceful-shutdown เดียวที่ portable ดังนั้นการเคารพมันคือสิ่งที่ทำให้ server ของคุณไม่ถูก kill server จะเริ่ม shutdown เองด้วยการปิด `stdout` แล้วออกก็ได้
+
+## การจบแบบไม่คาดคิด
+
+ถ้า process ของ server ตาย client **ควร** restart มัน เพราะ protocol เป็น stateless จึงไม่มีอะไรที่หายไปแล้วสร้างใหม่ไม่ได้: request ที่ค้างอยู่ก็แค่ retry กับ process ใหม่ และ stream `subscriptions/listen` ต้องส่งใหม่เพราะ server ไม่เก็บ subscription state ข้าม restart นี่คือประโยชน์โดยตรงของ[การออกแบบแบบ stateless](/mcp/th/mcp-foundations/discovery-and-versioning/) — restart คือการ retry ไม่ใช่กระบวนการกู้คืน
+
+## รัน stdio server
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer } from '@modelcontextprotocol/server';
+    import { serveStdio } from '@modelcontextprotocol/server/stdio';
+    import * as z from 'zod/v4';
+
+    serveStdio(() => {
+      const server = new McpServer({ name: 'weather', version: '1.0.0' });
+      server.registerTool(
+        'get-forecast',
+        { description: 'Forecast for a city', inputSchema: z.object({ city: z.string() }) },
+        async ({ city }) => ({ content: [{ type: 'text', text: `Sunny in ${city}.` }] }),
+      );
+      return server;
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("weather")
+
+    @mcp.tool()
+    def get_forecast(city: str) -> str:
+        """Forecast for a city."""
+        return f"Sunny in {city}."
+
+    if __name__ == "__main__":
+        mcp.run()  # transport defaults to "stdio"
+    ```
+  </TabItem>
+</Tabs>
+
+## host เปิดมันอย่างไร
+
+host เก็บ *command line* พร้อม environment แล้ว spawn มัน สองสำนวนที่คุณจะเห็นทุกที่คือ `npx -y <package>` สำหรับ server บน npm และ `uvx <package>` สำหรับ server บน PyPI — ทั้งคู่ดาวน์โหลดตอนรันครั้งแรกและไม่ต้องติดตั้งแบบ global
+
+Claude Desktop อ่าน `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Projects"]
+    },
+    "git": {
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "/Users/me/Projects/app"]
+    }
+  }
+}
+```
+
+`.mcp.json` ระดับ project ของ Claude Code ใช้รูปร่างเดียวกัน โดยมี `type` ระบุชัด, `env` และการขยายตัวแปร:
+
+```json
+{
+  "mcpServers": {
+    "local-db": {
+      "type": "stdio",
+      "command": "/path/to/server",
+      "args": ["--config", "${CLAUDE_PROJECT_DIR}/config.json"],
+      "env": { "DB_URL": "${DB_URL:-postgresql://localhost}" }
+    }
+  }
+}
+```
+
+credential ของ stdio server มาจาก `env` และไฟล์ในเครื่อง **ไม่ใช่** จาก OAuth — authorization framework มีไว้สำหรับ HTTP transport เท่านั้น เพราะ host รันคำสั่งอะไรก็ตามที่ถูก config ไว้ host จึงแสดงคำสั่งเต็ม ๆ และขอความยินยอมก่อนรันคำสั่งใหม่; ดู [threats and mitigations](/mcp/th/security-and-auth/threats-and-mitigations/)
+
+## probe สำหรับ legacy
+
+server ที่เขียนตาม 2025-11-25 และก่อนหน้าคาดหวัง handshake `initialize` ก่อนอย่างอื่น client ที่รองรับทั้งสองยุค **ควร** ส่ง `server/discover` ก่อน โดยใส่ version ยุคใหม่ที่ต้องการใน `_meta` มีสามผลลัพธ์ที่เป็นไปได้:
+
+1. **ได้ `DiscoverResult`** — server เป็น modern เลือก version จาก `supportedVersions` แล้วทำต่อ
+2. **ได้ modern error ที่รู้จัก** เช่น `UnsupportedProtocolVersionError` (-32022) — server เป็น modern แต่ไม่รองรับ version นั้น retry ด้วยตัวหนึ่งจากรายการ `supported` **ห้าม** fall back
+3. **ได้ error อื่นใด หรือไม่มีคำตอบภายใน timeout ที่เหมาะสม** — server เป็น legacy fall back ไปใช้ handshake `initialize`
+
+การ fallback ต้องไม่ผูกกับ error code ตัวใดตัวหนึ่ง: legacy server ตอบ request ที่ไม่รู้จักก่อน `initialize` ด้วย error แบบ implementation-defined (มักเป็น -32601 หรือ -32602) หรือเงียบไปเลย แม้แต่ client ที่เป็น modern อย่างเดียวก็ควร probe เพราะ legacy server บางตัวจะยินดีประมวลผล `tools/call` ที่คลุมเครือระหว่างยุคด้วย semantics แบบ legacy แทนที่จะล้มเหลว โมเดลของยุคทั้งหมดอยู่ใน [Backward Compatibility](/mcp/th/transports/backward-compatibility/)
+
+<Callout title="สรุปหนึ่งบรรทัด">
+stdio คือ child process ที่ถูก spawn แล้วพูด JSON-RPC message หนึ่งตัวต่อบรรทัด: stdout ใช้กับ protocol เท่านั้น stderr ใช้กับ log, client cancel ด้วย `notifications/cancelled`, shutdown ด้วยการปิด stdin และ restart-แล้ว-retry เมื่อ crash — และมัน probe ด้วย `server/discover` ก่อนจะเชื่อว่า server เป็น modern
+</Callout>
+
+export const quizStdio = [
+  {
+    q: 'stdio server พิมพ์ "server started" ลง stdout ตอนเปิด จะเกิดอะไรขึ้น?',
+    options: [
+      'ไม่มีอะไร — client เพิกเฉยบรรทัดที่ไม่ใช่ JSON',
+      'client parse protocol stream ไม่ได้; log ต้องไป stderr',
+      'client ถือว่ามันเป็น notification',
+      'message ถูกส่งต่อไปยัง LLM',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client cancel request ที่ค้างอยู่บน stdio ได้อย่างไร?',
+    options: [
+      'ปิด stream ของ request นั้น',
+      'ส่ง notifications/cancelled พร้อม request ID',
+      'ส่ง SIGINT ไปที่ process',
+      'ส่ง request เดิมซ้ำด้วย ID เดียวกัน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ลำดับ graceful shutdown ที่ถูกต้องสำหรับ stdio server คืออะไร?',
+    options: [
+      'ส่ง SIGKILL ทันที',
+      'ปิด stdin รอให้ออก แล้วค่อยไล่ไป SIGTERM/SIGKILL เฉพาะเมื่อจำเป็น',
+      'ส่ง request initialize พร้อม shutdown: true',
+      'ลบ entry ใน config',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'probe ด้วย server/discover ได้ UnsupportedProtocolVersionError client ควรทำอย่างไร?',
+    options: [
+      'fall back ไปใช้ handshake initialize แบบ legacy',
+      'retry ด้วย version จากรายการ supported ใน error — server เป็น modern',
+      'kill แล้ว restart server',
+      'ยอมแพ้; server พัง',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="transports/stdio" questions={quizStdio} />
+
+<ProgressTracker client:visible id="transports/stdio" />

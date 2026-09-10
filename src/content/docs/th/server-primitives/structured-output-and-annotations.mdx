@@ -1,0 +1,258 @@
+---
+title: 'Structured Output and Annotations'
+description: 'outputSchema และ structuredContent สำหรับผลลัพธ์ที่โปรแกรมอ่านได้, behavior hint ที่ host ใช้ตัดสินใจว่าต้องถามยืนยันไหม และ metadata อย่าง title กับ icon ที่ทำให้ tool ดูดีบน UI'
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## text มีไว้ให้ model, structure มีไว้ให้โปรแกรม
+
+array `content` ของ tool คือสิ่งที่ language model อ่าน แต่ยิ่งนานไป *ผู้บริโภค* ผลลัพธ์ของ tool ก็ยิ่งไม่ใช่ model — แต่เป็นโค้ด: host ที่ generate wrapper แบบมี type, sandbox แบบ "code mode" ที่ต่อ tool เป็นลูกโซ่, MCP App ที่ render chart ผู้บริโภคพวกนี้อยากได้ JSON ที่รู้ shape ไม่ใช่ prose ที่ต้องมา parse
+
+MCP ให้ทั้งสองช่องทางในผลลัพธ์เดียว:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "result": {
+    "resultType": "complete",
+    "content": [ { "type": "text", "text": "{\"name\":\"Travel mug\",\"price\":24}" } ],
+    "structuredContent": { "name": "Travel mug", "price": 24 }
+  }
+}
+```
+
+- `structuredContent` — JSON value อะไรก็ได้ (object, array, string, number, boolean หรือ null) ถ้า tool ประกาศ `outputSchema` ค่านี้ **ต้อง** ตรงตาม schema นั้น
+- `content` — ยังคงต้องมี เพื่อ backward compatibility tool ที่คืน structured content ควรคืน JSON ที่ serialize แล้วเป็น block `text` ด้วย เพื่อให้ client รุ่นเก่าและ model ยังได้อะไรไปบ้าง
+
+<Mermaid title="ผู้บริโภคสองแบบ ช่องทางสองช่อง" code={channelsDiagram} />
+
+export const channelsDiagram = `flowchart LR
+  S["Tool result"] --> C["content[] text"]
+  S --> SC["structuredContent"]
+  C --> LLM["Language model อ่าน prose"]
+  SC --> Code["Host code validate กับ outputSchema"]
+  SC --> App["MCP App render UI"]`;
+
+อย่าสับสนกับฟีเจอร์ "structured outputs" ของ LLM `structuredContent` คือข้อมูลที่ *server ผลิต* ไม่เกี่ยวอะไรกับวิธีที่ model generate text
+
+## การประกาศ output schema
+
+```json
+{
+  "name": "product_details",
+  "description": "Look up one product by its exact name",
+  "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] },
+  "outputSchema": {
+    "type": "object",
+    "properties": { "name": { "type": "string" }, "price": { "type": "number" } },
+    "required": ["name", "price"]
+  }
+}
+```
+
+สัญญาที่มาพร้อมกัน:
+
+- server **ต้อง** คืน `structuredContent` ที่ตรงตาม `outputSchema`
+- client **ควร** validate `structuredContent` กับ schema นั้น (และทำตามกฎ `$ref` — ห้าม fetch `$ref` ที่ชี้ไป network โดยอัตโนมัติ)
+- `outputSchema` เป็น JSON Schema 2020-12 อะไรก็ได้ รวมถึง array ที่ root:
+
+```json
+{ "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } }
+```
+
+ทำไปทำไม? host ที่รู้ shape ของ output จะ generate function แบบมี type ได้ (`productDetails(name): Promise<{name: string; price: number}>`) สำหรับ programmatic tool calling, ต่อ tool ของคุณเข้ากับตัวอื่นโดยไม่ต้องให้ข้อมูลไหลผ่าน model และปฏิเสธผลลัพธ์ที่ผิดรูปก่อนมันจะไปปนเปื้อนบทสนทนา tool ที่ไม่มี `outputSchema` จะตกไปอยู่ในสภาพ "มันเป็น string นะ โชคดี"
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    server.registerTool(
+      'product_details',
+      {
+        description: 'Look up one product by its exact name',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ name: z.string(), price: z.number() }),
+      },
+      async ({ name }) => {
+        const product = catalog.find((p) => p.name === name);
+        if (!product) {
+          return { content: [{ type: 'text', text: `No product named ${name}` }], isError: true };
+        }
+        const output = { name: product.name, price: product.price };
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        };
+      },
+    );
+    ```
+    เมื่อตั้ง `outputSchema` แล้ว ผลลัพธ์ต้องมี `structuredContent` และ SDK จะ validate มันกับ schema ก่อนส่ง
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from pydantic import BaseModel, Field
+
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("catalog")
+
+
+    class Product(BaseModel):
+        name: str
+        price: float = Field(description="Price in USD.")
+
+
+    @mcp.tool()
+    def product_details(name: str) -> Product:
+        """Look up one product by its exact name."""
+        for p in CATALOG:
+            if p["name"] == name:
+                return Product(**p)
+        raise ToolError(f"No product named {name!r}")
+    ```
+    การ return pydantic `BaseModel` ให้ object แบบ **unwrapped**: JSON schema ของ model กลายเป็น `outputSchema` และ instance กลายเป็น `structuredContent` การ return ค่า primitive อย่าง `str` หรือ `int` จะถูก **wrap** — SDK สร้าง schema หน้าตาแบบ `{"result": …}` เพื่อให้ค่ายังมี shape ที่ชัดเจน
+  </TabItem>
+</Tabs>
+
+## annotation: บอก host ว่า tool ทำตัวยังไง
+
+host คือคนตัดสินใจว่าจะถามคนก่อนรัน tool ไหม มันอ่านโค้ดของคุณไม่ได้ ดังนั้นบอกมันด้วย **annotation**:
+
+```json
+{
+  "name": "clear_catalog",
+  "title": "Clear the catalog",
+  "description": "Remove every product from the catalog",
+  "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
+}
+```
+
+| Hint | ค่าเริ่มต้น | ความหมาย |
+|------|---------|---------|
+| `readOnlyHint` | `false` | tool ไม่แก้ไข environment ของมัน |
+| `destructiveHint` | `true` | ถ้าไม่ใช่ read-only tool อาจทำการอัปเดตแบบทำลาย (ลบ, เขียนทับ) ไม่ใช่แค่เพิ่มอย่างเดียว |
+| `idempotentHint` | `false` | เรียกซ้ำด้วย argument เดิมไม่มีผลเพิ่มเติม |
+| `openWorldHint` | `true` | tool ติดต่อกับสิ่งภายนอก (เว็บ, third-party API) ไม่ใช่ระบบปิด |
+
+host ที่ทำตัวดีจะทำอะไรกับสิ่งเหล่านี้:
+
+- อนุมัติ tool ที่ `readOnlyHint: true` อัตโนมัติ; ถามยืนยันกับตัวที่ destructive
+- retry tool ที่ `idempotentHint: true` ได้อย่างปลอดภัยหลัง timeout; ไม่ retry ตัวที่ไม่ idempotent แบบสุ่มสี่สุ่มห้า
+- ติดธง tool ที่ `openWorldHint: true` บน UI เพื่อให้ user รู้ว่าข้อมูลอาจออกนอกเครื่อง
+
+ค่าเริ่มต้นถูกตั้งให้ *มองโลกในแง่ร้าย* โดยตั้งใจ: tool ที่ไม่มี annotation จะถูกมองว่าอาจ destructive, ไม่ idempotent และ open-world ดังนั้นตั้งมันซะ — tool ค้นหาแบบ read-only ที่ไม่ประกาศ `readOnlyHint` จะสร้างหน้ายืนยันที่ไม่จำเป็นขึ้นมา
+
+### annotation คือคำใบ้ ไม่ใช่การรับประกัน
+
+spec พูดตรง ๆ: **client ต้องถือว่า tool annotation เชื่อถือไม่ได้ เว้นแต่มาจาก server ที่เชื่อถือ** server ที่ประสงค์ร้ายจะติดป้าย `rm -rf` ว่า read-only ก็ได้ annotation ช่วยให้ประสบการณ์กับ server ที่คุณเชื่อถือดีขึ้น แต่ไม่ใช่ security boundary host ยังควรแสดง input ของ tool ให้ user ดูก่อนส่ง และ user ยังต้องปฏิเสธการเรียกใดก็ได้
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    server.registerTool(
+      'clear_catalog',
+      {
+        title: 'Clear the catalog',
+        description: 'Remove every product from the catalog',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+      },
+      async () => {
+        catalog.length = 0;
+        return { content: [{ type: 'text', text: 'Catalog cleared' }] };
+      },
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.types import ToolAnnotations
+
+
+    @mcp.tool(
+        title="Clear the catalog",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True),
+    )
+    def clear_catalog() -> str:
+        """Remove every product from the catalog."""
+        CATALOG.clear()
+        return "Catalog cleared"
+    ```
+  </TabItem>
+</Tabs>
+
+## `title` กับ `name`
+
+`name` คือตัวระบุที่ model ใช้ใน `tools/call`; ต้องทำตามกฎการตั้งชื่อและไม่ควรเปลี่ยนพร่ำเพรื่อ `title` คือข้อความอิสระสำหรับคน: "Search the product catalog" แทนที่จะเป็น `search_catalog` host แสดง `title` ในหน้ายืนยันและตัวเลือก tool และถอยไปใช้ `name` เมื่อไม่มี resource และ prompt ก็แยกแบบเดียวกัน
+
+## icon
+
+tool, prompt, resource และตัว server เองแนบ `icons` ได้:
+
+```json
+{ "icons": [ { "src": "https://example.com/search.png", "mimeType": "image/png", "sizes": ["48x48"] } ] }
+```
+
+อนุญาตเฉพาะ URI แบบ `https:` และ `data:`; client ต้องปฏิเสธ `javascript:`, `file:` และ scheme อื่น, fetch icon โดยไม่แนบ credential และตรวจว่า origin ของ icon ตรงกับของ server client ที่ render icon ต้องรองรับ PNG และ JPEG และควรรองรับ SVG (พร้อม sanitize — SVG มี script ได้) และ WebP มอง icon เป็นของแถมสำหรับ host แบบกราฟิก อย่าให้ server ของคุณต้องพึ่งมัน
+
+## `x-mcp-header`
+
+มีอีก property หนึ่งที่โผล่ใน `inputSchema` ได้: `"x-mcp-header": "Region"` บน parameter ชนิด primitive จะบอก client แบบ Streamable HTTP ให้สะท้อน argument นั้นไปเป็น header `Mcp-Param-Region` เพื่อให้ load balancer route ได้โดยไม่ต้อง parse body มันเป็นเรื่องของ transport ที่มีข้อจำกัดเข้มงวด — อยู่ในบท [Streamable HTTP](/mcp/th/transports/streamable-http/) ห้ามใช้กับข้อมูลลับเด็ดขาด
+
+<Callout title="สรุปหนึ่งบรรทัด">
+คืน `structuredContent` ที่ตรงตาม `outputSchema` ทุกครั้งที่โค้ดจะเป็นผู้บริโภคผลลัพธ์ และคง text block ไว้ข้าง ๆ สำหรับ model ตั้ง annotation hint ทั้งสี่ตัวเพื่อให้ host ที่เชื่อถือข้ามการยืนยันที่ไม่จำเป็นและ retry ได้อย่างปลอดภัย — แต่จำไว้ว่า client ถือว่ามันเชื่อถือไม่ได้ ดังนั้นมันคือ UX ไม่ใช่ security
+</Callout>
+
+export const quizStructured = [
+  {
+    q: 'tool ประกาศ outputSchema server ต้องทำอะไร?',
+    options: [
+      'ตัด content array ออก',
+      'คืน structuredContent ที่ตรงตาม schema',
+      'คืนแค่ text block ที่มี JSON',
+      'ตั้ง isError เป็น false อย่างชัดเจน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ค่าเริ่มต้นของ destructiveHint คืออะไรเมื่อ tool ไม่มี annotation?',
+    options: [
+      'false — ถือว่า tool ปลอดภัย',
+      'true — tool ที่ไม่ใช่ read-only ถูกมองว่าอาจ destructive',
+      'null — host ต้องถาม server',
+      'ขึ้นกับ openWorldHint',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client ต้องปฏิบัติกับ tool annotation จาก server ที่ไม่รู้จักอย่างไร?',
+    options: [
+      'ถือเป็นการรับประกันด้าน security ที่ผูกมัด',
+      'ถือเป็นคำใบ้ที่เชื่อถือไม่ได้ ซึ่งไม่ทดแทนการยืนยันจาก user',
+      'ถือเป็น field บังคับที่ validation จะล้มเหลวถ้าไม่มี',
+      'ถือเป็นเอกสารที่แสดงให้ developer เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'icon src แบบไหนที่ client ต้องปฏิเสธ?',
+    options: [
+      'https://example.com/icon.png',
+      'data:image/png;base64,iVBORw0…',
+      'javascript:alert(1)',
+      'https://example.com/icon.svg',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="server-primitives/structured-output-and-annotations" questions={quizStructured} />
+
+<ProgressTracker client:visible id="server-primitives/structured-output-and-annotations" />

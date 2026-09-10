@@ -1,0 +1,308 @@
+---
+title: 'Architecture: Data Layer and Transport Layer'
+description: 'The two layers of MCP, a full discover → list → call → notify exchange with the exact JSON on the wire, and how a host merges tools from many servers into one model tool list.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Two layers
+
+MCP is built as an inner **data layer** wrapped by an outer **transport layer**. Keeping them apart is what lets the same message travel over a subprocess pipe or an HTTPS connection unchanged.
+
+<Mermaid title="The data layer is the same on every transport" code={layersDiagram} />
+
+export const layersDiagram = `flowchart TB
+  subgraph T["Transport layer"]
+    direction LR
+    T1["stdio: newline-delimited JSON over stdin/stdout"]
+    T2["Streamable HTTP: one POST endpoint, JSON or SSE replies, OAuth"]
+  end
+  subgraph D["Data layer (JSON-RPC 2.0)"]
+    direction LR
+    D1["Discovery: server/discover"]
+    D2["Primitives: tools, resources, prompts"]
+    D3["Client features: elicitation"]
+    D4["Utilities: progress, subscriptions, caching, pagination"]
+  end
+  T --> D`;
+
+**Data layer** — a JSON-RPC 2.0 exchange protocol. It defines every message shape and its meaning: how a client discovers what a server supports, the three server primitives, elicitation, and utilities such as progress notifications and change subscriptions. Every implementation must support the base protocol, versioning, and the message patterns; the rest is opt-in.
+
+**Transport layer** — how those messages actually move. **stdio** for local subprocesses; **Streamable HTTP** for remote servers, including the authorization framework built on OAuth 2.1. The transport handles connection establishment, message framing, and security; it never changes what the messages mean.
+
+Most server authors spend all their time in the data layer, because that is where tools, resources, and prompts live. You pick a transport once, at deployment.
+
+## A full exchange, on the wire
+
+Here is a complete interaction between a client and a small server. Every request carries its protocol version and client capabilities in `_meta`, so the server can process each one independently — there is no handshake and no session.
+
+### 1. Discovery
+
+A client that wants to know what a server supports before doing anything else sends `server/discover`. Every server must implement it.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "server/discover",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"],
+    "capabilities": {
+      "tools": { "listChanged": true },
+      "resources": {}
+    },
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": { "name": "example-server", "version": "1.0.0" }
+    },
+    "ttlMs": 3600000,
+    "cacheScope": "public"
+  }
+}
+```
+
+Three things happen in this one round trip. The client declares which **version** it speaks and the server lists the versions it accepts. Each side declares its **capabilities** — the client can handle elicitation; the server has tools (and will notify when the list changes) and resources. And each side **identifies** itself for logs and debugging. The `ttlMs` says the answer can be cached for an hour.
+
+### 2. Tool discovery
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/list",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "tools": [
+      {
+        "name": "weather_current",
+        "title": "Weather Information",
+        "description": "Get current weather information for any location worldwide",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "location": { "type": "string", "description": "City name, address, or coordinates" },
+            "units": { "type": "string", "enum": ["metric", "imperial", "kelvin"], "default": "metric" }
+          },
+          "required": ["location"]
+        }
+      }
+    ],
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+```
+
+Each tool has a `name` (the key used to call it), a human `title`, a `description` the model reads to decide when to use it, and an `inputSchema` (JSON Schema) that says what arguments it takes.
+
+### 3. Tool execution
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "weather_current",
+    "arguments": { "location": "San Francisco", "units": "imperial" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "resultType": "complete",
+    "content": [
+      { "type": "text", "text": "Current weather in San Francisco: 68°F, partly cloudy, humidity 65%" }
+    ]
+  }
+}
+```
+
+The result is a `content` array — a list of typed blocks (text here; images, audio, and resources are also allowed) — that the host feeds back to the model.
+
+### 4. Change notifications
+
+Notifications are opt-in. A client that wants to hear when the tool list changes opens a long-lived stream with `subscriptions/listen`, naming the notification types it wants:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "subscriptions/listen",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    },
+    "notifications": { "toolsListChanged": true }
+  }
+}
+```
+
+The server first acknowledges, echoing the subset it will honour, then delivers notifications on that stream as they happen. Every message on the stream carries the subscription's ID (the JSON-RPC `id` of the `subscriptions/listen` request) in `_meta`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/subscriptions/acknowledged",
+  "params": {
+    "_meta": { "io.modelcontextprotocol/subscriptionId": 4 },
+    "notifications": { "toolsListChanged": true }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/tools/list_changed",
+  "params": { "_meta": { "io.modelcontextprotocol/subscriptionId": 4 } }
+}
+```
+
+A notification has no `id` and expects no response. On receiving it, the client simply sends `tools/list` again.
+
+<Mermaid title="The whole exchange in order" code={exchangeDiagram} />
+
+export const exchangeDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: server/discover
+  S-->>C: versions, capabilities, serverInfo
+  C->>S: tools/list
+  S-->>C: tool definitions
+  C->>S: tools/call weather_current
+  S-->>C: content blocks
+  C->>S: subscriptions/listen (toolsListChanged)
+  S-->>C: notifications/subscriptions/acknowledged
+  S-->>C: notifications/tools/list_changed
+  C->>S: tools/list (refresh)`;
+
+## How a host merges many servers into one model
+
+The host is the only participant that sees everything. Its job is to turn N servers' primitives into one coherent set of capabilities for the model, then route each model decision back to the right server. In pseudo-code:
+
+```python
+# 1. Connect and discover
+for cfg in configured_servers:
+    client = await connect(cfg)            # SDK sends server/discover for you
+    if client.server_capabilities.tools:
+        app.register(client)
+
+# 2. Build one tool list for the model
+available_tools = []
+for client in app.mcp_clients():
+    result = await client.list_tools()
+    for tool in result.tools:
+        # namespace to avoid collisions between servers
+        available_tools.append(rename(tool, f"{client.name}_{tool.name}"))
+conversation.register_available_tools(available_tools)
+
+# 3. Route each model tool call to its server
+async def handle_tool_call(tool_name, arguments):
+    client, original = app.find_client_for(tool_name)
+    result = await client.call_tool(original, arguments)
+    conversation.add_tool_result(result.content)
+```
+
+Three design points hide in that sketch:
+
+- **Namespacing.** Tool names are unique only within a server. Two servers can both expose `search`; the host prefixes them (`github_search`, `docs_search`) so the model can tell them apart.
+- **Human in the loop.** Before step 3 runs a sensitive tool, a good host shows the user the tool name and arguments and asks. The protocol strongly recommends this.
+- **Freshness.** The host caches `tools/list` for the advertised `ttlMs`, but treats the cache as stale the moment a `list_changed` notification arrives.
+
+The [Building Clients & Hosts](/mcp/en/building-clients/) module turns this sketch into working code against the Claude API.
+
+<Callout title="The one-line takeaway">
+MCP is a JSON-RPC data layer (discover, list, call, notify) carried by an interchangeable transport layer (stdio or Streamable HTTP); every request is self-describing via `_meta`, and the host's job is to merge every server's tools into one namespaced list for the model and route calls back.
+</Callout>
+
+export const quizArch = [
+  {
+    q: 'Which layer defines what tools/call means?',
+    options: [
+      'The transport layer',
+      'The data layer',
+      'The LLM API',
+      'The host UI',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What must every client request carry in _meta?',
+    options: [
+      'A session ID',
+      'The protocol version and the client capabilities',
+      'An OAuth token',
+      'The user’s name',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a client receive notifications/tools/list_changed?',
+    options: [
+      'Automatically on every connection',
+      'By polling tools/list every second',
+      'By opening a subscriptions/listen stream that opts in to toolsListChanged',
+      'By setting listChanged in its own capabilities',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Why does a host prefix tool names with the server name?',
+    options: [
+      'The spec requires it',
+      'Tool names are unique only within one server, so two servers may both expose the same name',
+      'It makes the tools run faster',
+      'The model cannot read names shorter than 10 characters',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/architecture-and-layers" questions={quizArch} />
+
+<ProgressTracker client:visible id="mcp-foundations/architecture-and-layers" />

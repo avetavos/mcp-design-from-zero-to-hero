@@ -1,0 +1,208 @@
+---
+title: 'Streamable HTTP'
+description: 'transport แบบ remote: POST endpoint เดียว, JSON หรือ SSE ต่อ request, header ที่ mirror มาซึ่ง intermediary พึ่งพา, subscriptions/listen ในฐานะ stream ที่เปิดค้างยาว และกฎ security ที่ HTTP server ทุกตัวต้องทำตาม'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## endpoint เดียว รับแค่ POST
+
+ใน **Streamable HTTP** server เป็น process อิสระที่ให้บริการหลาย client พร้อมกันได้ มันเปิด HTTP endpoint path เดียว — เรียกว่า *MCP endpoint* เช่น `https://example.com/mcp` — ที่รับ `POST` ภาพรวม:
+
+- client ส่ง JSON-RPC request หรือ notification **ทุกตัว** เป็น HTTP POST ของตัวเอง
+- server ตอบ request ด้วย JSON object เดียว หรือ Server-Sent Events stream ที่ผูกกับ request นั้นโดยเฉพาะ
+- การโต้ตอบจาก server ไป client (elicitation, sampling, roots) ถูกฝังใน result เป็น `InputRequiredResult` ไม่เคยส่งเป็น request แยก
+- change notification ที่อยู่ยาว ๆ มาทาง response stream ของ request `subscriptions/listen`
+
+Streamable HTTP เข้ามาแทน transport แบบ HTTP+SSE ใน 2025-03-26; revision 2026-07-28 ถอด GET stream และ session ระดับ protocol ออก ถ้าคุณเคยเห็น `Mcp-Session-Id` หรือ GET endpoint นั่นคือ legacy (2025-11-25 และก่อนหน้า) — ดู [Backward Compatibility](/mcp/th/transports/backward-compatibility/)
+
+<Mermaid title="สาม flow บน endpoint เดียว" code={httpDiagram} />
+
+export const httpDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  Note over C,S: response แบบธรรมดา
+  C->>S: POST tools/call
+  S-->>C: 200 application/json (response)
+  Note over C,S: response แบบ streaming
+  C->>S: POST tools/call
+  S-->>C: 200 text/event-stream: notifications/progress
+  S-->>C: SSE: notifications/progress
+  S-->>C: SSE: response, stream ปิด
+  Note over C,S: change notification
+  C->>S: POST subscriptions/listen
+  S-->>C: SSE: notifications/subscriptions/acknowledged
+  S-->>C: SSE: notifications/tools/list_changed (stream เปิดค้าง)`;
+
+## การส่ง
+
+กฎสำหรับ client บนทุก POST:
+
+1. ใช้ `POST`
+2. ส่ง `Accept: application/json, text/event-stream` — client ต้องรองรับ response ทั้งสองรูปแบบ
+3. ใส่ request metadata header (ด้านล่าง)
+4. body คือ JSON-RPC request หรือ notification **ตัวเดียว** client ไม่มีทาง POST JSON-RPC response
+
+ถ้า body เป็น **notification** และ server รับ มันจะตอบ `202 Accepted` โดยไม่มี body; ไม่เช่นนั้นตอบ HTTP error เช่น `400` ถ้า body เป็น **request** server จะตอบด้วย `Content-Type: application/json` (object เดียว) หรือ `Content-Type: text/event-stream` (SSE stream) server เลือกได้เป็นราย request; client ต้องรับมือได้ทั้งสองแบบ
+
+## การรับ SSE stream
+
+เมื่อ server เลือก SSE stream นั้นจะผูกกับ request ต้นทาง:
+
+- มัน **อาจ** พก notification ที่เกี่ยวกับ request นั้น — `notifications/progress`, `notifications/message` — มาก่อน response สุดท้าย
+- มัน **ห้าม** พก JSON-RPC request อิสระ (legacy server เคย push `sampling/createMessage` บน SSE ได้; server ยุคใหม่ทำไม่ได้)
+- JSON-RPC response สุดท้าย **ควร** เป็นตัวปิด stream
+
+กฎเชิงปฏิบัติสองข้อสำหรับ server: ส่ง `X-Accel-Buffering: no` เพื่อไม่ให้ reverse proxy อย่าง nginx buffer event และบน stream ที่ยาว ให้ส่ง SSE comment line (`:` ตามด้วย newline) เป็นระยะเพื่อเป็น keep-alive — client ต้องเพิกเฉย comment line stream ที่ resume ได้ผ่าน `Last-Event-ID` **ไม่รองรับ**; response stream ที่ขาดจะทำให้ request ที่ค้างอยู่หายไป และ client ต้องส่งใหม่ด้วย ID ใหม่
+
+## request metadata header
+
+Streamable HTTP mirror บาง field ของ body ไปเป็น header เพื่อให้ intermediary route ได้โดยไม่ต้อง parse JSON
+
+| Header | ต้นทาง | บังคับสำหรับ |
+|--------|--------|--------------|
+| `MCP-Protocol-Version` | `_meta["io.modelcontextprotocol/protocolVersion"]` | ทุก request |
+| `Mcp-Method` | `method` | ทุก request |
+| `Mcp-Name` | `params.name` หรือ `params.uri` | `tools/call`, `resources/read`, `prompts/get` |
+
+```http
+POST /mcp HTTP/1.1
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: get_weather
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "Seattle, WA" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "ExampleClient", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+สำหรับ `resources/read` `Mcp-Name` จะพก URI เช่น `Mcp-Name: file:///projects/myapp/config.json`
+
+### การ validate ฝั่ง server
+
+server ที่ประมวลผล body **ต้อง** ตรวจว่า header ตรงกับมัน ถ้าไม่ตรง, header บังคับหายไป หรือมีตัวอักษรที่ไม่ถูกต้อง จะถูกปฏิเสธด้วย `400 Bad Request` และ JSON-RPC error `-32020` (`HeaderMismatch`):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": { "code": -32020, "message": "Header mismatch: Mcp-Name header value 'foo' does not match body value 'bar'" }
+}
+```
+
+ทำไมต้องเข้มขนาดนี้? load balancer อาจ route ตาม header ในขณะที่ server ทำงานตาม body ถ้าสองอย่างนี้ขัดกันได้ ผู้โจมตีจะเล็ง request ไปที่ route ของ tenant หนึ่งแต่ใช้ข้อมูลของอีก tenant ได้ ชื่อ header ไม่สนตัวพิมพ์เล็กใหญ่; ค่าของ header สนตัวพิมพ์
+
+status code อีกสองตัวที่ควรรู้: protocol version ที่ไม่รองรับ → `400` พร้อม `UnsupportedProtocolVersionError` (-32022) ที่ระบุ version ที่รองรับ; RPC method ที่ไม่รู้จัก → `404 Not Found` พร้อม `-32601` JSON-RPC body คือสิ่งที่แยก `404` ของ server ยุคใหม่ออกจาก legacy server ที่แค่ไม่มี route `/mcp`
+
+## custom header จาก parameter ของ tool
+
+server อาจทำเครื่องหมาย parameter ของ tool ด้วย `x-mcp-header` ใน `inputSchema`; HTTP client ที่ทำตาม spec จะ mirror argument นั้นไปเป็น `Mcp-Param-{Name}`:
+
+```json
+{
+  "name": "execute_sql",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "region": { "type": "string", "x-mcp-header": "Region" },
+      "query": { "type": "string" }
+    },
+    "required": ["region", "query"]
+  }
+}
+```
+
+call ที่มี `"region": "us-west1"` จะพก `Mcp-Param-Region: us-west1` ทำให้ gateway route ไป region ที่ถูกต้องได้ก่อน body จะถูก parse ด้วยซ้ำ ข้อจำกัด: ใช้ได้กับ parameter ประเภท primitive `string`/`integer`/`boolean` เท่านั้น (ไม่ใช่ `number`), ชื่อต้องเป็น HTTP token ที่ถูกต้องและไม่ซ้ำ และ property ต้องเข้าถึงได้ผ่าน key `properties` ล้วน ๆ — ไม่ผ่าน `items`, `oneOf`, `$ref` และอื่น ๆ client ต้องตัด tool ที่ annotation ผิดกฎเหล่านี้ทิ้งแทนที่จะส่งมัน
+
+ค่าที่ไม่ใช่ ASCII ล้วน หรือมี whitespace นำหน้า/ตามหลัง หรือมี newline จะถูก encode เป็น Base64 พร้อม sentinel และกฎเดียวกันนี้ครอบคลุม `Mcp-Name` ที่ผิดปกติด้วย:
+
+```text
+Mcp-Param-Greeting: =?base64?SGVsbG8sIOS4lueVjA==?=
+```
+
+**ห้าม** ทำเครื่องหมาย password, API key, token หรือ PII ด้วย `x-mcp-header` เด็ดขาด ค่าของ header มองเห็นได้โดย intermediary ทุกตัวบนเส้นทาง
+
+## notification ที่อยู่ยาว
+
+ไม่มี GET stream client ที่ต้องการ change notification จะส่ง POST `subscriptions/listen`; response ของ server เป็น SSE stream ที่เปิดค้างไว้และพกเฉพาะประเภทที่ client opt-in (`toolsListChanged`, `promptsListChanged`, `resourcesListChanged`, `resourceSubscriptions`) notification ที่ผูกกับ request อย่าง progress ไม่มีทางวิ่งบน stream นี้ — มันอยู่บน response stream ของ request ที่มันเกี่ยวข้อง รายละเอียดอยู่ใน [change notifications](/mcp/th/server-primitives/notifications-and-caching/)
+
+## Cancellation
+
+การปิด SSE response stream **ต้อง** ถูก server ถือว่าเป็นการ cancel request นั้น แต่ละ request มี stream ของตัวเอง การ disconnect จึงไม่กำกวม; ไม่มีการคาดหวัง message `notifications/cancelled` บน HTTP server ควรหยุดงานทันทีและห้ามส่ง message เพิ่มสำหรับมัน
+
+## ข้อกำหนดด้าน security
+
+1. server **ต้อง** validate header `Origin` บน connection ขาเข้าทั้งหมดเพื่อป้องกัน DNS rebinding `Origin` ที่มีแต่ไม่ถูกต้องจะได้ `403 Forbidden`
+2. เมื่อรันในเครื่อง ให้ bind กับ `127.0.0.1` ไม่ใช่ `0.0.0.0`
+3. implement authentication ที่เหมาะสมสำหรับทุก connection — สำหรับ remote server นั่นหมายถึง OAuth 2.1 flow ใน [Security and Authorization](/mcp/th/security-and-auth/oauth-flow/)
+
+ถ้าไม่มีสิ่งเหล่านี้ หน้าเว็บใน browser ของผู้ใช้จะคุยกับ local MCP server ราวกับว่ามันเป็น host ได้
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Streamable HTTP คือ POST endpoint เดียว: แต่ละ message เป็น request ของตัวเอง คำตอบเป็น JSON หรือ SSE stream ที่ผูกกับ request, method/name/version ใน body ถูก mirror ไป `Mcp-Method`, `Mcp-Name` และ `MCP-Protocol-Version` (และต้องตรงกัน ไม่งั้น -32020), change notification วิ่งบน stream `subscriptions/listen`, การปิด stream คือการ cancel — และคุณต้อง validate `Origin`, bind localhost และมี authentication
+</Callout>
+
+export const quizHttp = [
+  {
+    q: 'client POST JSON-RPC notification response ที่ถูกต้องเมื่อสำเร็จคืออะไร?',
+    options: [
+      '200 พร้อม JSON-RPC response ว่าง',
+      '202 Accepted โดยไม่มี body',
+      '204 พร้อม body แบบ text/event-stream',
+      '201 Created',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'header Mcp-Name บอกว่า "foo" แต่ body บอกว่า "bar" server ต้องทำอย่างไร?',
+    options: [
+      'เชื่อ header แล้ว route ตามมัน',
+      'ปฏิเสธด้วย 400 และ JSON-RPC error -32020 HeaderMismatch',
+      'เชื่อ body แล้วเพิกเฉย header',
+      'ตอบ 404',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client cancel request บน Streamable HTTP ได้อย่างไร?',
+    options: [
+      'ส่ง notifications/cancelled ใน POST ใหม่',
+      'ปิด SSE response stream ของ request นั้น',
+      'ส่ง HTTP DELETE ไปที่ endpoint',
+      'ส่ง request ID เดิมอีกครั้ง',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'parameter ไหนเป็นเป้าหมายที่ถูกต้องสำหรับ x-mcp-header?',
+    options: [
+      'latitude ที่มี type เป็น number',
+      'region ที่เป็น string อยู่ภายใน items array',
+      'property region ที่เป็น string ระดับบนสุด',
+      'API key ที่เป็น string เพื่อให้ gateway ทำ authentication ได้',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="transports/streamable-http" questions={quizHttp} />
+
+<ProgressTracker client:visible id="transports/streamable-http" />

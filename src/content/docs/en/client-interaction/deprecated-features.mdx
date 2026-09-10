@@ -1,0 +1,266 @@
+---
+title: 'Deprecated: Sampling, Roots, and Logging'
+description: 'What sampling, roots, and logging did, how they look after 2026-07-28, why SEP-2577 deprecated them, and the concrete migration for each — direct LLM calls, explicit paths, and stderr or OpenTelemetry.'
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Three features on their way out
+
+The 2026-07-28 revision deprecated three client-side features in one stroke (SEP-2577): **sampling**, **roots**, and **logging**. They are not gone — deprecated features keep working for at least twelve months under the feature lifecycle policy, and they are listed in the deprecated-features registry so you can track them. But new implementations should not adopt them, and existing ones should plan the migration.
+
+This lesson covers what each did, what it looks like today, and what to do instead.
+
+## Sampling
+
+### What it did
+
+Sampling let a *server* ask the *host's* LLM for a completion — "summarize this diff for me" — without bundling an LLM SDK or API key. The request was `sampling/createMessage`:
+
+```json
+{
+  "method": "sampling/createMessage",
+  "params": {
+    "messages": [
+      { "role": "user", "content": { "type": "text", "text": "Summarize this changelog in one line: …" } }
+    ],
+    "systemPrompt": "You are terse.",
+    "maxTokens": 100,
+    "modelPreferences": {
+      "hints": [{ "name": "claude" }],
+      "intelligencePriority": 0.8,
+      "speedPriority": 0.5,
+      "costPriority": 0.2
+    }
+  }
+}
+```
+
+`modelPreferences` was advisory: `hints` were substring matches on model names, and the three priorities (0–1) let the host pick a model. The host kept the human in the loop — it could show, edit, or refuse the prompt and the completion.
+
+### How it appears now
+
+In 2026-07-28 a server cannot send requests, so the *only* place a `sampling/createMessage` may appear is inside an `InputRequiredResult.inputRequests` map under [MRTR](/mcp/en/client-interaction/multi-round-trip-requests/). The client runs the completion and returns a `CreateMessageResult` in `inputResponses`:
+
+```json
+{
+  "capital": {
+    "role": "assistant",
+    "content": { "type": "text", "text": "The capital of France is Paris." },
+    "model": "claude-opus-5",
+    "stopReason": "endTurn"
+  }
+}
+```
+
+The `includeContext` values `"thisServer"` and `"allServers"` were soft-deprecated in 2025-11-25 and are now formally deprecated; omit the field or send `"none"`.
+
+### Why it was deprecated
+
+Two reasons. First, statelessness: a completion is expensive, and forcing it through an MRTR retry means the host pays for it and then re-sends the whole original request. Second, the host's model is not the server's model — quality, cost, and safety policies belonged to whoever owns the API key. Servers that need an LLM are better served calling one.
+
+### Migration: call your provider directly
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import Anthropic from '@anthropic-ai/sdk';
+
+    const anthropic = new Anthropic(); // reads ANTHROPIC_API_KEY from the environment
+
+    async function summarize(text: string): Promise<string> {
+      const msg = await anthropic.messages.create({
+        model: 'claude-opus-5',
+        max_tokens: 256,
+        system: 'You are terse.',
+        messages: [{ role: 'user', content: `Summarize in one line:\n\n${text}` }],
+      });
+      const block = msg.content[0];
+      return block.type === 'text' ? block.text : '';
+    }
+
+    server.registerTool(
+      'summarize_changelog',
+      { description: 'One-line changelog summary', inputSchema: z.object({ text: z.string() }) },
+      async ({ text }) => ({ content: [{ type: 'text', text: await summarize(text) }] })
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import anthropic
+
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("changelog")
+    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+
+
+    @mcp.tool()
+    def summarize_changelog(text: str) -> str:
+        """One-line changelog summary."""
+        msg = client.messages.create(
+            model="claude-opus-5",
+            max_tokens=256,
+            system="You are terse.",
+            messages=[{"role": "user", "content": f"Summarize in one line:\n\n{text}"}],
+        )
+        return msg.content[0].text
+    ```
+  </TabItem>
+</Tabs>
+
+On stdio, the key comes from the environment the host launches you with; on HTTP, from your own secret store. Either way the server now owns model choice, retries, and cost.
+
+## Roots
+
+### What it did
+
+Roots let a server ask the client which filesystem locations it was allowed to operate on — `roots/list` returned URIs such as `file:///home/me/project` — and `notifications/roots/list_changed` told the server when that set changed.
+
+### How it appears now
+
+`roots/list` survives only as an MRTR input request; `notifications/roots/list_changed` was removed outright (there is no client-to-server notification for it in 2026-07-28). A `ListRootsResult` still looks like this when it comes back in `inputResponses`:
+
+```json
+{
+  "roots": [{ "uri": "file:///home/me/project", "name": "project" }]
+}
+```
+
+### Migration: make the path explicit
+
+The recommended replacement is embarrassingly simple: **pass the directory as a tool argument, a resource URI, or server configuration**.
+
+- A tool that searches files takes a `path` parameter, validated against an allowlist you configure at launch.
+- A server that always works on one project takes that directory as a CLI argument or environment variable when the host spawns it — which is exactly how `npx @modelcontextprotocol/server-filesystem ~/Desktop` has always worked.
+- Files the model should *read* are better exposed as [resources](/mcp/en/server-primitives/resources/) than discovered through roots.
+
+Explicit paths are also easier to secure: you can sanitize a parameter; you cannot easily audit an implicit permission the client granted on some earlier request.
+
+## Logging
+
+### What it did
+
+Logging gave the server a channel to the client's log: the client set a threshold with `logging/setLevel`, and the server pushed `notifications/message` entries with a `level` (`debug` through `emergency`), an optional `logger` name, and arbitrary `data`.
+
+### How it appears now
+
+`logging/setLevel` was removed. The threshold is now **per request**, carried in `_meta`:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/logLevel": "info",
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {}
+  }
+}
+```
+
+A server **must not** emit `notifications/message` for a request that did not include this field, and any it does emit ride on that request's response stream, not on a subscription.
+
+### Migration: stderr and OpenTelemetry
+
+- **On stdio, log to stderr.** The transport reserves stdout for protocol messages, but stderr is explicitly for logs; the host may capture, forward, or ignore it. Never write logs to stdout.
+- **On HTTP, use your normal logging stack** and, for correlation across services, **OpenTelemetry**. The `_meta` keys `traceparent`, `tracestate`, and `baggage` are reserved for W3C trace-context propagation, so a client can hand you a trace id and your spans line up with theirs:
+
+```json
+{
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "Bangkok" },
+    "_meta": {
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01",
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // stdio server: logs go to stderr, never stdout
+    console.error(JSON.stringify({ level: 'info', msg: 'import started', files: urls.length }));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import logging
+    import sys
+
+    # stdio server: configure the root logger to stderr once, at startup
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+    logging.getLogger("catalog").info("import started: %d files", len(urls))
+    ```
+  </TabItem>
+</Tabs>
+
+## The lifecycle, so you can plan
+
+<Mermaid title="Feature lifecycle: Active, Deprecated, Removed" code={lifecycleDiagram} />
+
+export const lifecycleDiagram = `flowchart LR
+  A["Active"] --> D["Deprecated (12+ months, listed in registry)"]
+  D --> R["Removed in a later revision"]`;
+
+A deprecated feature documents its migration path and stays for at least twelve months (ninety days under the expedited exception) before it becomes eligible for removal. Sampling, roots, and logging entered Deprecated with 2026-07-28; the same revision reclassified the old HTTP+SSE transport and dynamic client registration as Deprecated too. Check the registry page for the current state before you build on anything marked Deprecated.
+
+<Callout title="The one-line takeaway">
+Sampling, roots, and logging are deprecated as of 2026-07-28: sampling and roots survive only as MRTR input requests, and logging became a per-request `_meta` level. Replace them with a direct LLM call from the server, explicit path arguments, and stderr or OpenTelemetry — and treat anything in the deprecated registry as borrowed time.
+</Callout>
+
+export const quizDeprecated = [
+  {
+    q: 'Where can sampling/createMessage still appear in a 2026-07-28 exchange?',
+    options: [
+      'As a server-initiated request on the SSE stream',
+      'Only inside InputRequiredResult.inputRequests under MRTR',
+      'On a subscriptions/listen stream',
+      'It was removed entirely',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What replaced logging/setLevel?',
+    options: [
+      'A new logging/configure request',
+      'The io.modelcontextprotocol/logLevel key in each request’s _meta',
+      'A capability flag in server/discover',
+      'Nothing — log level is fixed at info',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the recommended migration away from roots?',
+    options: [
+      'Use notifications/roots/list_changed instead',
+      'Pass directories explicitly as tool parameters, resource URIs, or server configuration',
+      'Read the host’s config file directly',
+      'Elicit the path in URL mode',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Where should a stdio server write its logs?',
+    options: [
+      'stdout, as JSON-RPC notifications',
+      'stdout, as plain lines',
+      'stderr',
+      'A file the client polls',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="client-interaction/deprecated-features" questions={quizDeprecated} />
+
+<ProgressTracker client:visible id="client-interaction/deprecated-features" />

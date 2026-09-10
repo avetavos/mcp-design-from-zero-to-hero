@@ -1,0 +1,245 @@
+---
+title: 'Protecting Your Server'
+description: 'สิ่งที่ MCP resource server ต้องตรวจในทุก request, วิธีต่อการตรวจ bearer token และ metadata endpoint ใน SDK ของ TypeScript และ Python และวิธีออกแบบ scope กับ step-up challenge'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## หน้าที่ของ server: ตรวจสอบ ไม่ใช่ออก token
+
+HTTP MCP server คือ *resource server* ตาม OAuth 2.1 มันไม่ได้ log user เข้าระบบ และไม่ได้ออก token authorization server เป็นคนทำเรื่องพวกนั้น หน้าที่ทั้งหมดของ server คือตอบคำถามเดียวในทุก ๆ request: *token นี้ใช้ได้ไหม สำหรับฉัน สำหรับ operation นี้*
+
+<Mermaid title="สิ่งที่เกิดกับทุก request ก่อน tool จะรัน" code={verifyDiagram} />
+
+export const verifyDiagram = `flowchart LR
+  R["POST /mcp"] --> T{"มี bearer token ไหม"}
+  T -->|ไม่มี| E401["401 + WWW-Authenticate"]
+  T -->|มี| V{"signature และวันหมดอายุผ่านไหม"}
+  V -->|ไม่ผ่าน| E401
+  V -->|ผ่าน| A{"audience คือ server นี้ไหม"}
+  A -->|ไม่ใช่| E401
+  A -->|ใช่| S{"scope ครอบคลุม operation ไหม"}
+  S -->|ไม่| E403["403 insufficient_scope"]
+  S -->|ใช่| H["MCP handler รัน request"]`;
+
+การตรวจตามลำดับ ตาม OAuth 2.1 section 5.2 และ RFC 8707:
+
+1. **มีและถูกรูปแบบ** header `Authorization: Bearer` ที่หายไปหรือผิดรูปแบบได้ `401` พร้อม `WWW-Authenticate` challenge ที่ชี้ไปยัง resource metadata ของคุณ
+2. **signature และวันหมดอายุ** ตรวจกับ key ของ AS (JWT) หรือผ่าน introspection (opaque token) ไม่ถูกต้องหรือหมดอายุคือ `401`
+3. **audience** token MUST ถูกออกให้ server *ตัวนี้* ซึ่งระบุด้วย canonical URI ของมัน นี่คือการตรวจที่ทำให้ token passthrough เป็นไปไม่ได้ audience ผิดคือ `401` ไม่ใช่ "รับไว้แต่จำกัดสิทธิ์"
+4. **scope** ถ้า operation ต้องการ scope ที่ token ไม่มี ตอบ `403` พร้อม `error="insufficient_scope"` และชุด scope ทั้งหมดที่ต้องการ เพื่อให้ client step-up ได้ในรอบเดียว
+
+จากนี้ตามมาด้วยกฎเด็ดขาดสองข้อ: server MUST NOT รับ token ที่ไม่ได้ออกให้ตัวเอง และ MUST NOT ส่งต่อ token ใด ๆ ที่ได้รับไปยัง service อื่น
+
+## สาม endpoint ที่คุณต้อง host
+
+| Path | หน้าที่ |
+|------|---------|
+| `/mcp` (MCP endpoint ของคุณ) | protected resource ทุก POST ถูกตรวจตามข้างบน |
+| `/.well-known/oauth-protected-resource/mcp` | Protected Resource Metadata ตาม RFC 9728 (แบบมี path; แบบ root ก็ใช้ได้) ระบุ `authorization_servers` และ `scopes_supported` ของคุณ |
+| `/.well-known/oauth-authorization-server` (mirror, ไม่บังคับ) | ถ้า AS อยู่ที่เดียวกัน คุณอาจ serve metadata ตาม RFC 8414 ของมันตรงนี้ด้วย |
+
+SDK ทั้งสองตัวให้ของพวกนี้ได้ในไม่กี่บรรทัด
+
+## ต่อเข้ากับ SDK
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    helper ของ Express ให้ทั้ง metadata router และ bearer middleware คุณแค่ใส่ verifier ซึ่งเป็นส่วนเดียวที่รู้จัก AS ของคุณ
+
+    ```ts
+    import type { OAuthTokenVerifier } from '@modelcontextprotocol/express';
+    import {
+        createMcpExpressApp,
+        getOAuthProtectedResourceMetadataUrl,
+        mcpAuthMetadataRouter,
+        requireBearerAuth
+    } from '@modelcontextprotocol/express';
+    import { toNodeHandler } from '@modelcontextprotocol/node';
+    import type { AuthInfo, OAuthMetadata } from '@modelcontextprotocol/server';
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+
+    const mcpServerUrl = new URL('https://api.example.com/mcp');
+
+    // verifier ของคุณ: ตรวจ signature, วันหมดอายุ, audience แล้วคืน AuthInfo หรือ throw
+    async function verifyAccessToken(token: string): Promise<AuthInfo> {
+        const claims = await verifyJwt(token, { audience: mcpServerUrl.href });
+        return { token, clientId: claims.client_id, scopes: claims.scope.split(' ') };
+    }
+    const verifier: OAuthTokenVerifier = { verifyAccessToken };
+
+    const auth = requireBearerAuth({
+        verifier,
+        requiredScopes: ['mcp'],
+        resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpServerUrl)
+    });
+
+    const app = createMcpExpressApp({ host: '0.0.0.0', allowedHosts: ['api.example.com'] });
+    app.use(mcpAuthMetadataRouter({ oauthMetadata, resourceServerUrl: mcpServerUrl }));
+
+    const node = toNodeHandler(createMcpHandler(buildServer));
+    app.all('/mcp', auth, (req, res) => void node(req, res, req.body));
+    ```
+
+    `mcpAuthMetadataRouter` serve `/.well-known/oauth-protected-resource/mcp` (RFC 9728) และ mirror `oauthMetadata` ที่คุณส่งให้ไว้ที่ `/.well-known/oauth-authorization-server` ส่วน `requireBearerAuth` ตอบ `401`/`403` พร้อม `WWW-Authenticate` challenge ที่ถูกต้อง และแนบ `AuthInfo` ที่ตรวจแล้วไว้กับ request
+
+    ภายใน tool ตัวตนของผู้เรียกมาถึงผ่าน request context:
+
+    ```ts
+    server.registerTool('whoami', { description: 'Report the authenticated caller' }, async ctx => {
+        const caller = ctx.http?.authInfo;
+        return { content: [{ type: 'text', text: `${caller?.clientId} [${caller?.scopes.join(' ')}]` }] };
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    สัญญาของ Python SDK คือ protocol `TokenVerifier` ที่มี async method ตัวเดียว คืน `AccessToken` สำหรับ token ที่ดี และ `None` สำหรับอย่างอื่นทั้งหมด
+
+    ```python
+    from mcp.server import MCPServer
+    from mcp.server.auth.provider import AccessToken, TokenVerifier
+    from mcp.server.auth.settings import AuthSettings
+
+
+    class JwtVerifier(TokenVerifier):
+        async def verify_token(self, token: str) -> AccessToken | None:
+            try:
+                claims = verify_jwt(token, audience="https://api.example.com/mcp")
+            except Exception:
+                return None  # signature ผิด, หมดอายุ, audience ผิด -> 401
+            return AccessToken(
+                token=token,
+                client_id=claims["client_id"],
+                scopes=claims["scope"].split(),
+                expires_at=claims["exp"],
+            )
+
+
+    mcp = MCPServer(
+        "Files",
+        token_verifier=JwtVerifier(),
+        auth=AuthSettings(
+            issuer_url="https://auth.example.com",
+            resource_server_url="https://api.example.com/mcp",
+            required_scopes=["mcp"],
+        ),
+    )
+    ```
+
+    `AuthSettings` กำหนดหน้าตาที่ server เปิดออกสู่ภายนอก: จะประกาศ AS ตัวไหนใน Protected Resource Metadata (`issuer_url`), canonical URI ที่ใช้เป็น audience (`resource_server_url`) และ scope ที่ทุก token ต้องมี รันผ่าน Streamable HTTP ด้วย `mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)` แล้ว well-known route กับ challenge จะถูก serve ให้เอง
+
+    ภายใน tool อ่าน token ที่ authenticate แล้วจาก request context:
+
+    ```python
+    from mcp.server.auth.middleware.auth_context import get_access_token
+
+
+    @mcp.tool()
+    def whoami() -> str:
+        """Report the authenticated caller."""
+        token = get_access_token()
+        if token is None:
+            return "anonymous"
+        return f"{token.client_id} [{' '.join(token.scopes)}]"
+    ```
+  </TabItem>
+</Tabs>
+
+ไม่ว่าจะใช้ SDK ไหน verifier คือที่ที่การตรวจ audience อาศัยอยู่ อย่าข้ามมันด้วยเหตุผลว่า "AS ออก token ให้เราคนเดียว" เพราะทันทีที่มี resource ตัวที่สองอยู่หลัง AS เดียวกัน สมมติฐานนั้นกลายเป็นช่องโหว่
+
+## authorization เป็นแบบต่อ request และรายการอาจต่างกันได้
+
+MCP เป็น stateless: credential เป็น input ต่อ request ไม่ใช่ state ของ connection นั่นมีผลพวงที่มีประโยชน์ซึ่ง spec ระบุไว้ชัด `tools/list`, `resources/list` และ `prompts/list` MUST NOT ต่างกันตาม connection แต่ MAY ต่างกันตาม authorization ที่ยื่นมากับ request token ที่มี `files:read` อาจเห็นรายการ tool สั้นกว่า token ที่มี `files:write` ได้อย่างชอบธรรม
+
+ทำแบบนี้ด้วยการกรองตาม scope ที่ตรวจแล้วภายใน list handler หรือตอน register tool ห้ามเชื่อสิ่งที่ client ส่งมาใน `_meta` หรือใน argument ของ tool field `clientInfo` เป็นค่าที่ client รายงานเอง และ MUST NOT ถูกใช้ตัดสินใจเรื่อง security
+
+## การออกแบบ scope
+
+scope ที่ออกแบบไม่ดีเป็นปัญหา security ไม่ใช่แค่ UX: token ที่กว้างเกินไปซึ่งถูกขโมยจาก log จะให้สิทธิ์เข้าถึงทุกอย่างในคราวเดียว คำแนะนำของ spec คือโมเดลแบบ progressive และ least-privilege:
+
+**เริ่มจากเล็ก** `scopes_supported` ใน resource metadata ควรระบุเฉพาะชุดขั้นต่ำสำหรับการใช้งานพื้นฐาน (เช่น `mcp:tools-basic` สำหรับ discovery และ tool ที่อ่านอย่างเดียว) ไม่ใช่รายการทั้งหมดของคุณ
+
+**challenge ให้แม่น** เมื่อ tool ต้องการมากกว่านั้น ตอบ `403` พร้อม scope *ทั้งหมด* ที่ operation นั้นต้องการ ในคราวเดียว การ challenge ทีละ scope บังคับให้มี consent หลายรอบสำหรับ action เดียว
+
+```http
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope",
+                         scope="files:write files:delete",
+                         resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp"
+```
+
+คุณจะเลือกแบบขั้นต่ำ (เฉพาะที่ operation นี้ต้องการ), แบบกลาง ๆ ที่แนะนำ (operation นี้บวก scope ที่มักมาด้วยกัน) หรือแบบขยายที่ client น่าจะต้องใช้เร็ว ๆ นี้ก็ได้ เลือกแบบไหนก็ตาม ให้สม่ำเสมอเพื่อให้ client คาดเดาคุณได้
+
+**รับ token ที่ scope น้อยกว่าที่ขอ** AS MAY ให้เพียงส่วนหนึ่งของที่ขอ server ของคุณควรทำงานได้กับสิทธิ์ที่น้อยลง ไม่ใช่ล้มทันทีที่ scope เสริมตัวแรกหายไป
+
+**เคารพลำดับชั้น** ถ้า AS ของคุณนิยามว่า `admin` ครอบคลุม `read` token ที่มี `admin` ต้องผ่านการตรวจ `read` ด้วย เข้ารหัส mapping นั้นฝั่ง server อย่าพึ่ง client ให้ขยายมันเอง
+
+**อย่าเชื่อ scope ที่อ้างมาเพียงอย่างเดียว** scope ใน token บอกว่า user *ยินยอม* ให้ทำ action ประเภทนั้น server ของคุณยังต้องตัดสินว่า user *คนนี้* แตะ resource *ชิ้นนี้* ได้ไหม ด้วย authorization ตาม business logic ปกติ
+
+ข้อผิดพลาดที่พบบ่อยตามที่ spec ระบุ: ประกาศทุก scope ใน `scopes_supported`, scope ครอบจักรวาลอย่าง `*` หรือ `full-access`, มัดสิทธิ์ที่ไม่เกี่ยวกันรวมกันเพื่อเลี่ยง prompt ในอนาคต, คืนรายการทั้งหมดในทุก challenge และเปลี่ยนความหมายของ scope เงียบ ๆ โดยไม่ทำ versioning
+
+## สุขอนามัยในการปฏิบัติงาน
+
+นอกจากการตรวจ token spec ของ tools บอกว่า server MUST จำกัดอัตราการเรียก, ตรวจ input, ทำ access control และ sanitize output สำหรับ server ที่ authenticate แล้วในทางปฏิบัติ:
+
+- **rate limit ต่อ principal** โดยใช้ `client_id` หรือ subject ที่ตรวจแล้ว ไม่ใช่ต่อ IP
+- **log การใช้ tool พร้อม principal และ correlation ID** log การยกระดับ scope (ที่ขอ, ส่วนที่ได้รับ) เพื่อให้ audit สร้างภาพได้ว่าใครยกระดับอะไร
+- **ใช้ TLS** bearer token ปลอดภัยได้แค่เท่าที่ช่องทางปลอดภัย `https://` เป็นข้อบังคับสำหรับ production และ `http://` ธรรมดายอมให้ได้เฉพาะบน loopback ตอนพัฒนา
+- **ผูก state handle กับ user** ถ้า tool คืน handle ไว้ใช้ในการเรียกครั้งถัดไป เก็บ state ด้วย key แบบ `user_id:handle` โดยที่ `user_id` มาจาก token ที่ตรวจแล้ว การถือ handle ไม่ใช่ authentication เด็ดขาด
+
+<Callout title="สรุปหนึ่งบรรทัด">
+resource server ตรวจทุก request: มี token ไหม, signature และวันหมดอายุ, audience ต้องเท่ากับ canonical URI ของตัวเอง แล้วค่อย scope; SDK ให้ `requireBearerAuth` บวก `mcpAuthMetadataRouter` หรือ `TokenVerifier` บวก `AuthSettings` และงานของคุณคือ verifier, scope เริ่มต้นที่น้อยที่สุด และ `403` challenge ที่แม่นยำในครั้งเดียว
+</Callout>
+
+export const quizProtect = [
+  {
+    q: 'token เซ็นถูกต้องและยังไม่หมดอายุ แต่ audience เป็น service อื่น response ไหนถูกต้อง?',
+    options: [
+      '200 รัน tool ด้วย scope ที่ลดลง',
+      '401 Unauthorized',
+      '403 Forbidden พร้อม insufficient_scope',
+      '400 Bad Request',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ใน Python SDK การ implement `TokenVerifier.verify_token` คืนอะไรสำหรับ token ที่ไม่ถูกต้อง?',
+    options: [
+      '`AccessToken` ที่ scope ว่าง',
+      'string "invalid"',
+      '`None`',
+      'raise `ToolError`',
+    ],
+    answer: 2,
+  },
+  {
+    q: '`tools/list` คืน tool ต่างกันให้ผู้เรียกต่างคนได้ไหม?',
+    options: [
+      'ไม่ได้ ต้องเหมือนกันสำหรับทุกคน',
+      'ได้ ตาม connection เพื่อให้ server จำได้ว่าเคยแสดงอะไรไปแล้ว',
+      'ได้ ตาม authorization ที่ยื่นมากับ request แต่ไม่ใช่ตาม connection',
+      'ได้เฉพาะบน stdio',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'tool ต้องการทั้ง `files:write` และ `files:delete` challenge แบบ 403 ควรมีอะไร?',
+    options: [
+      'เฉพาะ `files:write` แล้วค่อย `files:delete` ตอน retry ครั้งถัดไป',
+      'ทั้งสอง scope ในพารามิเตอร์ `scope` เดียว',
+      'รายการ scope ทั้งหมดของ server',
+      'ไม่ต้องมีพารามิเตอร์ scope เพื่อให้ client ขอทุกอย่าง',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/protecting-your-server" questions={quizProtect} />
+
+<ProgressTracker client:visible id="security-and-auth/protecting-your-server" />

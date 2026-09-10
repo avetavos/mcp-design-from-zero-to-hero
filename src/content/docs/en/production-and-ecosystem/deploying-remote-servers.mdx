@@ -1,0 +1,221 @@
+---
+title: 'Deploying Remote Servers'
+description: 'Run a Streamable HTTP server in production — stateless scaling behind any load balancer, web-standard versus Node runtimes, proxy settings for SSE, Python behind uvicorn, hardening, observability through mirrored headers, and versioning without breaking clients.'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Stateless is the whole deployment story
+
+Protocol version `2026-07-28` made MCP a stateless protocol: every request carries its version, capabilities, and identity in `_meta`, and a server **MUST NOT** rely on a prior request over the same connection. There is no `Mcp-Session-Id`, no handshake, no GET stream to keep open.
+
+Operationally that means:
+
+- **Any load balancer works.** No sticky sessions, no consistent hashing. Round-robin is fine.
+- **Autoscaling is trivial.** A new instance can answer the next request cold. Long-running state lives behind an explicit handle in a database, not in the process.
+- **Restarts are safe.** In-flight requests are lost and clients re-issue them with a new id; `subscriptions/listen` streams are re-opened by the client.
+
+<Mermaid title="A stateless fleet behind a plain load balancer" code={fleetDiagram} />
+
+export const fleetDiagram = `flowchart LR
+  c1["client A"] --> lb["HTTPS load balancer"]
+  c2["client B"] --> lb
+  lb --> s1["instance 1"]
+  lb --> s2["instance 2"]
+  lb --> s3["instance 3"]
+  s1 --> db["shared state store, keyed by handle"]
+  s2 --> db
+  s3 --> db`;
+
+If you find yourself wanting sticky sessions, you have hidden state in the process. Move it behind a handle.
+
+## Pick a runtime shape
+
+The TypeScript SDK's `createMcpHandler` produces a **web-standard** handler (a `fetch`-style function). That runs unchanged on Cloudflare Workers, Deno, and Bun; for Node you wrap it once.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // server.ts — shared between runtimes
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    export const handler = createMcpHandler(() => {
+      const server = new McpServer({ name: 'notes', version: '1.4.0' });
+      server.registerTool(
+        'add-note',
+        { description: 'Save a note', inputSchema: z.object({ text: z.string() }) },
+        async ({ text }) => ({ content: [{ type: 'text', text: `Saved: ${text}` }] }),
+      );
+      return server;
+    });
+
+    // worker.ts — Cloudflare Workers / Deno / Bun: the handler is the app
+    export default handler;
+
+    // node.ts — Node behind Express
+    import { createMcpExpressApp } from '@modelcontextprotocol/express';
+    import { toNodeHandler } from '@modelcontextprotocol/node';
+
+    const app = createMcpExpressApp({ host: '0.0.0.0', allowedHosts: ['mcp.example.com'] });
+    const node = toNodeHandler(handler);
+    app.all('/mcp', (req, res) => void node(req, res, req.body));
+    app.get('/healthz', (_req, res) => res.send('ok'));
+    app.listen(8080);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    # server.py
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("Notes")
+
+
+    @mcp.tool()
+    def add_note(text: str) -> str:
+        """Save a note."""
+        return f"Saved: {text}"
+
+
+    if __name__ == "__main__":
+        # Streamable HTTP, stateless, one JSON object per response where possible.
+        mcp.run(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=8080,
+            streamable_http_path="/mcp",
+            stateless_http=True,
+            json_response=True,
+        )
+    ```
+  </TabItem>
+</Tabs>
+
+Two Python knobs matter in production. `stateless_http=True` is the modern per-request mode. `json_response=True` makes the server answer with a single JSON body instead of an SSE stream whenever it can; that is friendlier to proxies and simpler to log, at the cost of losing mid-call `notifications/progress`. Choose per server: a fast lookup service wants JSON, a long-running importer wants SSE.
+
+The factory-per-request shape (`createMcpHandler(() => ...)`) is deliberate: the SDK builds a fresh `McpServer` for each request so nothing leaks between callers. Keep the factory cheap — construct clients and pools *outside* it and close over them.
+
+## What the proxy must do
+
+Streamable HTTP is plain POST, but some responses are SSE streams, and `subscriptions/listen` is a stream that stays open for as long as the client cares. Reverse proxies default to settings that break both:
+
+| Setting | Why | Typical value |
+|---------|-----|---------------|
+| Response buffering **off** | Buffered SSE arrives in one burst at the end | Server sends `X-Accel-Buffering: no`; nginx `proxy_buffering off` |
+| Read / idle timeout **long** | A listen stream idles for minutes between notifications | Minutes to hours on the `/mcp` route only |
+| Keep-alives | Intermediaries close quiet connections | Server emits `:\r\n` SSE comment lines periodically; clients ignore them |
+| HTTP/1.1 or HTTP/2 to upstream | HTTP/1.0 cannot stream chunked responses | `proxy_http_version 1.1` on nginx |
+| Request body limit | Tool arguments can be large but not unbounded | 1–10 MB, then 413 |
+
+The spec recommends `X-Accel-Buffering: no` on every SSE response precisely because nginx-style proxies buffer by default. The SDKs set it for you; a proxy in the middle can still override it, so verify with a real stream.
+
+## Hardening
+
+- **Validate `Origin`.** Servers **MUST** respond `403` to a present-but-invalid `Origin`; this is the DNS-rebinding defence. `createMcpExpressApp({ allowedHosts })` does this; set it to your real hostnames.
+- **HTTPS only.** Terminate TLS at the edge and bind the app to a private interface. When running locally, bind `127.0.0.1`, never `0.0.0.0`.
+- **Authenticate every request.** The authorization module covered the OAuth resource-server pattern; in production, every `/mcp` POST carries a bearer token you verify for audience and scope.
+- **Rate limit per token,** not per IP; agents behind one NAT look like one IP.
+- **Bound everything:** request size, tool execution time, schema complexity (deep `anyOf` trees are a validator DoS vector), and the number of concurrent listen streams per principal.
+- **Validate tool inputs yourself** even though the schema does; the schema does not know your business rules.
+
+## Observability comes for free in the headers
+
+The transport mirrors body fields into HTTP headers exactly so that infrastructure can route and measure without parsing JSON:
+
+```http
+POST /mcp HTTP/1.1
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: execute_sql
+Mcp-Param-Region: us-west1
+```
+
+- `Mcp-Method` gives you per-method latency and error dashboards at the load balancer.
+- `Mcp-Name` gives you per-tool metrics and lets a WAF block one dangerous tool without touching the body.
+- `Mcp-Param-{Name}`, driven by `x-mcp-header` in a tool's `inputSchema`, lets a gateway route by tenant or region *before* the request reaches an instance.
+
+The server behind the proxy **MUST** still verify that header values match the body (`-32020` on mismatch), so intermediaries and instances never disagree about what a request is. Never put secrets or PII in `x-mcp-header` parameters; headers are visible to every hop.
+
+## Versioning your server
+
+Clients cache `tools/list` per `ttlMs` and models learn your tool names inside long conversations. Change carefully:
+
+1. **Bump `serverInfo.version`** on every release. Clients log it; you will want it in bug reports.
+2. **Make tool changes additive.** New optional parameters with defaults, new tools, wider enums. Never rename a tool or make an optional parameter required in place.
+3. **Deprecate in the description first:** `"Deprecated: use search_issues_v2. Will be removed after 2026-12-01."` The model reads it; so do humans.
+4. **Emit `notifications/tools/list_changed`** to clients listening for `toolsListChanged` when the set actually changes, and lower `ttlMs` around a migration window.
+5. **Support two protocol eras** if you still have `2025-11-25` clients: the TypeScript handler serves both by default; set `legacy: 'reject'` only when you are sure.
+
+## A minimal container
+
+```dockerfile
+FROM node:22-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY dist ./dist
+ENV NODE_ENV=production PORT=8080
+EXPOSE 8080
+USER node
+CMD ["node", "dist/node.js"]
+```
+
+Add a plain `GET /healthz` route (outside `/mcp`) for the orchestrator's liveness probe; the MCP endpoint itself only speaks POST, so probing it with GET yields a `405`, which most health checkers treat as failure.
+
+<Callout title="The one-line takeaway">
+A `2026-07-28` server is stateless, so deploy it like any stateless HTTP service — round-robin load balancing, autoscaling, restart freely — and spend your care on the proxy (no buffering, long timeouts, keep-alives for `subscriptions/listen`), on hardening (Origin, HTTPS, per-token limits), on the mirrored `Mcp-*` headers for routing and metrics, and on additive, described, versioned tool changes.
+</Callout>
+
+export const quizDeploy = [
+  {
+    q: 'Why does a 2026-07-28 server not need sticky sessions on the load balancer?',
+    options: [
+      'Because HTTP/2 handles affinity',
+      'Because the protocol is stateless: each request carries its own version, capabilities, and any state handle, so any instance can serve it',
+      'Because Mcp-Session-Id is routed by the proxy',
+      'Because only one client can connect at a time',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does X-Accel-Buffering: no accomplish on an SSE response?',
+    options: [
+      'Enables gzip',
+      'Tells nginx-style proxies not to buffer, so events reach the client immediately',
+      'Disables TLS',
+      'Marks the response cacheable',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the trade-off of json_response=True in the Python SDK?',
+    options: [
+      'It disables authentication',
+      'Responses are single JSON bodies, which proxies and logs like, but you lose mid-call progress notifications',
+      'It forces sticky sessions',
+      'It only works over stdio',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which is a safe way to evolve a tool in production?',
+    options: [
+      'Rename the tool and hope clients refresh',
+      'Make an optional parameter required',
+      'Add a new optional parameter with a default and note deprecations in the description',
+      'Remove the outputSchema',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/deploying-remote-servers" questions={quizDeploy} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/deploying-remote-servers" />

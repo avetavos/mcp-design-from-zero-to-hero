@@ -1,0 +1,263 @@
+---
+title: 'Change Notifications, Subscriptions, and Caching'
+description: 'How clients opt in to list-changed and resource-updated notifications with subscriptions/listen, what the acknowledgment and subscriptionId mean, and how ttlMs, cacheScope, and cursors keep discovery cheap.'
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Lists change; polling is expensive
+
+Tool sets grow with a deploy, resources update as files are edited, prompts get added by an admin. A client that re-runs `tools/list` before every turn wastes round trips; one that never re-runs it goes stale. MCP solves this with two cooperating mechanisms:
+
+1. **Opt-in notifications** over a long-lived `subscriptions/listen` request, so the server can say "something changed" the moment it does.
+2. **Caching hints** (`ttlMs`, `cacheScope`) on every list and read result, so clients know how long a cached answer is good for.
+
+Neither is guaranteed delivery. Notifications are best-effort — a reconnect can lose one — so clients still refresh on TTL expiry. The two together give you *usually instant, always eventually correct*.
+
+## Opening a notification stream
+
+In the 2026-07-28 revision there is no standalone GET stream and no `resources/subscribe` method. The client sends one request and names exactly which notification types it wants:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "subscriptions/listen",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    },
+    "notifications": {
+      "toolsListChanged": true,
+      "promptsListChanged": true,
+      "resourcesListChanged": true,
+      "resourceSubscriptions": ["file:///project/config.json"]
+    }
+  }
+}
+```
+
+| Filter field | Type | Delivers |
+|--------------|------|----------|
+| `toolsListChanged` | boolean | `notifications/tools/list_changed` |
+| `promptsListChanged` | boolean | `notifications/prompts/list_changed` |
+| `resourcesListChanged` | boolean | `notifications/resources/list_changed` |
+| `resourceSubscriptions` | string[] | `notifications/resources/updated` for each listed URI |
+
+All fields are optional; omitting one means "do not send that". The server **MUST NOT** send notification types the client did not request.
+
+<Mermaid title="A subscription's lifetime" code={subDiagram} />
+
+export const subDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: subscriptions/listen (id 7, filter)
+  S-->>C: notifications/subscriptions/acknowledged (subscriptionId 7)
+  Note over C,S: stream stays open
+  S-->>C: notifications/tools/list_changed (subscriptionId 7)
+  C->>S: tools/list
+  S-->>C: fresh tools[]
+  S-->>C: notifications/resources/updated uri=file:///project/config.json
+  C->>S: resources/read
+  S-->>C: result for id 7 (graceful close)`;
+
+### The acknowledgment comes first
+
+The server's **first** message for a subscription is always `notifications/subscriptions/acknowledged`. It carries the subscription ID — which is simply the JSON-RPC `id` of the `subscriptions/listen` request — and echoes back the *subset* of the filter the server agreed to honor:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/subscriptions/acknowledged",
+  "params": {
+    "_meta": { "io.modelcontextprotocol/subscriptionId": 7 },
+    "notifications": { "toolsListChanged": true, "resourceSubscriptions": ["file:///project/config.json"] }
+  }
+}
+```
+
+Here the server dropped `promptsListChanged` and `resourcesListChanged` — perhaps it does not declare those `listChanged` capabilities. The client SHOULD compare the acknowledged filter to what it asked for and fall back to polling for anything missing.
+
+### Every notification is tagged
+
+Each notification on the stream carries `io.modelcontextprotocol/subscriptionId` in `_meta`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/resources/updated",
+  "params": { "_meta": { "io.modelcontextprotocol/subscriptionId": 7 }, "uri": "file:///project/config.json" }
+}
+```
+
+On Streamable HTTP each `subscriptions/listen` gets its own SSE response stream, so the tag is a convenience. On **stdio** every message shares one channel, and clients **MUST** use the tag to demultiplex — you may have one subscription for tool changes and another for a resource, both alive at once.
+
+Only the *change* notifications flow on the listen stream. Request-scoped notifications such as `notifications/progress` and `notifications/message` travel on the response stream of the request they belong to, never here.
+
+## How a subscription ends
+
+- **Client cancels:** close the SSE stream (HTTP) or send `notifications/cancelled` naming the listen request's ID (stdio).
+- **Server closes gracefully** (shutdown, redeploy): it SHOULD send a normal *result* for the listen request, tagged with the subscription ID, then close. A result means "closed cleanly"; a transport drop with no result means "unexpected — consider reconnecting".
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "result": { "resultType": "complete", "_meta": { "io.modelcontextprotocol/subscriptionId": 7 } } }
+```
+
+- **Transport dies:** HTTP timeout, TCP reset, stdio process exit. Because the protocol is stateless, the server keeps no subscription state; on stdio, after a restart the client **MUST** send `subscriptions/listen` again.
+
+## Emitting changes from a server
+
+The SDKs manage the stream plumbing; your job is to signal that something changed.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const server = new McpServer(
+      { name: 'board', version: '1.0.0' },
+      { capabilities: { tools: { listChanged: true }, resources: { listChanged: true, subscribe: true } } },
+    );
+
+    // Registering a tool after the server is live triggers
+    // notifications/tools/list_changed for subscribed clients.
+    function enableReports() {
+      server.registerTool(
+        'sprint_report',
+        { description: 'Summarize completed tasks' },
+        async () => ({ content: [{ type: 'text', text: report() }] }),
+      );
+    }
+    ```
+    The `McpServer` tracks registrations; adding, removing, enabling, or disabling a tool after startup causes the SDK to emit the list-changed notification to clients listening for it. Resource updates are signaled through the server's notification API for the specific URI.
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server.mcpserver import Context, MCPServer
+
+    mcp = MCPServer("Sprint Board")
+    BOARDS = {"sprint": {"design": False, "build": False}}
+
+
+    @mcp.resource("board://{name}")
+    def board(name: str) -> str:
+        tasks = BOARDS[name]
+        return "\n".join(f"[{'x' if done else ' '}] {t}" for t, done in tasks.items())
+
+
+    @mcp.tool()
+    async def complete_task(board: str, task: str, ctx: Context) -> str:
+        BOARDS[board][task] = True
+        await ctx.notify_resource_updated(f"board://{board}")
+        return f"{task}: done"
+
+
+    def sprint_report() -> str:
+        done = sum(d for tasks in BOARDS.values() for d in tasks.values())
+        return f"{done} task(s) done"
+
+
+    @mcp.tool()
+    async def enable_reports(ctx: Context) -> str:
+        mcp.add_tool(sprint_report)
+        await ctx.notify_tools_changed()
+        return "reporting is live"
+    ```
+    `ctx.notify_resource_updated(uri)` reaches clients whose `resourceSubscriptions` include that URI; `ctx.notify_tools_changed()` reaches clients that asked for `toolsListChanged`.
+  </TabItem>
+</Tabs>
+
+Remember the rule from the module [index](/mcp/en/server-primitives/): the change must be *global* (or per-authorization), not per-connection. `enable_reports` above adds the tool for everyone — that is allowed. Adding it only for the caller who invoked it is not.
+
+## Caching hints: `ttlMs` and `cacheScope`
+
+Every `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, `resources/read`, and `server/discover` result carries two required fields:
+
+| Field | Values | Meaning |
+|-------|--------|---------|
+| `ttlMs` | integer ms | Freshness hint: the client may reuse this result for this long without asking again |
+| `cacheScope` | `"public"` or `"private"` | `public`: shared intermediaries (a gateway, a corporate proxy) may cache and serve it to other callers. `private`: only this caller may cache it — use for anything that depends on the caller's authorization |
+
+Guidance for servers:
+
+- A static tool list: long TTL (minutes to an hour), `public`.
+- A tool list filtered by scopes: `private`, because another caller must not receive it from a cache.
+- `resources/read` of a per-user document: short TTL, `private`.
+
+Guidance for clients: honor the TTL, **but** treat a cached list as stale the moment a matching `list_changed` notification arrives, even before the TTL expires. Notification beats TTL.
+
+Because the model's tool list often sits in the LLM prompt prefix, hosts pair this with deterministic ordering (see [Tools](/mcp/en/server-primitives/tools/)) so that a cache hit on the MCP side also stays a cache hit on the LLM side.
+
+## Pagination
+
+All `*/list` methods accept an optional `cursor` and may return `nextCursor`:
+
+```json
+{ "method": "tools/list", "params": { "cursor": "eyJwYWdlIjoyfQ" } }
+```
+
+- Cursors are **opaque** strings. Clients MUST NOT parse or construct them; servers may encode a page number, an offset, or a keyset however they like.
+- Absence of `nextCursor` means this was the last page.
+- Page size is the server's choice. Keep pages small enough that `ttlMs` stays meaningful for each.
+
+A client that wants "all tools" loops until `nextCursor` is absent, then caches the assembled list for the *minimum* `ttlMs` it saw.
+
+## Legacy note
+
+In protocol versions 2025-11-25 and earlier, change notifications arrived on a standalone HTTP GET stream (or unsolicited on stdio) with no opt-in, and resource updates used explicit `resources/subscribe` and `resources/unsubscribe` requests. `ttlMs` and `cacheScope` did not exist. When talking to a legacy server, expect none of the filter semantics above; see [Backward Compatibility](/mcp/en/transports/backward-compatibility/).
+
+<Callout title="The one-line takeaway">
+Clients opt in to change notifications with one `subscriptions/listen` request naming a filter; the server acknowledges first, tags every notification with the subscription ID, and closes with a result when it shuts down gracefully. Pair that with the `ttlMs` and `cacheScope` hints on every list and read result — and opaque cursors for large lists — and discovery stays cheap, fresh, and safe to cache.
+</Callout>
+
+export const quizNotifications = [
+  {
+    q: 'What is the value of io.modelcontextprotocol/subscriptionId on notifications from a subscription?',
+    options: [
+      'A random UUID minted by the server',
+      'The JSON-RPC id of the subscriptions/listen request that opened the stream',
+      'The server name',
+      'The client\'s progressToken',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'The acknowledgment omits promptsListChanged even though the client asked for it. What does that mean?',
+    options: [
+      'The request was malformed and must be resent',
+      'The server will not honor that notification type; the client should poll for prompt changes instead',
+      'Prompts are disabled for this user',
+      'The subscription failed entirely',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A cached tools/list has 4 minutes of ttlMs left when notifications/tools/list_changed arrives. What should the client do?',
+    options: [
+      'Keep using the cache until the TTL expires',
+      'Treat the cache as stale immediately and re-fetch',
+      'Ignore the notification because ttlMs is authoritative',
+      'Close the subscription',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which cacheScope should a server use for a tool list that depends on the caller\'s OAuth scopes?',
+    options: [
+      'public',
+      'private',
+      'shared',
+      'Omit the field',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/notifications-and-caching" questions={quizNotifications} />
+
+<ProgressTracker client:visible id="server-primitives/notifications-and-caching" />

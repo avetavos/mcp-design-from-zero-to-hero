@@ -1,0 +1,301 @@
+---
+title: 'Elicitation'
+description: 'Asking the user for data or consent from inside a tool — form mode with its deliberately small schema subset, URL mode for anything sensitive, the three response actions, and the client UI rules that keep it safe.'
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## What elicitation is
+
+**Elicitation** lets a server ask the *user* something in the middle of a tool call, resource read, or prompt fetch. It is the one client feature that survived the 2026-07-28 deprecations untouched, because it is the one thing a server truly cannot do alone: get a human decision.
+
+It comes in two modes:
+
+- **Form mode** — the server describes a small form; the client renders it, the user fills it in, and the data comes back through the client. Good for choices, confirmations, names, dates.
+- **URL mode** — the server hands over a URL; the client asks the user for consent and opens it; whatever happens there is **invisible to the client**. Required for secrets, payments, and third-party OAuth.
+
+Under MRTR both are delivered as an `elicitation/create` entry inside `inputRequests`, and answered inside `inputResponses` on the retry (see [MRTR](/mcp/en/client-interaction/multi-round-trip-requests/)).
+
+## Declaring the capability
+
+A client that supports elicitation says so on **every request**, in `_meta`:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/clientCapabilities": {
+      "elicitation": { "form": {}, "url": {} }
+    }
+  }
+}
+```
+
+An empty `"elicitation": {}` means *form mode only* (backwards compatibility). A client that declares the capability must support at least one mode, and a server must never send a mode the client did not declare.
+
+## Form mode
+
+A form request carries `mode: "form"` (or omits `mode`, which means the same), a human-readable `message`, and a `requestedSchema`.
+
+<Mermaid title="Form mode under MRTR" code={formDiagram} />
+
+export const formDiagram = `sequenceDiagram
+  participant U as User
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (id 1)
+  S-->>C: input_required: elicitation/create mode form
+  C->>U: render form from requestedSchema
+  U-->>C: fills it in, submits
+  C->>S: tools/call (id 2, inputResponses)
+  S-->>C: final result`;
+
+### The schema is deliberately small
+
+`requestedSchema` is **not** arbitrary JSON Schema. To keep client forms simple and predictable it is restricted to a flat object whose properties are primitives:
+
+| Kind | Allowed keywords |
+|------|------------------|
+| string | `title`, `description`, `minLength`, `maxLength`, `default`, `format` ∈ `email`, `uri`, `date`, `date-time` |
+| number / integer | `title`, `description`, `minimum`, `maximum`, `default` |
+| boolean | `title`, `description`, `default` |
+| single-select enum | `type: "string"` with `enum: [...]`, or titled options via `oneOf: [{ const, title }]` |
+| multi-select enum | `type: "array"` with `items.enum`, or titled via `items.anyOf: [{ const, title }]`, plus `minItems` / `maxItems` |
+
+No nested objects, no arrays of objects, no `$ref`, no conditionals. If you need more, split it into several questions or move it into the tool's own `inputSchema`.
+
+```json
+{
+  "method": "elicitation/create",
+  "params": {
+    "mode": "form",
+    "message": "Confirm the deployment",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string",
+          "title": "Environment",
+          "oneOf": [
+            { "const": "stg", "title": "Staging" },
+            { "const": "prd", "title": "Production" }
+          ],
+          "default": "stg"
+        },
+        "notify": { "type": "boolean", "title": "Notify the on-call channel", "default": true },
+        "window": { "type": "string", "format": "date-time", "title": "Deploy at" }
+      },
+      "required": ["environment"]
+    }
+  }
+}
+```
+
+Clients that support defaults should pre-fill them. Servers should validate what comes back against the schema — the client is expected to, but you are the trust boundary.
+
+### Never ask for secrets in a form
+
+The spec is categorical: servers **must not** use form mode for passwords, API keys, access tokens, or payment credentials. Form data passes through the client, may be logged, and may be seen by the LLM. Names, emails, and usernames are allowed at the server's discretion. Anything that *grants access* goes through URL mode.
+
+## URL mode
+
+A URL request carries `mode: "url"`, a `message`, and the `url` itself:
+
+```json
+{
+  "method": "elicitation/create",
+  "params": {
+    "mode": "url",
+    "url": "https://mcp.example.com/connect/github?flow=8f1c…",
+    "message": "Connect your GitHub account to continue."
+  }
+}
+```
+
+The flow is different from form mode in one crucial way: **`accept` means the user consented to open the URL — not that the interaction finished.**
+
+<Mermaid title="URL mode: the client learns nothing except that the user consented" code={urlDiagram} />
+
+export const urlDiagram = `sequenceDiagram
+  participant B as Browser
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (id 1)
+  S-->>C: input_required: elicitation/create mode url, requestState
+  C->>C: show full URL, ask consent
+  C->>B: open URL
+  C->>S: tools/call (id 2, accept, requestState)
+  B->>S: user completes the flow out of band
+  Note over S: check via requestState whether done
+  S-->>C: final result, or another input_required`;
+
+On the retry the server looks at the echoed `requestState` (or its own stored state) to decide whether the out-of-band work is done. If not, it returns another `InputRequiredResult` and the client tries again later — clients should give the user manual retry and cancel controls for exactly this case.
+
+URL mode is *not* how a client authorizes to the MCP server itself; that is the [OAuth flow](/mcp/en/security-and-auth/oauth-flow/). URL mode is for the server obtaining something on the user's behalf — a third-party token, an API key typed into a page the server controls, a payment. Those credentials must never transit the client.
+
+## The three actions
+
+Every elicitation result, in either mode, has an `action`:
+
+| `action` | Meaning | `content` |
+|----------|---------|-----------|
+| `accept` | user explicitly approved / submitted | present in form mode, omitted in URL mode |
+| `decline` | user explicitly said no | omitted |
+| `cancel` | user dismissed without choosing (closed the dialog, pressed Escape, page failed to load) | omitted |
+
+Handle all three. `decline` usually means "offer an alternative or stop"; `cancel` often means "it is fine to ask again later". Never treat a missing `content` as an empty form submission.
+
+## Client UI rules
+
+Because elicitation puts a server's words in front of a user, clients carry obligations:
+
+- Make it **obvious which server** is asking.
+- Give clear **decline and cancel** controls.
+- In form mode, let the user **review and edit** before sending.
+- In URL mode: show the **full URL** before consent, highlight the domain, warn on Punycode or suspicious hosts, **never prefetch** it, never open it without explicit consent, and open it in a way the client and LLM cannot inspect (a system browser or `SFSafariViewController`, not an embedded web view).
+- Do not render URLs as clickable anywhere in an elicitation *except* the `url` field of a URL-mode request.
+
+Servers, symmetrically, must not embed credentials or PII in the URL, must not hand out pre-authenticated links, and must verify that the person who opens the URL is the same user who triggered the elicitation (the phishing case is covered in [Security](/mcp/en/security-and-auth/third-party-auth-and-url-elicitation/)).
+
+## In code
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Server: ask from inside a tool handler
+    server.registerTool(
+      'collect_feedback',
+      { description: 'Ask how something went', inputSchema: z.object({ topic: z.string() }) },
+      async ({ topic }, ctx) => {
+        const result = await ctx.mcpReq.elicitInput({
+          mode: 'form',
+          message: `How was ${topic}?`,
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              rating: { type: 'number', title: 'Rating (1-5)', minimum: 1, maximum: 5 },
+              comment: { type: 'string', title: 'Comment' },
+            },
+            required: ['rating'],
+          },
+        });
+        if (result.action !== 'accept') {
+          return { content: [{ type: 'text', text: `Feedback ${result.action}.` }] };
+        }
+        return { content: [{ type: 'text', text: `Recorded: ${JSON.stringify(result.content)}` }] };
+      }
+    );
+
+    // Client: answer elicitation requests the SDK surfaces from inputRequests
+    client.setRequestHandler('elicitation/create', async (request) => {
+      if (request.params.mode === 'url') {
+        // show the URL, get consent, open it in the system browser
+        return { action: 'accept' };
+      }
+      // render request.params.requestedSchema as a form
+      return { action: 'accept', content: { rating: 5, comment: 'great' } };
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from pydantic import BaseModel
+
+    from mcp import Client
+    from mcp.client import ClientRequestContext
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver import Context
+    from mcp.types import ElicitRequestParams, ElicitResult
+
+    mcp = MCPServer("feedback")
+
+
+    class Feedback(BaseModel):
+        rating: int
+        comment: str = ""
+
+
+    # Server: ask from inside a tool handler
+    @mcp.tool()
+    async def collect_feedback(topic: str, ctx: Context) -> str:
+        result = await ctx.elicit(f"How was {topic}?", schema=Feedback)
+        if result.action != "accept":
+            return f"Feedback {result.action}."
+        return f"Recorded: {result.data.rating}/5 {result.data.comment!r}"
+
+
+    # Client: a callback that fulfils elicitation input requests
+    async def on_elicit(context: ClientRequestContext, params: ElicitRequestParams) -> ElicitResult:
+        # render params.requested_schema as a form; here we auto-answer
+        return ElicitResult(action="accept", content={"rating": 5, "comment": "great"})
+
+
+    async def main() -> None:
+        async with Client("http://127.0.0.1:8000/mcp", elicitation_callback=on_elicit) as client:
+            result = await client.call_tool("collect_feedback", {"topic": "the demo"})
+            print(result.content)
+    ```
+  </TabItem>
+</Tabs>
+
+## Design notes
+
+- **Ask late, ask once.** Do not elicit until you know the tool cannot proceed without the answer; the user sees every question.
+- **Prefer tool arguments to elicitation** when the LLM could reasonably supply the value. Elicitation is for decisions the *human* must own.
+- **Statelessness still holds.** If you persist anything about an elicitation, bind it to the verified user identity (the token's `sub`), never to something the client told you.
+
+<Callout title="The one-line takeaway">
+Elicitation asks the user, not the model: form mode for small, non-secret, flat-schema questions; URL mode — with full-URL consent and no client visibility — for anything that grants access. Handle `accept`, `decline`, and `cancel`, and remember that in URL mode `accept` only means "I'll open it".
+</Callout>
+
+export const quizElicit = [
+  {
+    q: 'Which of these is allowed in a form-mode requestedSchema?',
+    options: [
+      'A nested object property',
+      'An array of objects',
+      'A string property with format "date-time"',
+      'A $ref to a shared definition',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A tool needs the user to enter a third-party API key. Which mode must it use?',
+    options: [
+      'Form mode with a masked string field',
+      'URL mode, so the secret never passes through the client',
+      'Either, as long as the schema marks it required',
+      'Neither — put it in the tool arguments',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In URL mode, what does action "accept" tell the server?',
+    options: [
+      'The out-of-band interaction completed successfully',
+      'The user consented to open the URL — completion must be checked separately (e.g. via requestState)',
+      'The client fetched the URL and has the data',
+      'The user declined',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does "elicitation": {} in clientCapabilities mean?',
+    options: [
+      'Elicitation is disabled',
+      'Both form and URL mode are supported',
+      'Form mode only (backwards-compatible shorthand)',
+      'URL mode only',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="client-interaction/elicitation" questions={quizElicit} />
+
+<ProgressTracker client:visible id="client-interaction/elicitation" />

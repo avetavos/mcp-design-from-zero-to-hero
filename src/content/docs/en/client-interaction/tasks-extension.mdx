@@ -1,0 +1,246 @@
+---
+title: 'Long-Running Work: the Tasks Extension'
+description: 'When a request cannot stay open — the io.modelcontextprotocol/tasks extension, task handles, polling with tasks/get, mid-flight input via tasks/update, and cooperative cancellation.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Why not just block?
+
+Progress notifications keep a request honest, but they still require the request to stay *open*. That fails for real work:
+
+- **Intermediaries time out.** Load balancers, gateways, and mobile networks cut idle or long connections after seconds or a few minutes.
+- **Clients crash or move.** A laptop lid closes; the phone switches from Wi-Fi to cellular. An in-flight request is simply lost.
+- **Humans are slow.** An approval gate may sit for hours.
+
+The **Tasks extension** (`io.modelcontextprotocol/tasks`) lets a server answer *immediately* with a durable **task handle** instead of the result. The client polls that handle, supplies input if asked, and collects the result whenever it is ready — even from a fresh connection or a new process.
+
+Tasks moved out of the core protocol and into an official extension in 2026-07-28 (SEP-2663). The full specification lives in the `modelcontextprotocol/ext-tasks` repository; the shapes below are what you will see on the wire.
+
+## Negotiating the extension
+
+Extensions are advertised in the `extensions` field of capabilities — on every client request, and in the server's `server/discover` response:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {
+      "extensions": { "io.modelcontextprotocol/tasks": {} }
+    }
+  }
+}
+```
+
+```json
+{
+  "result": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"],
+    "capabilities": {
+      "tools": {},
+      "extensions": { "io.modelcontextprotocol/tasks": {} }
+    }
+  }
+}
+```
+
+The rule is strict: a server **must never** return a task to a client that did not declare the extension on *that* request. Because the protocol is stateless, check the capabilities each time — there is nothing to remember from an earlier call.
+
+## The flow
+
+<Mermaid title="A task is a handle you poll" code={tasksDiagram} />
+
+export const tasksDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (with tasks capability)
+  S-->>C: resultType task (taskId, status working)
+  loop until terminal
+    C->>S: tasks/get (taskId)
+    S-->>C: status working
+  end
+  C->>S: tasks/get (taskId)
+  S-->>C: status input_required, inputRequests
+  C->>S: tasks/update (taskId, inputResponses)
+  S-->>C: ack
+  C->>S: tasks/get (taskId)
+  S-->>C: status completed, result`;
+
+### 1. The server decides to return a task
+
+The server chooses *per request* whether the work is long enough to deserve a task. The client does not ask for one; it just has to be ready for either shape.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "task",
+    "task": {
+      "taskId": "tsk_9f2c1a",
+      "status": "working",
+      "statusMessage": "Queued behind 2 other builds",
+      "ttlMs": 3600000,
+      "pollIntervalMs": 5000
+    }
+  }
+}
+```
+
+The task must be **durably created before** this response is sent — a `taskId` the server has already forgotten is worse than no task at all.
+
+### 2. The client polls
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tasks/get",
+  "params": { "taskId": "tsk_9f2c1a" }
+}
+```
+
+Respect `pollIntervalMs`. Store the `taskId` somewhere durable so polling can resume after a crash — that persistence is the whole point.
+
+### 3. Statuses
+
+| Status | Meaning | Terminal |
+|--------|---------|----------|
+| `working` | in progress | no |
+| `input_required` | the server needs client input; see `inputRequests` | no |
+| `completed` | done; `result` holds what the original request would have returned | yes |
+| `failed` | a JSON-RPC error occurred; `error` holds it | yes |
+| `cancelled` | cancellation was honored | yes |
+
+Once a task reaches a terminal state it never changes again.
+
+### 4. Mid-flight input
+
+When a task needs the user — an approval, a choice — it moves to `input_required` and the `tasks/get` response carries an `inputRequests` map with the same shapes MRTR uses (elicitation, and so on). The client answers with `tasks/update`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tasks/update",
+  "params": {
+    "taskId": "tsk_9f2c1a",
+    "inputResponses": {
+      "approve_prod": { "action": "accept", "content": { "confirm": true } }
+    }
+  }
+}
+```
+
+The server acknowledges with an empty result and ignores responses for keys it did not ask for or has already satisfied. No second connection, no server-initiated message — the same stateless discipline as MRTR.
+
+### 5. Completion and retrieval
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "resultType": "complete",
+    "task": {
+      "taskId": "tsk_9f2c1a",
+      "status": "completed",
+      "ttlMs": 3600000
+    },
+    "result": {
+      "content": [{ "type": "text", "text": "Build 4812 passed in 6m 12s" }],
+      "structuredContent": { "buildId": 4812, "ok": true }
+    }
+  }
+}
+```
+
+The `result` is exactly what a synchronous `tools/call` would have returned. `ttlMs` tells the client how long the server promises to keep the task retrievable.
+
+### 6. Cancellation
+
+`tasks/cancel` is acknowledged with an empty result but is **cooperative**: the server may or may not be able to stop the underlying job, and the task may still end `completed` or `failed`. Treat `cancelled` as one possible outcome, not a guarantee.
+
+## Notifications instead of polling
+
+A server may push full task snapshots as `notifications/tasks`. Clients opt in through the normal `subscriptions/listen` mechanism (see [change notifications](/mcp/en/server-primitives/notifications-and-caching/)). Each notification carries the whole task state, so no follow-up `tasks/get` is needed. Polling remains the default and the fallback.
+
+## When to use tasks
+
+| Situation | Why tasks fit |
+|-----------|---------------|
+| CI pipelines, batch jobs, model training | minutes to hours; blocking is impossible |
+| approval gates, human review | `input_required` surfaces the request; nobody holds a connection open |
+| wrapping an API that already has job ids | return a task when you create the job, resolve it when the job does |
+| mobile / flaky networks | the `taskId` survives disconnects |
+| bulk operations with meaningful partial progress | `statusMessage` reports progress without a live stream |
+
+And when *not* to: anything that finishes in a few seconds. A task adds two round trips minimum and a polling loop; plain `tools/call` with progress is cheaper and simpler.
+
+## Server checklist
+
+1. Advertise `io.modelcontextprotocol/tasks` in `server/discover` capabilities.
+2. On each request, check the client's `extensions` before returning a task.
+3. Persist the task **before** responding with `resultType: "task"`.
+4. Serve `tasks/get`, returning `result` on `completed` and `error` on `failed`.
+5. Accept `tasks/update` and `tasks/cancel`; acknowledge both with an empty result.
+6. Bind tasks to the authenticated user. A `taskId` is a handle, not a credential — validate the caller on every poll (see [state handle hijacking](/mcp/en/security-and-auth/threats-and-mitigations/)).
+
+SDK support for the extension is evolving; where your SDK exposes a task helper, use it, otherwise the wire shapes above are small enough to implement by hand on top of an ordinary request handler.
+
+<Callout title="The one-line takeaway">
+When work outlives a request, return `resultType: "task"` with a durable `taskId` — but only to clients that declared `io.modelcontextprotocol/tasks` on that request — then let them poll `tasks/get`, answer `input_required` through `tasks/update`, and treat `tasks/cancel` as a polite ask rather than a kill switch.
+</Callout>
+
+export const quizTasks = [
+  {
+    q: 'Who decides whether a given tools/call returns a task instead of a result?',
+    options: [
+      'The client, by setting a per-request flag',
+      'The server, per request — as long as the client declared the tasks extension on that request',
+      'The transport layer',
+      'The LLM',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which statuses are terminal?',
+    options: [
+      'working and input_required',
+      'completed, failed, and cancelled',
+      'only completed',
+      'only failed',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a client answer an input_required task?',
+    options: [
+      'By retrying the original tools/call with inputResponses',
+      'By calling tasks/update with inputResponses keyed to the task’s inputRequests',
+      'By opening a subscriptions/listen stream',
+      'By calling elicitation/create on the server',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does a successful tasks/cancel acknowledgement guarantee?',
+    options: [
+      'The job has stopped',
+      'The task will end in status cancelled',
+      'Nothing beyond acknowledging the intent — cancellation is cooperative',
+      'The result is discarded',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="client-interaction/tasks-extension" questions={quizTasks} />
+
+<ProgressTracker client:visible id="client-interaction/tasks-extension" />

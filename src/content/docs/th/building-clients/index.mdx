@@ -1,0 +1,109 @@
+---
+title: 'Building Clients and Hosts'
+description: 'host เป็นเจ้าของอะไร client เป็นเจ้าของอะไร ทำไมต้องมี client หนึ่งตัวต่อหนึ่ง server และ LLM loop, consent UI กับ tool registry ประกอบกันอย่างไร'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## อีกครึ่งหนึ่งของ protocol
+
+ที่ผ่านมาคอร์สนี้มอง MCP จากฝั่ง server เป็นหลัก: จะเปิด tool, resource และ prompt ออกมาอย่างไร โมดูลนี้จะพลิกมุมมอง ถ้าคุณกำลังสร้าง AI application ไม่ว่าจะเป็นผู้ช่วยใน IDE, ผลิตภัณฑ์แชท หรือ agent ที่ทำงานเอง แปลว่าคุณกำลังสร้าง **host** และภายใน host นั้นคุณจะสร้าง **client** หนึ่งตัวต่อหนึ่ง server ที่เชื่อมต่อ
+
+ความต่างนี้สำคัญ เพราะ protocol กำหนดหน้าที่ให้ทั้งสองต่างกัน:
+
+- **client** คือ object ระดับ protocol มันคุย JSON-RPC กับ server เพียงตัวเดียวผ่าน transport เดียว ส่ง `_meta` ไปกับทุก request และแปลงผลลัพธ์บน wire ให้เป็นค่าที่มี type
+- **host** คือตัว application มันเป็นเจ้าของ language model, บทสนทนา, user interface, การตัดสินใจเรื่อง consent และ registry ที่รวม tool จากหลาย client เข้าเป็น list เดียวที่ model มองเห็น
+
+<Mermaid title="host เดียว หลาย client โดยมี client หนึ่งตัวต่อหนึ่ง server" code={hostDiagram} />
+
+export const hostDiagram = `flowchart LR
+  subgraph host["Host (your AI app)"]
+    llm["LLM loop"]
+    ui["Consent UI"]
+    reg["Tool registry"]
+    c1["Client 1"]
+    c2["Client 2"]
+    c3["Client 3"]
+  end
+  s1["Server A (stdio, local)"]
+  s2["Server B (HTTP, remote)"]
+  s3["Server C (HTTP, remote)"]
+  c1 --- s1
+  c2 --- s2
+  c3 --- s3
+  reg --> llm
+  ui --> llm`;
+
+## ทำไมต้องมี client หนึ่งตัวต่อหนึ่ง server
+
+MCP เป็น protocol แบบ stateless: ทุก request พก protocol version, client capability และตัวตนของ client ไปด้วย แต่ก็ยังมีเหตุผลดี ๆ ที่ควรเก็บ client object ไว้หนึ่งตัวต่อหนึ่ง server เพราะแต่ละ server มี transport ของตัวเอง (subprocess หรือ HTTP origin), มี capability ที่ discover มาได้ต่างกัน, มี credential ของตัวเอง และมีชื่อ tool ของตัวเอง ถ้าเอาหลาย server ไปซ่อนไว้หลัง client ตัวเดียว host จะต้องคอยแยกแยะทั้งหมดนั้นทุกครั้งที่เรียก การแยกไว้ทำให้ host มอง server เป็นหน่วยหนึ่งที่ connect, disconnect และ revoke ได้อย่างอิสระ
+
+host คือจุดที่การรวมเกิดขึ้น มันขอ `tools/list` จากแต่ละ client, ใส่ prefix หรือ namespace ให้ชื่อเพื่อกันชนกัน (server สองตัวอาจเปิด `search` ทั้งคู่) แล้วส่ง list ที่รวมแล้วให้ model
+
+## host เป็นเจ้าของอะไรบ้าง
+
+| เรื่อง | ใคร | ทำไมถึงอยู่ตรงนั้น |
+|---------|-----|--------------------|
+| คุย JSON-RPC, ใส่ `_meta`, parse ผลลัพธ์ | Client | เป็นงานกลไกล้วน ๆ มีหนึ่งตัวต่อ transport |
+| ตัดสินว่า tool call ไปที่ server ไหน | Host | มีแต่ host ที่เห็น server ทุกตัว |
+| เรียก LLM และรัน tool loop | Host | protocol ไม่เคยคุยกับ model โดยตรง |
+| ถามผู้ใช้ก่อนรัน tool ที่ทำลายข้อมูล | Host | spec บอกว่าควรมีมนุษย์ที่ปฏิเสธ call ใดก็ได้ |
+| แสดง form ของ elicitation และขอ consent ก่อนเปิด URL | Host | host เป็นเจ้าของ UI |
+| ถือ OAuth token และ API key | Host | credential ต้องไม่ไปถึง model หรือ sandbox เด็ดขาด |
+| cache `tools/list` ตาม `ttlMs` และ refresh เมื่อได้ `list_changed` | Host | เป็น policy ที่ข้ามหลาย request |
+
+## โมดูลนี้ครอบคลุมอะไร
+
+| บทเรียน | คุณจะได้เรียน |
+|--------|----------------|
+| [Writing a Client](/mcp/th/building-clients/writing-a-client/) | เชื่อมต่อผ่าน stdio หรือ HTTP, list และ call tool, อ่าน resource, ตอบ elicitation |
+| [Wiring Tools to an LLM](/mcp/th/building-clients/wiring-tools-to-an-llm/) | แปลง `tools/list` เป็น tool definition ของ model และรัน agent loop |
+| [Using Servers in Real Hosts](/mcp/th/building-clients/using-servers-in-hosts/) | Claude Code, Claude Desktop, MCP connector ของ Claude API และ Inspector |
+| [Scaling Tools](/mcp/th/building-clients/scaling-tools/) | progressive discovery, caching และ programmatic tool calling |
+| [Client Security Duties](/mcp/th/building-clients/client-security-duties/) | client ที่ดีต้องทำอะไรบ้างเพื่อปกป้องผู้ใช้ |
+
+<Callout title="สรุปหนึ่งบรรทัด">
+client คือสายไฟ: หนึ่งตัวต่อหนึ่ง server, stateless, ทำงานเชิงกลไก ส่วน host คือตัว application: มันรัน model, รวม tool จากทุก client เข้าเป็น registry เดียว และเป็นที่ที่ผู้ใช้ตอบว่าใช่หรือไม่ใช่
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'ปกติ host สร้าง MCP client กี่ตัว?',
+    options: [
+      'หนึ่งตัวสำหรับทั้ง application',
+      'หนึ่งตัวต่อหนึ่ง server ที่เชื่อมต่อ',
+      'หนึ่งตัวต่อหนึ่ง tool',
+      'หนึ่งตัวต่อหนึ่งข้อความของผู้ใช้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อใดเป็นหน้าที่ของ host ไม่ใช่ client?',
+    options: [
+      'ใส่ field _meta ลงใน request',
+      'parse JSON-RPC error response',
+      'ตัดสินว่า tool call นั้นไปที่ server ไหน และขอ consent จากผู้ใช้',
+      'เข้ารหัส message แบบคั่นด้วย newline บน stdio',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ทำไม host ต้องใส่ namespace ให้ชื่อ tool (เช่น server__tool)?',
+    options: [
+      'spec บังคับ',
+      'server สองตัวอาจเปิด tool ชื่อเดียวกัน host จึงต้อง route ได้โดยไม่กำกวม',
+      'ทำให้ tool call เร็วขึ้น',
+      'จำเป็นสำหรับ OAuth',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="building-clients/index" />

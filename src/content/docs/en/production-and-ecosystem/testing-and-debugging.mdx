@@ -1,0 +1,262 @@
+---
+title: 'Testing and Debugging'
+description: 'Poke a server without an LLM using the MCP Inspector, write in-process tests that run in CI in TypeScript and Python, log safely on stdio, propagate trace context, and work through the common-failure checklist.'
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Take the model out of the loop
+
+Debugging through a chat window is slow and noisy: you cannot tell whether the model chose wrong, the client encoded wrong, or your server answered wrong. The fix is to talk to the server *directly*, with a client you control, and look at the JSON-RPC on the wire.
+
+<Mermaid title="Three ways to drive a server" code={driveDiagram} />
+
+export const driveDiagram = `flowchart LR
+  i["Inspector: web, cli, tui"] --> s["your server"]
+  t["in-process test client"] --> s
+  h["real host, e.g. Claude Code"] --> s
+  s --> w["wire: JSON-RPC you can read"]`;
+
+## The MCP Inspector
+
+The [Inspector](https://github.com/modelcontextprotocol/inspector) is the reference developer tool. One package, three clients, one shared core, so a connection behaves identically in each. It needs **Node 22.19.0 or newer** and runs through `npx` with no install:
+
+```bash
+# Web UI (default): launches a browser tab with a one-time session token
+npx @modelcontextprotocol/inspector node dist/index.js
+
+# Or start empty and add servers from the UI
+npx @modelcontextprotocol/inspector
+
+# A published npm server
+npx -y @modelcontextprotocol/inspector npx @modelcontextprotocol/server-filesystem ~/Desktop
+
+# A PyPI server
+npx @modelcontextprotocol/inspector uvx mcp-server-git --repository ~/code/repo
+
+# A remote Streamable HTTP server
+npx @modelcontextprotocol/inspector --server-url https://api.example.com/mcp --transport http
+```
+
+The web client has tabs for tools, resources, and prompts, an OAuth flow for protected servers, and a monitoring sidebar that shows every message as it happens. It negotiates protocol era automatically, so you can point it at a legacy `2025-11-25` server or a modern `2026-07-28` one.
+
+### CLI mode for scripts and CI
+
+`--cli` turns the same core into a scriptable client with machine-readable output:
+
+```bash
+# List tools and exit
+npx @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list
+
+# Call a tool and pipe into jq
+npx @modelcontextprotocol/inspector --cli https://api.example.com/mcp --transport http \
+  --method tools/call --tool-name get_weather --tool-arg city=Boston --format json | jq .result
+```
+
+This is the fastest smoke test you can put in a pipeline: exit code, JSON out, no browser.
+
+### TUI mode
+
+```bash
+npx @modelcontextprotocol/inspector --tui node dist/index.js
+```
+
+Same features, in the terminal, for SSH sessions and machines without a browser.
+
+The mode flag must come first: `--web` (default), `--cli`, or `--tui`. Everything after the first non-mode token is forwarded to the client and then to your server, which is how a server can itself accept a literal `--cli` argument.
+
+## In-process tests
+
+The Inspector is for exploring. For regression tests you want a client in the same process as the server, no ports, no subprocess, running under your normal test runner.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import assert from 'node:assert/strict';
+    import { test } from 'node:test';
+    import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    function createServer() {
+      const server = new McpServer({ name: 'pricing', version: '1.0.0' });
+      server.registerTool(
+        'apply-discount',
+        {
+          description: 'Apply a percentage discount to a price',
+          inputSchema: z.object({ price: z.number(), percent: z.number().min(0).max(100) }),
+          outputSchema: z.object({ total: z.number() }),
+        },
+        async ({ price, percent }) => {
+          if (price < 0) {
+            return { content: [{ type: 'text', text: 'price must be >= 0' }], isError: true };
+          }
+          const total = price * (1 - percent / 100);
+          return { content: [{ type: 'text', text: `$${total}` }], structuredContent: { total } };
+        },
+      );
+      return server;
+    }
+
+    test('discount math and error path', async () => {
+      const handler = createMcpHandler(createServer);
+      // Route the client's fetch straight into the handler — no network.
+      const transport = new StreamableHTTPClientTransport(new URL('http://test.local/mcp'), {
+        fetch: (url, init) => handler.fetch(new Request(url, init)),
+      });
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      await client.connect(transport);
+
+      const ok = await client.callTool({ name: 'apply-discount', arguments: { price: 100, percent: 25 } });
+      assert.equal(ok.isError, undefined);
+      assert.deepEqual(ok.structuredContent, { total: 75 });
+
+      const bad = await client.callTool({ name: 'apply-discount', arguments: { price: -1, percent: 0 } });
+      assert.equal(bad.isError, true);
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pytest
+    from pydantic import BaseModel
+
+    from mcp import Client
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+    from mcp.types import TextContent
+
+    mcp = MCPServer("Pricing")
+
+
+    class Discounted(BaseModel):
+        total: float
+
+
+    @mcp.tool()
+    def apply_discount(price: float, percent: float) -> Discounted:
+        """Apply a percentage discount to a price."""
+        if price < 0:
+            raise ToolError("price must be >= 0")
+        return Discounted(total=price * (1 - percent / 100))
+
+
+    @pytest.mark.anyio
+    async def test_discount_and_error():
+        # Client(mcp) connects in-process — no subprocess, no port.
+        async with Client(mcp) as client:
+            ok = await client.call_tool("apply_discount", {"price": 100, "percent": 25})
+            assert not ok.is_error
+            assert ok.structured_content == {"total": 75.0}
+
+            bad = await client.call_tool("apply_discount", {"price": -1, "percent": 0})
+            assert bad.is_error
+            assert isinstance(bad.content[0], TextContent)
+    ```
+  </TabItem>
+</Tabs>
+
+Both patterns exercise the real protocol path: the request is serialized, `_meta` is filled, the handler validates the schema, and the result comes back as the model would see it. Assert on `isError`, on `structuredContent`, and on the *text* — the text is what the model reads.
+
+## Logging without breaking the transport
+
+On **stdio**, `stdout` is the wire. One stray `console.log` or `print()` corrupts framing and the client sees a parse error, not your message. Rules:
+
+- Log to **stderr** only. The spec allows any UTF-8 on stderr; clients may capture, forward, or ignore it.
+- In Node, `console.error` goes to stderr; in Python, use `logging` with a `StreamHandler(sys.stderr)` or `print(..., file=sys.stderr)`.
+- Third-party libraries that print to stdout must be silenced or redirected before the server starts.
+
+On **Streamable HTTP** there is no such hazard, but the protocol's own logging feature is now deprecated (see the last lesson). If a client wants per-request log messages, it opts in with `io.modelcontextprotocol/logLevel` in `_meta`; a server **MUST NOT** emit `notifications/message` for requests that did not include it. For everything else, use your platform's logger.
+
+## Trace context
+
+The reserved `_meta` keys `traceparent`, `tracestate`, and `baggage` carry W3C Trace Context through MCP, so a tool call can join the same distributed trace as the HTTP request that triggered the agent:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "Lisbon" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"
+    }
+  }
+}
+```
+
+Read `traceparent` in your handler, start a child span, and your tool's downstream calls show up under the agent's trace. This follows the OpenTelemetry semantic conventions for MCP.
+
+## The common-failure checklist
+
+When a server "does nothing" or a client "cannot connect", it is almost always one of these:
+
+| Symptom | Likely cause | Check |
+|---------|--------------|-------|
+| Client reports JSON parse error on stdio | Something wrote to stdout | grep for `console.log` / `print(` without `file=sys.stderr` |
+| HTTP 400, error `-32020` HeaderMismatch | `Mcp-Method` / `Mcp-Name` / `MCP-Protocol-Version` missing or differ from the body | Compare headers with `params.name` and `_meta` |
+| HTTP 400, error `-32022` UnsupportedProtocolVersion | Client sent a version the server does not speak | Read `error.data.supported` and retry with one of them |
+| HTTP 400, error `-32602` and "missing _meta" | Request lacks `io.modelcontextprotocol/protocolVersion` or `clientCapabilities` | Use an SDK client, or add the fields by hand |
+| HTTP 403 | `Origin` header present and not allowed | Set the server's allowed hosts / origins |
+| HTTP 406 or hanging response | Client `Accept` does not list both `application/json` and `text/event-stream` | Fix the client's headers |
+| Tool "works in Inspector, fails from host" | `inputSchema` too strict or model sends a string for a number | Loosen or coerce; add `description` to the property |
+| `structuredContent` rejected | Result does not match `outputSchema` | Validate before returning; keep the text fallback |
+| Legacy client gets 405 on GET | Modern-only server, client expects the old GET stream | Serve dual-era or tell the client to upgrade |
+
+Read the wire first. The Inspector's monitor sidebar, or the CLI's `--format json`, shows you exactly which of these it is.
+
+<Callout title="The one-line takeaway">
+Debug MCP without the model: explore with the Inspector (web, `--cli` for CI, `--tui` for terminals), regress with an in-process client (`handler.fetch` in TypeScript, `Client(mcp)` in Python), never write to stdout on stdio, thread `traceparent` through `_meta`, and read the wire error codes — `-32020`, `-32022`, `-32602` — before touching code.
+</Callout>
+
+export const quizTesting = [
+  {
+    q: 'What is the minimum Node version for the MCP Inspector?',
+    options: ['16', '18', '20', '22.19.0'],
+    answer: 3,
+  },
+  {
+    q: 'How do you run a TypeScript server in-process for tests without opening a port?',
+    options: [
+      'Spawn it with child_process and parse stdout',
+      'Pass a custom fetch to StreamableHTTPClientTransport that calls handler.fetch(new Request(url, init))',
+      'Use the deprecated HTTP+SSE transport',
+      'Set stateless_http: true',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A stdio server prints "starting…" with console.log. What happens?',
+    options: [
+      'Nothing; clients ignore non-JSON lines',
+      'The client sees a corrupted wire and reports a parse error, because stdout is the transport',
+      'The message appears in the host UI as a notification',
+      'The server switches to HTTP',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A remote server answers HTTP 400 with JSON-RPC error code -32020. What does that mean?',
+    options: [
+      'Unsupported protocol version',
+      'Unknown tool',
+      'The mirrored HTTP headers do not match the request body, or a required header is missing',
+      'Rate limited',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/testing-and-debugging" questions={quizTesting} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/testing-and-debugging" />

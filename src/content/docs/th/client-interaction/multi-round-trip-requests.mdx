@@ -1,0 +1,274 @@
+---
+title: 'Multi Round-Trip Requests (MRTR)'
+description: 'pattern ที่มาแทน request ซึ่ง server เป็นฝ่ายเริ่ม — InputRequiredResult, inputRequests กับ inputResponses, requestState แบบ opaque และวิธีทำให้มันเชื่อถือได้โดยไม่ต้องมี state ฝั่ง server'
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ปัญหาที่ MRTR แก้
+
+MCP ยุคเก่า (2025-11-25 และก่อนหน้า) ยอมให้ server ส่ง `elicitation/create`, `sampling/createMessage` หรือ `roots/list` เป็น JSON-RPC *request* ไปหา client ผ่าน session วิธีนี้ใช้ได้กับ stdio แต่บังคับให้ remote server ต้องเก็บ state ต่อ session และมี back-channel เปิดค้างไว้ — ซึ่งพังทันทีที่เอา load balancer ไปวางหน้า replica สองตัว เพราะ replica ที่ได้รับ retry ต้องรู้ว่าอีกตัวถามอะไรไป
+
+**Multi Round-Trip Requests (MRTR)** ตัด back-channel ทิ้ง server ไม่เคยเป็นฝ่ายถาม แต่ *ตอบกลับด้วยคำถาม* แล้ว client ส่ง request เดิมซ้ำโดยแนบคำตอบมาด้วย replica ตัวไหนก็จบงานได้ เพราะทุกอย่างที่ต้องใช้อยู่ใน retry นั้นแล้ว
+
+## flow สี่ขั้น
+
+1. client ส่ง request ปกติ — สมมติว่า `tools/call`
+2. server รู้ตัวว่าต้องการข้อมูลเพิ่ม เลยตอบกลับด้วย `InputRequiredResult`
+3. client รวบรวม input ที่ถูกขอ (จากผู้ใช้ หรือจากที่อื่น) แล้ว **retry request เดิม** พร้อมแนบ input
+4. คราวนี้ server มีข้อมูลพอ ทำงาน แล้ว return ผลลัพธ์สุดท้าย
+
+<Mermaid title="MRTR: สอง request ที่เป็นอิสระต่อกัน แต่เป็น operation เดียวในเชิงตรรกะ" code={mrtrDiagram} />
+
+export const mrtrDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (id 1, params)
+  Note over S: ต้องการ input
+  S-->>C: result resultType input_required (inputRequests, requestState)
+  Note over C: request 1 จบแล้ว
+  Note over C: รวบรวม input จากผู้ใช้
+  C->>S: tools/call (id 2, params เดิม + inputResponses + requestState)
+  Note over S: ประกอบ state คืนจาก requestState แล้วรัน
+  S-->>C: result resultType complete`;
+
+สังเกตสิ่งที่ไดอะแกรม *ไม่ได้* แสดง: state ใด ๆ ที่ server ต้องถือไว้ระหว่างขั้น 2 กับขั้น 3 request 1 จบทันทีที่ server ตอบ ส่วน request 2 เป็น request ใหม่เอี่ยมที่ครบในตัวเอง
+
+## type สามตัว
+
+### InputRequiredResult
+
+result ที่ `resultType` เป็น `"input_required"` มี field ได้ไม่เกินสองตัว:
+
+- `inputRequests` — map จาก key ที่ server ตั้งเอง (string) ไปยัง request object ที่ client ต้องไปหาคำตอบมา
+- `requestState` — string แบบ opaque ที่มีความหมายเฉพาะกับ server
+
+server **ต้อง** ใส่มาอย่างน้อยหนึ่งในสอง จะใส่แค่ `requestState` ก็ได้ (แปลว่า "ไว้ค่อย retry ทีหลัง ฉันเก็บของที่ต้องใช้ไว้ในนี้แล้ว") หรือแค่ `inputRequests` ก็ได้
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "input_required",
+    "inputRequests": {
+      "pick_region": {
+        "method": "elicitation/create",
+        "params": {
+          "mode": "form",
+          "message": "Which region should the database live in?",
+          "requestedSchema": {
+            "type": "object",
+            "properties": {
+              "region": { "type": "string", "enum": ["eu-west-1", "us-east-1", "ap-southeast-1"] }
+            },
+            "required": ["region"]
+          }
+        }
+      }
+    },
+    "requestState": "v1.eyJuYW1lIjoib3JkZXJzIn0.h2Kq..."
+  }
+}
+```
+
+### InputRequests
+
+value ใน `inputRequests` คือ request shape ปกติของ MCP — หนึ่งใน `ElicitRequest`, `CreateMessageRequest` (sampling) หรือ `ListRootsRequest` key ให้ server เป็นคนตั้ง และต้องไม่ซ้ำกันภายใน response เดียว `InputRequiredResult` ตัวเดียวรวมหลายคำถามไว้ด้วยกันได้
+
+### InputResponses
+
+ตอน retry client ส่ง `inputResponses` มา — key ชุดเดิม แต่ละตัว map ไปยัง *result* type ที่ตรงกัน (`ElicitResult`, `CreateMessageResult`, `ListRootsResult`):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "provision_database",
+    "arguments": { "name": "orders" },
+    "inputResponses": {
+      "pick_region": {
+        "action": "accept",
+        "content": { "region": "eu-west-1" }
+      }
+    },
+    "requestState": "v1.eyJuYW1lIjoib3JkZXJzIn0.h2Kq...",
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": { "form": {} } }
+    }
+  }
+}
+```
+
+กฎสามข้อของการ retry:
+
+- JSON-RPC `id` **ต้องต่างจาก** ครั้งแรก — มันเป็น request ที่เป็นอิสระต่อกัน
+- `name` และ `arguments` เดิมถูกส่งซ้ำแบบไม่แก้ไข
+- `requestState` ถูกส่งคืน **แบบ byte ต่อ byte** ถ้า server ส่งมา และไม่ใส่ถ้า server ไม่ได้ส่ง client ห้าม parse, แก้ไข หรือตีความมันเด็ดขาด
+
+## MRTR ใช้ได้ที่ไหนบ้าง
+
+มีแค่ client request สามแบบที่รับ `InputRequiredResult` ได้:
+
+| client request | return `input_required` ได้ไหม |
+|----------------|------------------------------|
+| `tools/call` | ได้ |
+| `resources/read` | ได้ |
+| `prompts/get` | ได้ |
+| อื่น ๆ ทั้งหมด (`tools/list`, `server/discover`, …) | ไม่ได้ |
+
+ถ้าเมื่อไรอยาก elicit ระหว่าง `tools/list` แปลว่าออกแบบผิด: รายการต้องไม่เปลี่ยนตาม connection หรือเป็นผลข้างเคียงของ request อื่น
+
+## ข้อกำหนดฝั่ง server
+
+- **ห้ามขอสิ่งที่ client ทำไม่ได้** ถ้า `io.modelcontextprotocol/clientCapabilities` ของ client ไม่ได้ประกาศ `elicitation` server ห้ามใส่ `elicitation/create` ลงใน `inputRequests` ให้เช็ค capability จาก request *นี้* — ไม่มี handshake ก่อนหน้าให้จำ
+- **ห้ามคิดเอาเองว่า retry จะมา** ผู้ใช้อาจปฏิเสธ client อาจยอมแพ้ อย่าจอง resource ในขาแรกที่ต้องรอขาสองมาเก็บกวาด
+- **input ที่หายไปไม่ใช่ error** ถ้า retry มาถึงโดยไม่มีสิ่งที่ขอไป และยังต้องใช้อยู่ ให้ return `InputRequiredResult` ใหม่ถามอีกรอบ — ไม่ใช่ JSON-RPC error
+- **มองข้ามสิ่งที่ไม่ได้ขอ** key เกินใน `inputResponses` ให้เมิน
+- **วนได้** server จะ return `input_required` ซ้ำหลายรอบ ถามทีละอย่าง จนกว่าจะได้ครบก็ได้
+
+## requestState ถือว่าถูกควบคุมโดยผู้โจมตี
+
+เพราะ `requestState` ออกจาก server แล้ววนกลับมาผ่าน client client ที่ประสงค์ร้ายหรือถูกยึดจึงแก้ไขมันได้ spec พูดตรง ๆ ว่า: ถ้า `requestState` มีผลต่อ authorization, การเข้าถึง resource หรือ business logic server **ต้อง** ปกป้อง integrity ของมัน — ทำ HMAC หรือ seal ด้วย AEAD — และปฏิเสธทุกอย่างที่ verify ไม่ผ่าน
+
+เพื่อจำกัดการ replay ให้ใส่สิ่งเหล่านี้ไว้ใน payload ที่ถูกป้องกัน แล้วตรวจตอนได้รับ:
+
+- **principal ที่ authenticate แล้ว** — ปฏิเสธ state ที่ผู้ใช้คนอื่นเอามายื่น
+- **TTL สั้น ๆ** — ปฏิเสธ state ที่เก่าเกิน
+- **identifier ของ request ต้นทาง** — ชื่อ method บวก digest ของ param สำคัญ เพื่อให้ state ที่ออกให้ `provision_database("orders")` เอาไป replay กับ `delete_database("orders")` ไม่ได้
+
+มาตรการเหล่านี้จำกัดช่องโหว่ แต่ไม่รับประกันว่าใช้ได้ครั้งเดียว ถ้า state หนึ่ง ๆ ต้องถูกใช้ไม่เกินหนึ่งครั้ง (เช่นการแลกรับสิทธิ์ครั้งเดียว) ต้องบังคับฝั่ง server ด้วย store การป้องกัน integrity จะข้ามได้ *ก็ต่อเมื่อ* การแก้ไขข้อมูลทำได้อย่างมากแค่ทำให้ request ล้มเหลว
+
+## SDK ทำอะไรให้บ้าง
+
+คุณแทบไม่ต้องประกอบ `InputRequiredResult` เองเลย SDK ทางการทั้งสองตัวให้เขียน handler เหมือนคำถามเป็น synchronous แล้วแยกเป็นสองขาให้เบื้องหลัง
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    const server = new McpServer({ name: 'infra', version: '1.0.0' });
+
+    server.registerTool(
+      'provision_database',
+      { description: 'Create a database', inputSchema: z.object({ name: z.string() }) },
+      async ({ name }, ctx) => {
+        // ดูเหมือน synchronous บน wire จริง ๆ จะ return input_required
+        // แล้ว handler ถูกรันใหม่ตอน retry โดยมีคำตอบพร้อมแล้ว
+        const answer = await ctx.mcpReq.elicitInput({
+          mode: 'form',
+          message: `Which region should ${name} live in?`,
+          requestedSchema: {
+            type: 'object',
+            properties: { region: { type: 'string', enum: ['eu-west-1', 'us-east-1'] } },
+            required: ['region'],
+          },
+        });
+        if (answer.action !== 'accept') {
+          return { content: [{ type: 'text', text: 'Provisioning cancelled.' }] };
+        }
+        return { content: [{ type: 'text', text: `Created ${name} in ${answer.content?.region}` }] };
+      }
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from typing import Annotated
+
+    from pydantic import BaseModel
+
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver import Elicit, Resolve
+
+    mcp = MCPServer("infra")
+
+
+    class Region(BaseModel):
+        region: str
+
+
+    async def ask_region(name: str) -> Elicit[Region]:
+        return Elicit(f"Which region should {name} live in?", Region)
+
+
+    # parameter แบบ Resolve จะถูกเติมจาก inputResponses ตอน retry
+    # ตัว tool จะรันก็ต่อเมื่อคำตอบมาถึงแล้วเท่านั้น
+    @mcp.tool()
+    async def provision_database(
+        name: str, where: Annotated[Region, Resolve(ask_region)]
+    ) -> str:
+        return f"Created {name} in {where.region}"
+    ```
+  </TabItem>
+</Tabs>
+
+รูปแบบ `Resolve` ของ Python เป็นแบบที่ใช้ได้ข้ามยุค: กับ client ยุคใหม่จะได้ MRTR สองขาที่สะอาด และยังทำงานกับ client ยุคเก่าที่คาดหวัง request แบบ push ได้ ไม่ว่าจะทางไหน mental model สำคัญคือ **handler ของคุณอาจถูกรันมากกว่าหนึ่งครั้ง** เก็บ side effect ไว้หลังจุดที่ input ครบทุกตัวแล้ว
+
+## ข้อคิดด้านการออกแบบ
+
+- **ถามทีละข้อเมื่อต้องเรียงลำดับ ถามหลายข้อพร้อมกันเมื่อไม่ต้อง** `inputRequests` เป็น map คำถามที่เป็นอิสระต่อกันเดินทางไปด้วยกันได้ ประหยัดไปหนึ่งรอบ
+- **ทำ `requestState` ให้เล็ก** มันวิ่งผ่าน client สองรอบและไปโผล่ใน log เข้ารหัสแค่ id กับ digest ไม่ใช่เอกสารทั้งก้อน
+- **retry ต้อง idempotent** retry ส่ง argument เดิมซ้ำ ถ้าขาแรกทำอะไรที่ย้อนกลับไม่ได้ไปแล้ว ขาสองต้องไม่ทำซ้ำ — อีกเหตุผลที่ควรเลื่อน side effect ออกไป
+
+<Callout title="สรุปหนึ่งบรรทัด">
+MRTR เปลี่ยน "server ถาม client" ให้เป็น "server return `input_required` แล้ว client retry request เดิมพร้อม `inputResponses`" — สอง request ที่เป็นอิสระ, id ใหม่ตอน retry, `requestState` แบบ opaque ที่ส่งคืนตามเดิม และไม่มี state บน server เซ็นหรือ seal `requestState` ทุกครั้งที่มันมีผลต่ออะไรที่สำคัญ
+</Callout>
+
+export const quizMrtr = [
+  {
+    q: 'client ต้องทำอะไรหลังได้รับ InputRequiredResult ที่มี inputRequests?',
+    options: [
+      'ส่งคำตอบไปเป็น JSON-RPC response ให้ server',
+      'รวบรวม input แล้ว retry request เดิมพร้อม inputResponses (และ requestState ถ้ามี) ภายใต้ id ใหม่',
+      'เปิด stream subscriptions/listen แล้วรอ',
+      'เรียก server/discover อีกครั้ง',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client request แบบไหนที่รับ resultType "input_required" ได้อย่างถูกต้อง?',
+    options: [
+      'request ใดก็ได้',
+      'เฉพาะ server/discover',
+      'tools/call, resources/read และ prompts/get',
+      'tools/list และ resources/list',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'client ทำอะไรกับ requestState ได้บ้าง?',
+    options: [
+      'parse มันเพื่อเติม form ล่วงหน้า',
+      'ส่งคืนแบบไม่แก้ไขตอน retry — แค่นั้น',
+      'เก็บไว้แล้วเอาไปใช้ซ้ำกับ request ที่ไม่เกี่ยวกัน',
+      'ตัดทิ้งเพื่อประหยัด bandwidth',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม server ต้องป้องกัน requestState ที่มีผลต่อ authorization ด้วย HMAC หรือ AEAD?',
+    options: [
+      'เพราะ JSON-RPC บังคับให้ params ต้องถูกเซ็น',
+      'เพราะมันผ่านมือ client และอาจถูกแก้ไขหรือ replay ได้',
+      'เพราะ transport ไม่ได้เข้ารหัส',
+      'เพราะ SDK serialize มันไม่ได้ถ้าไม่ทำ',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-interaction/multi-round-trip-requests" questions={quizMrtr} />
+
+<ProgressTracker client:visible id="client-interaction/multi-round-trip-requests" />

@@ -1,0 +1,90 @@
+---
+title: 'Production and Ecosystem'
+description: 'From a server that works to one agents love and operators can run — tool design for models, testing and debugging, remote deployment, publishing to the registry, and the extension ecosystem.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## "It works" is the halfway point
+
+By now you can build a server that lists tools, serves resources, speaks both transports, and asks the user for input. That server *works*. It is not yet *good*.
+
+Two audiences decide whether an MCP server is good, and neither of them is you:
+
+- **The model.** It reads your tool names and descriptions cold, with no README, and decides in one pass which tool to call and how. A tool that a human can figure out in ten minutes is a tool the model will misuse in ten milliseconds.
+- **The operator.** Someone deploys your server behind a load balancer, watches it at 3 a.m., and upgrades it without breaking the clients already connected. If the server hides state in a process, logs to stdout, or ships breaking tool changes silently, that person pages *you*.
+
+This module is about serving both audiences, and then about the ecosystem your server lives in: how people find it, install it, and what the protocol is growing into.
+
+<Mermaid title="The road from working to production" code={roadDiagram} />
+
+export const roadDiagram = `flowchart LR
+  a["Works locally"] --> b["Tools a model uses well"]
+  b --> c["Tested and debuggable"]
+  c --> d["Deployed stateless behind HTTPS"]
+  d --> e["Published and discoverable"]
+  e --> f["Extensions: Tasks, Apps"]`;
+
+## What this module covers
+
+| Lesson | Question it answers |
+|--------|---------------------|
+| [Designing Tools for Agents](/mcp/en/production-and-ecosystem/designing-tools-for-agents/) | Why does the model keep picking the wrong tool, and how do I fix the *definition* instead of the prompt? |
+| [Testing and Debugging](/mcp/en/production-and-ecosystem/testing-and-debugging/) | How do I poke a server without an LLM in the loop, write tests that run in CI, and read the wire when it breaks? |
+| [Deploying Remote Servers](/mcp/en/production-and-ecosystem/deploying-remote-servers/) | What does a stateless Streamable HTTP server need from its proxy, its runtime, and its operator? |
+| [Publishing and the MCP Registry](/mcp/en/production-and-ecosystem/publishing-and-registry/) | How do people install my server with one line, and how do I list it in the official registry? |
+| [Extensions and the Road Ahead](/mcp/en/production-and-ecosystem/extensions-and-the-road-ahead/) | What are Tasks and MCP Apps, what is deprecated, and how does the spec evolve? |
+
+## The three habits this module installs
+
+**Design for the reader that is a model.** Every tool description is a prompt. Every parameter name is a hint. Every error message is a chance for the model to self-correct instead of giving up. You will learn to write those three things deliberately.
+
+**Trust the wire, not the SDK.** When something goes wrong, the JSON-RPC messages on the wire are the ground truth. The Inspector shows them to you; in-process tests let you assert on them. An SDK abstraction that you cannot see through is a liability at 3 a.m.
+
+**Stay stateless, stay boring.** Protocol version `2026-07-28` removed sessions on purpose. A server that keeps its promise of "every request stands alone" scales horizontally for free, survives restarts, and needs no sticky load balancing. Every deployment decision in this module follows from that one property.
+
+<Callout title="The one-line takeaway">
+Production MCP is two design problems — an interface a model can use correctly on the first try, and a stateless service an operator can run without surprises — plus the ecosystem work of making the result findable and installable.
+</Callout>
+
+export const quizProdIndex = [
+  {
+    q: 'Who are the two audiences that decide whether an MCP server is "good", according to this module?',
+    options: [
+      'The spec authors and the SDK maintainers',
+      'The model that reads the tool definitions and the operator who runs the server',
+      'The end user and the database',
+      'npm and PyPI',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does protocol version 2026-07-28 make deployment simpler?',
+    options: [
+      'It requires sticky sessions on the load balancer',
+      'It removed protocol-level sessions, so every request stands alone and servers scale horizontally',
+      'It moved all servers to stdio',
+      'It mandates a single process per client',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'When a server misbehaves, what does this module treat as the ground truth?',
+    options: [
+      'The SDK\'s TypeScript types',
+      'The model\'s explanation of what happened',
+      'The JSON-RPC messages actually exchanged on the wire',
+      'The README',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/index" questions={quizProdIndex} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/index" />

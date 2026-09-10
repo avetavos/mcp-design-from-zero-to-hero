@@ -1,0 +1,246 @@
+---
+title: 'Designing Tools for Agents'
+description: 'Tools are an interface for a model, not a mirror of your REST API — how to name, describe, shape, and error them so an LLM picks the right one and uses it correctly on the first try.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The reader is a model
+
+A REST API is read by a developer with docs open, time to experiment, and a debugger. An MCP tool is read by a language model in a single forward pass, with the tool list competing for context against the user's message and everything else. It gets one look at `name`, `description`, and `inputSchema`, then it commits.
+
+That changes what "well designed" means. The best MCP servers are not the ones that expose the most endpoints. They are the ones whose tool list reads like a short, unambiguous menu of *tasks*.
+
+<Mermaid title="What the model actually sees" code={readerDiagram} />
+
+export const readerDiagram = `flowchart LR
+  l["tools/list"] --> n["name"]
+  l --> d["description"]
+  l --> s["inputSchema"]
+  n --> m["model picks a tool and fills arguments"]
+  d --> m
+  s --> m
+  m --> c["tools/call"]
+  c --> r["result text + structuredContent"]
+  r --> m`;
+
+## Fewer, task-shaped tools
+
+The most common mistake is mirroring CRUD. A server that exposes `list_users`, `get_user`, `create_user`, `update_user`, `delete_user`, `list_orders`, `get_order`, ... forces the model to plan a multi-step workflow every time, and every step is a chance to pick the wrong one.
+
+Ask instead: *what does the user actually ask for?* Then build a tool per answer.
+
+| CRUD mirror (avoid) | Task-shaped (prefer) |
+|---------------------|----------------------|
+| `get_user`, `list_orders`, `get_order` | `find_recent_orders_for_customer` |
+| `create_ticket`, `add_ticket_comment`, `set_ticket_priority` | `file_bug_report` |
+| `list_files`, `read_file` (×N) | `search_docs` returning excerpts |
+
+A handful of tools that each complete a meaningful unit of work beat thirty primitives. The spec does not limit you, but the model's context and attention do. If you need primitives for edge cases, keep them, but put the common path in one tool.
+
+## Names
+
+Tool names **SHOULD** be 1–128 characters from `A-Z a-z 0-9 _ - .`, case-sensitive, unique within the server. Beyond the letter of the spec:
+
+- **Verb first, then noun**: `search_issues`, `create_invoice`, `get_weather_forecast`. The model scans for the action it needs.
+- **One consistent prefix or style per server.** Hosts that aggregate many servers may prefix names with the server name to avoid collisions (two servers both exposing `search`), so do not rely on your server's `name` for disambiguation, and do not mix `camelCase` with `snake_case`.
+- **Say what it does, not how**: `send_email`, not `smtp_post_message`.
+- **Avoid abbreviations** the model has to guess at: `list_repositories`, not `ls_repos`.
+
+## Descriptions that make decisions easy
+
+The description is the single most important string on the tool. Write it in three parts:
+
+1. **What it does and when to use it.** One sentence.
+2. **When *not* to use it** and what to use instead. The model needs this to choose between neighbours.
+3. **What comes back.** Shape, limits, and any pagination.
+
+Bad:
+
+```json
+{
+  "name": "query",
+  "description": "Runs a query."
+}
+```
+
+Good:
+
+```json
+{
+  "name": "search_issues",
+  "description": "Search open and closed issues in the project tracker by free text, label, or assignee. Use this to find existing issues before filing a new one. Do not use it to read a single known issue — use get_issue with its id instead. Returns up to 20 matches per page with id, title, state, and a one-line summary; pass the returned nextCursor to fetch more."
+}
+```
+
+The good version tells the model when to pick this tool, when to pick its sibling, and what to expect. Nothing in it is decoration.
+
+## Parameters
+
+Every property in `inputSchema` should carry a `description`. Beyond that:
+
+- **Use `enum` for closed sets.** `"unit": { "enum": ["metric", "imperial"] }` cannot be misspelled. A free string can.
+- **Give `default` values** so optional parameters are truly optional and the model does not have to invent one.
+- **Avoid ambiguous booleans.** `"verbose": true` means what? Prefer an enum with named levels, or split into two tools if behaviour truly diverges.
+- **Keep nesting shallow.** Deep objects and `oneOf` compositions are legal (the spec allows any JSON Schema 2020-12 keywords), but every level of nesting is a level the model can get wrong. Flat is fast.
+- **Mark the `required` set honestly.** If it is required, the model must supply it; if it is optional, provide a default.
+- **Never mark secrets with `x-mcp-header`** — header values are visible to intermediaries.
+
+A schema that a strict validator accepts and a model fills correctly on the first try is the goal. Test with the Inspector: if *you* need to reread the schema to call the tool, the model will too.
+
+## Response design
+
+The result of a tool call lands in the model's context. Every byte you return is a byte the model has to read, and a byte the user pays for.
+
+- **Budget tokens.** Return a summary, not a dump. A `search` tool returning 20 rows with five fields each is fine; returning 2,000 rows of full records is not, even if the API can.
+- **Pair text with `structuredContent`.** The `content` text is what the model reads; `structuredContent` (validated against `outputSchema`) is what code mode and typed clients read. Return both for the same data.
+- **Use `resource_link` for large payloads.** A 4 MB log file should come back as a link the host can fetch on demand, not inline text.
+- **Paginate with cursors.** Return `nextCursor` in your structured output and describe it in the tool description, as the good example above does.
+- **Order results deterministically** and include units and timestamps explicitly (`"temperature_c": 22.5`, `"as_of": "2026-09-10T08:00:00Z"`). A bare `22.5` invites a wrong guess.
+
+## Errors that teach
+
+MCP has two error channels, and choosing the right one changes what the model can do next:
+
+- **Protocol errors** (a JSON-RPC `error`, e.g. `-32602` for an unknown tool or malformed arguments) mean the *request* was wrong in a way the model probably cannot fix.
+- **Tool execution errors** (`isError: true` in the result) mean the tool ran and failed for a reason the model *can* act on.
+
+Write execution errors as instructions:
+
+```json
+{
+  "resultType": "complete",
+  "isError": true,
+  "content": [
+    {
+      "type": "text",
+      "text": "Invalid departure date: must be in the future. Current date is 2026-09-10. Retry with a date on or after 2026-09-11 in YYYY-MM-DD format."
+    }
+  ]
+}
+```
+
+The model now knows what was wrong, what today is, and what a valid retry looks like. Compare that with `"error: bad input"`, which ends the conversation.
+
+Clients **SHOULD** feed execution errors back to the model precisely so it can self-correct; make that loop worth having.
+
+## Idempotency and annotations
+
+`annotations` are hints the client may use to decide whether to ask the user for confirmation. They are untrusted from the client's point of view, but honest annotations make your server pleasant to use:
+
+```json
+{
+  "name": "delete_branch",
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}
+```
+
+Design tools to be idempotent where you can: deleting an already-deleted branch should succeed (or return a clear "already gone" result), not throw. Idempotent tools survive the retries that MRTR and flaky networks produce.
+
+## State needs a handle
+
+There are no protocol-level sessions. If a workflow spans calls — a shopping basket, an open browser tab, a database transaction — return an explicit handle from a creation tool and accept it on later calls:
+
+```json
+{ "name": "create_basket", "arguments": {} }
+```
+
+```json
+{
+  "content": [{ "type": "text", "text": "Created basket bsk_a1b2c3 (expires after 24h idle)" }],
+  "structuredContent": { "basket_id": "bsk_a1b2c3" }
+}
+```
+
+Then `add_item` takes `basket_id`. Rules of thumb: handles are opaque and high-entropy, bound server-side to the authenticated user, have a stated lifetime *in the creation tool's description*, and a call against an expired handle returns an execution error that says "create a new basket".
+
+## Listing hygiene
+
+Two small things pay off in every conversation:
+
+- **Return tools in a deterministic order.** Clients cache the list and LLM providers cache prompt prefixes; a reshuffled `tools/list` busts both.
+- **Set `ttlMs` and `cacheScope` sensibly.** A static tool set can advertise `"ttlMs": 3600000, "cacheScope": "public"`; a per-tenant list is `"private"`. Combine with `listChanged` for the rare update.
+
+And use the `instructions` field of `server/discover`. It is a free system-prompt slot for *how* to use your server well — workflow order, units, limits. Keep it to a paragraph.
+
+## Before and after
+
+<Mermaid title="Refactoring a tool surface" code={refactorDiagram} />
+
+export const refactorDiagram = `flowchart TB
+  subgraph before["Before: 6 CRUD tools"]
+    b1["list_customers"]
+    b2["get_customer"]
+    b3["list_orders"]
+    b4["get_order"]
+    b5["list_shipments"]
+    b6["get_shipment"]
+  end
+  subgraph after["After: 2 task tools"]
+    a1["find_customer_orders"]
+    a2["get_order_status"]
+  end
+  before --> after`;
+
+The "after" server answers "where is Ana's last order?" in one call instead of four, has two descriptions to get right instead of six, and gives the model nowhere to wander.
+
+<Callout title="The one-line takeaway">
+Design tools for the reader that is a model: few task-shaped tools, verb-first names, descriptions that say when to use and when not, flat schemas with enums and defaults, token-budgeted results with `structuredContent`, errors that tell the model how to retry, honest annotations, explicit handles for state, and a deterministic, cacheable `tools/list`.
+</Callout>
+
+export const quizDesignTools = [
+  {
+    q: 'Why prefer a few task-shaped tools over a full CRUD mirror?',
+    options: [
+      'The spec limits servers to ten tools',
+      'Every extra primitive is another chance for the model to plan wrong, and it costs context; task-shaped tools answer the user question in one call',
+      'CRUD tools cannot have descriptions',
+      'Task-shaped tools do not need input schemas',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which error channel should a tool use for "date must be in the future"?',
+    options: [
+      'A JSON-RPC protocol error with code -32602',
+      'An HTTP 500',
+      'A result with isError: true whose text explains the fix, so the model can self-correct',
+      'Silently returning an empty result',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'How should a server carry state across tool calls?',
+    options: [
+      'Rely on the Mcp-Session-Id header',
+      'Return an explicit, opaque handle from a creation tool and accept it as an argument on later calls, with a documented lifetime',
+      'Keep state keyed by TCP connection',
+      'Ask the client to echo the whole previous result',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why return tools in a deterministic order from tools/list?',
+    options: [
+      'The spec makes it a MUST',
+      'So clients can cache the list and LLM prompt-prefix caches stay warm',
+      'Because alphabetical order improves accuracy',
+      'To make pagination unnecessary',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/designing-tools-for-agents" questions={quizDesignTools} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/designing-tools-for-agents" />

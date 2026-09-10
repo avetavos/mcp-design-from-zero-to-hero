@@ -1,0 +1,250 @@
+---
+title: 'Prompts'
+description: 'prompt template ที่ user เป็นคนควบคุม — การ list และดึงมาพร้อม argument, message และ content type ที่มันคืนกลับมา, argument completion และเมื่อไรที่ prompt คือ primitive ที่ถูกต้อง'
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## workflow ที่ user เป็นคนเรียก
+
+**prompt** คือ message template ที่ใช้ซ้ำได้ซึ่ง server เสนอให้ และ *user* เป็นคนเลือกรัน UI ที่พบบ่อยคือ slash command: user พิมพ์ `/code_review` host ถาม argument แล้วเรียก `prompts/get` จากนั้นแทรก message ที่ได้กลับมาเข้าไปในบทสนทนา
+
+"user-controlled" อธิบายว่าใครตัดสินใจว่าจะใช้ prompt *เมื่อไร* — ไม่ใช่ใครเป็นคนเขียน server เป็นผู้แต่งเนื้อหา คนเป็นผู้กด ความต่างนี้คือเหตุผลที่ prompt ปลอดภัยพอจะทำให้ทรงพลังได้: มันเก็บ checklist การรีวิวของทีม, playbook การ debug หรือชุดตัวอย่าง few-shot ได้ และจะรันก็ต่อเมื่อมีคนขอ
+
+<Mermaid title="จาก slash command สู่ message" code={promptFlow} />
+
+export const promptFlow = `sequenceDiagram
+  participant U as User
+  participant C as Host
+  participant S as Server
+  C->>S: prompts/list
+  S-->>C: prompts[] แสดงเป็น slash command
+  U->>C: /code_review code=...
+  C->>S: prompts/get name=code_review arguments
+  S-->>C: messages[]
+  C->>U: message ถูกแทรกเข้าบทสนทนา`;
+
+## `prompts/list`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "prompts": [
+      {
+        "name": "code_review",
+        "title": "Request Code Review",
+        "description": "Asks the LLM to analyze code quality and suggest improvements",
+        "arguments": [
+          { "name": "code", "description": "The code to review", "required": true },
+          { "name": "language", "description": "Programming language", "required": false }
+        ]
+      }
+    ],
+    "nextCursor": "next-page-cursor",
+    "ttlMs": 600000,
+    "cacheScope": "public"
+  }
+}
+```
+
+prompt มี `name`, `title` และ `description` แบบเลือกใส่, `icons` แบบเลือกใส่ และรายการ `arguments` แบบเลือกใส่ ซึ่งแต่ละตัวมีชื่อ, description และ flag `required` argument บน wire เป็น string เสมอ — host เก็บมันจาก user เป็นข้อความ
+
+## `prompts/get`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "prompts/get",
+  "params": { "name": "code_review", "arguments": { "code": "def hello():\n    print('world')" } }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "description": "Code review prompt",
+    "messages": [
+      {
+        "role": "user",
+        "content": { "type": "text", "text": "Please review this Python code:\ndef hello():\n    print('world')" }
+      }
+    ]
+  }
+}
+```
+
+`messages` คือรายการ `PromptMessage` แบบมีลำดับ แต่ละตัวมี `role` เป็น `user` หรือ `assistant` และ `content` block หนึ่งก้อน เพราะคุณควบคุมทั้งลำดับ คุณจึงคืน *บทสนทนา* ได้ ไม่ใช่แค่คำสั่งเดียว — การวางกรอบแบบ system เป็น user message แรก, assistant message ที่แสดงรูปแบบที่คาดหวัง แล้วตามด้วย input จริงของ user
+
+เช่นเดียวกับ method ลงมืออื่น ๆ `prompts/get` **อาจ** คืน `InputRequiredResult` เมื่อ server ต้อง elicit อะไรบางอย่างก่อนจะสร้าง message ได้
+
+### content type ใน message
+
+| `type` | Field | ใช้สำหรับ |
+|--------|--------|---------|
+| `text` | `text` | คำสั่ง, ตัวอย่าง few-shot |
+| `image` | `data` (base64), `mimeType` | screenshot ให้วิจารณ์, design mock |
+| `audio` | `data` (base64), `mimeType` | เสียงให้ถอดความหรืออภิปราย |
+| `resource_link` | `uri`, `name`, `description`, `mimeType` | ชี้ไปที่ resource ที่ host fetch ได้ |
+| `resource` | `resource: { uri, mimeType, text หรือ blob }` | ฝังเอกสาร, schema หรือตัวอย่างโค้ดลงไปเลย |
+
+embedded resource คือฟีเจอร์ที่ทรงพลังที่สุดตรงนี้: prompt `db_query_help` ฝัง database schema สด ๆ ลงไปได้ เพื่อให้ model ไม่ต้องเดาชื่อ table content block ทุกตัวรองรับ `annotations` ตามปกติ (`audience`, `priority`, `lastModified`)
+
+## การ implement prompt
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer, completable } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    const server = new McpServer({ name: 'review', version: '1.0.0' });
+
+    server.registerPrompt(
+      'code_review',
+      {
+        title: 'Request Code Review',
+        description: 'Asks the LLM to analyze code quality and suggest improvements',
+        argsSchema: z.object({
+          code: z.string().describe('The code to review'),
+          language: completable(z.string().describe('Programming language'), (value) =>
+            ['typescript', 'javascript', 'python', 'rust', 'go'].filter((l) => l.startsWith(value)),
+          ),
+        }),
+      },
+      ({ code, language }) => ({
+        messages: [
+          {
+            role: 'user' as const,
+            content: {
+              type: 'text' as const,
+              text: `Review this ${language} code. Check correctness first, then readability.\n\n${code}`,
+            },
+          },
+        ],
+      }),
+    );
+    ```
+    `argsSchema` เป็นตัวกำหนดรายการ `arguments` ใน `prompts/list`; การห่อ field ด้วย `completable(...)` ทำให้ server ตอบ `completion/complete` สำหรับ field นั้นได้
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("review")
+
+
+    @mcp.prompt(title="Request Code Review")
+    def code_review(code: str, language: str = "python") -> str:
+        """Asks the LLM to analyze code quality and suggest improvements."""
+        return f"Review this {language} code. Check correctness first, then readability.\n\n{code}"
+    ```
+    parameter ของ function กลายเป็น `arguments` ของ prompt (ค่า default ทำให้มันไม่บังคับ) การ return `str` ให้ user text message เดียว; return list ของ message object เมื่อต้องการ prompt แบบหลายเทิร์นหรือหลาย modality
+  </TabItem>
+</Tabs>
+
+## argument completion
+
+host เรียก `completion/complete` ขณะ user พิมพ์ค่า argument เพื่อให้ picker แนะนำค่าที่ถูกต้องได้:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "completion/complete",
+  "params": {
+    "ref": { "type": "ref/prompt", "name": "code_review" },
+    "argument": { "name": "language", "value": "py" }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": { "resultType": "complete", "completion": { "values": ["python"], "hasMore": false } }
+}
+```
+
+request เดียวกันที่ใช้ `"type": "ref/resource"` และ `uri` template จะ complete ตัวแปรของ [resource template](/mcp/th/server-primitives/resources/) completion เป็น server capability ชื่อ `completions`; ประกาศมันถ้าคุณ implement
+
+## การออกแบบ prompt ที่ดี
+
+prompt โดดเด่นเมื่องาน *ทำซ้ำ* และมี *รูปแบบที่ดีที่รู้กันอยู่แล้ว* รูปแบบที่พบบ่อย:
+
+- **Checklist** "รีวิวความพร้อมก่อน release" ที่ไล่ผ่าน test, changelog, migration note — เป็นรายการลำดับเลขที่ model ต้องตอบทีละข้อตามลำดับ
+- **ชุด few-shot** ตัวอย่างที่ทำสำเร็จแล้วสองสามชุดของรูปแบบ output ที่ต้องการ เป็น message user/assistant สลับกัน แล้วตามด้วย input จริง
+- **Prompt ที่มีหลักยึด** ฝัง resource (schema, style guide, glossary) เพื่อให้ model ทำงานจากแหล่งข้อมูลจริงแทนความจำ
+- **Playbook ที่รับ parameter** `incident_triage(service, severity)` ที่ดึงส่วนของ runbook ที่ถูกต้องสำหรับ service นั้น
+
+เมื่อไรที่ prompt คือตัวเลือกที่ *ผิด*?
+
+| สถานการณ์ | ใช้แทน |
+|-----------|-------------|
+| model ควรตัดสินใจเองว่าจะทำเมื่อไร | [tool](/mcp/th/server-primitives/tools/) |
+| มันเป็นแค่ข้อมูลที่ไม่มีคำสั่ง | [resource](/mcp/th/server-primitives/resources/) |
+| มันต้อง *ทำ* อะไรบางอย่าง (เขียน, เรียก API) | tool — prompt ผลิตได้แค่ message |
+
+prompt ไม่เคย execute อะไร ถ้า "prompt" ของคุณต้อง fetch ข้อมูลสด ให้มันฝัง resource หรือบอก model ว่าควรเรียก tool ไหนต่อ
+
+## error และ validation
+
+- ชื่อ prompt ไม่รู้จัก → `-32602` (Invalid params)
+- ขาด argument ที่บังคับ → `-32602`
+- ความล้มเหลวภายใน → `-32603`
+
+server ควร validate argument ก่อนสร้าง message และ — เพราะ argument คือข้อความที่ user ใส่มาซึ่งจะไปอยู่ใน context ของ model — ให้ถือว่ามันเป็น input ที่เชื่อถือไม่ได้ อย่าปล่อยให้ argument หลุดออกจากกรอบที่คุณตั้งใจไว้ (เช่น การเอาไปแทรกในตำแหน่งที่มันปลอมตัวเป็นเทิร์นของ assistant ได้)
+
+<Callout title="สรุปหนึ่งบรรทัด">
+prompt คือ template ที่ user เป็นคนกด ซึ่งคืนรายการ message — text, รูป, เสียง หรือ embedded resource — สร้างจาก string argument ที่ host เก็บมา และ auto-complete ได้ผ่าน `completion/complete` ใช้ prompt กับ workflow ที่ทำซ้ำและมีรูปแบบชัดเจน; ใช้ tool เมื่อ model ต้องตัดสินใจเอง และ resource เมื่อมันเป็นแค่ข้อมูล
+</Callout>
+
+export const quizPrompts = [
+  {
+    q: 'ใน interaction model ของ prompt ใครเป็นคนตัดสินใจว่าจะใช้ prompt เมื่อไร?',
+    options: [
+      'language model',
+      'user เป็นคนเลือกเองอย่างชัดเจน (เช่นผ่าน slash command)',
+      'server ตาม timer',
+      'authorization server',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'method ไหนที่ให้ host แนะนำค่าที่ถูกต้องของ argument ขณะ user พิมพ์?',
+    options: [
+      'prompts/suggest',
+      'completion/complete',
+      'prompts/get พร้อม argument บางส่วน',
+      'resources/templates/list',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทีมอยากได้คำสั่ง "/deploy" ที่สั่ง deploy จริง ๆ primitive ที่ถูกต้องคืออะไร?',
+    options: [
+      'prompt — slash command คือ prompt',
+      'tool — prompt ผลิตได้แค่ message ทำ action ไม่ได้',
+      'resource ที่ใช้ scheme deploy://',
+      'subscription',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/prompts" questions={quizPrompts} />
+
+<ProgressTracker client:visible id="server-primitives/prompts" />

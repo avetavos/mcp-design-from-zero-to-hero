@@ -1,0 +1,163 @@
+---
+title: 'Backward Compatibility and Protocol Eras'
+description: 'Modern (2026-07-28) versus legacy (2025-11-25 and earlier) MCP: what changed, how clients detect which era a server speaks on stdio and HTTP, the full compatibility matrix, and how to run a dual-era server.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Two eras
+
+Revision 2026-07-28 made MCP stateless, and that split the protocol's history into two eras. The spec's own terms:
+
+- **Modern** — versions that convey protocol version, identity and capabilities as per-request metadata: `2026-07-28` and later.
+- **Legacy** — versions that establish a session with an `initialize` handshake: `2025-11-25` and earlier.
+- **Dual-era** — an implementation that supports both.
+
+Most servers deployed today are still legacy, so a client that only speaks modern cannot use them, and a legacy client cannot use a modern-only server. Knowing how to detect and bridge the eras is a practical skill, not trivia.
+
+## What legacy looked like
+
+| Legacy (2025-11-25 and earlier) | Modern (2026-07-28) |
+|---------------------------------|---------------------|
+| `initialize` request then `notifications/initialized`; version and capabilities negotiated once | Version and capabilities in `_meta` on every request; `server/discover` is optional |
+| `Mcp-Session-Id` header minted by the server, terminated with HTTP `DELETE` | No protocol-level sessions; explicit handles in tool arguments |
+| HTTP `GET` opened a standalone SSE stream for server-initiated messages | No GET; `subscriptions/listen` POST returns the long-lived stream |
+| Server could send `sampling/createMessage`, `elicitation/create`, `roots/list` as requests on SSE | Server embeds them in `InputRequiredResult` (MRTR) |
+| SSE resumable with `Last-Event-ID` | Not resumable; re-issue the request |
+| `resources/subscribe` / `unsubscribe`, `ping`, `logging/setLevel`, `notifications/roots/list_changed` | Removed; `resourceSubscriptions` filter, per-request `logLevel` in `_meta` |
+| Results had no `resultType` | Every result carries `resultType`; clients treat an absent one as `"complete"` |
+
+Before that, 2024-11-05 used a separate **HTTP+SSE** transport (a GET stream that announced a POST endpoint via an `endpoint` event). It has been deprecated since 2025-03-26 and is formally Deprecated under the feature lifecycle policy — do not adopt it.
+
+## Detecting the era on stdio
+
+There is no HTTP status code to steer on, so a dual-era client probes with `server/discover`, carrying its preferred modern version in `_meta`.
+
+<Mermaid title="The stdio era probe" code={probeDiagram} />
+
+export const probeDiagram = `sequenceDiagram
+  participant C as Dual-era client
+  participant S as Server
+  C->>S: server/discover (protocolVersion 2026-07-28)
+  alt DiscoverResult
+    S-->>C: supportedVersions, capabilities
+    Note over C: Modern. Pick a supported version, stay modern.
+  else Recognized modern error (e.g. -32022)
+    S-->>C: UnsupportedProtocolVersionError with supported list
+    Note over C: Modern. Retry with a listed version. Never fall back.
+  else Other error or timeout
+    S-->>C: -32601 / -32602 / silence
+    Note over C: Legacy. Send initialize and continue in legacy mode.
+  end`;
+
+The fallback **must not** be keyed to a specific code. Legacy servers respond to unknown pre-`initialize` requests with implementation-defined errors — commonly `-32601` or `-32602` — or not at all. Probing is recommended even for modern-only clients: some legacy servers do not check that a request arrived after `initialize` and would process an era-ambiguous `tools/call` under legacy semantics. A probe turns that into a deterministic failure you can report to the user.
+
+## Detecting the era on HTTP
+
+Over Streamable HTTP the client simply attempts a modern request first. A legacy server has no idea what to do with it and typically returns `400 Bad Request` — but so does a modern server for `UnsupportedProtocolVersionError`, `MissingRequiredClientCapabilityError` and header-validation failures. So on `400` the client **should** inspect the body before deciding:
+
+- Body contains a **recognized modern JSON-RPC error** → the server is modern. Retry with an advertised version or fix the request. Do not fall back.
+- Body is empty or not a recognized modern error → fall back to `initialize` and continue with the legacy revision.
+
+To also support the deprecated HTTP+SSE transport, a client that gets `400`, `404` or `405` without a modern error body issues a `GET` to the URL; if an SSE stream opens and the first event is `endpoint`, it is a 2024-11-05 server.
+
+The era is a property of the **server**, not of a request. Cache the result for the lifetime of the process (stdio) or origin (HTTP), optionally persist it across restarts of the same configuration, and re-probe if the cached assumption later fails.
+
+## The compatibility matrix
+
+| Client | Server | Outcome |
+|--------|--------|---------|
+| Modern | Modern | Works. `server/discover` optional; version mismatches surface as `-32022` and the client retries. |
+| Modern | Legacy | **Fails.** The server may reject, stay silent, or process an era-ambiguous method under legacy semantics. Probe on stdio to fail deterministically. |
+| Dual-era | Modern | Works. Probe returns a `DiscoverResult` or a modern error; the client stays modern. |
+| Dual-era | Legacy | Works. Probe returns a non-modern error or times out; client falls back to `initialize` (and possibly to HTTP+SSE). |
+| Legacy | Modern | **Fails.** stdio: `initialize` is an unknown method lacking `_meta`, rejected with an implementation-defined error. HTTP: missing required headers → `400`. Legacy clients have no fall-forward. |
+| Legacy | Dual-era | Works. The server answers `initialize` and serves the negotiated legacy revision. |
+| Legacy | Legacy | Works per the legacy revision. |
+
+Read it as a design rule: to reach the most peers, **clients should be dual-era, and servers should be dual-era for as long as legacy clients matter to you.**
+
+## A modern-only server meeting legacy traffic
+
+If you choose not to support legacy clients, be polite about it:
+
+- HTTP `GET` or `DELETE` to the MCP endpoint → `405 Method Not Allowed`.
+- An `Mcp-Session-Id` header → ignore it; never mint or echo session IDs.
+- A `Last-Event-ID` header → ignore it; streams are not resumable.
+- An `initialize` request on any transport → reject it, and **name the protocol versions you support** in the error message. Legacy clients have no fall-forward mechanism, so that message may be the only diagnostic a user ever sees.
+
+## A dual-era server
+
+A dual-era server picks its behaviour from how the client opens: a request carrying modern `_meta` is served statelessly; an `initialize` request selects legacy semantics scoped to the stdio process or the HTTP session. Both eras may run concurrently on the same endpoint.
+
+In the TypeScript SDK this is one option on the handler:
+
+```ts
+import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+
+const buildServer = () => new McpServer({ name: 'notes', version: '1.0.0' });
+
+// default: also serve legacy clients, statelessly
+const handler = createMcpHandler(buildServer);
+
+// modern only: reject legacy traffic
+const strict = createMcpHandler(buildServer, { legacy: 'reject' });
+```
+
+The same factory backs both eras, so you register tools once. The MCP Inspector negotiates both eras too, which makes it the quickest way to confirm which mode a server is actually running in — see [testing and debugging](/mcp/en/production-and-ecosystem/testing-and-debugging/).
+
+<Callout title="The one-line takeaway">
+Modern MCP puts version and capabilities on every request; legacy negotiated them once with `initialize`. A dual-era client probes with `server/discover` on stdio and inspects the body of a `400` on HTTP, falling back to `initialize` only on an unrecognized error — and a dual-era server answers whichever opening it receives, which is what `createMcpHandler` does by default.
+</Callout>
+
+export const quizCompat = [
+  {
+    q: 'Which pair of behaviours marks a server as legacy (2025-11-25 and earlier)?',
+    options: [
+      'resultType on every result and server/discover',
+      'An initialize handshake and an Mcp-Session-Id header',
+      'subscriptions/listen and MRTR',
+      'Mcp-Method headers and x-mcp-header',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'On HTTP a modern request gets a 400. What decides whether the client falls back to initialize?',
+    options: [
+      'Whether the status is exactly 400',
+      'Whether the response body is a recognized modern JSON-RPC error',
+      'Whether the server sent Mcp-Session-Id',
+      'The client always falls back on any 4xx',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A legacy client talks to a modern-only server. What happens?',
+    options: [
+      'It works because the server downgrades automatically',
+      'It fails; legacy clients have no fall-forward mechanism',
+      'The server upgrades the client',
+      'The client silently switches to HTTP+SSE',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why should the stdio probe not be keyed to a single error code?',
+    options: [
+      'Because modern servers never return errors',
+      'Legacy servers answer unknown pre-initialize requests with varying codes or silence',
+      'Because -32601 means the server is modern',
+      'Because error codes are transport-specific',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="transports/backward-compatibility" questions={quizCompat} />
+
+<ProgressTracker client:visible id="transports/backward-compatibility" />

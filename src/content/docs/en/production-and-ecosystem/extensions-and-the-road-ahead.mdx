@@ -1,0 +1,179 @@
+---
+title: 'Extensions and the Road Ahead'
+description: 'How optional extensions are negotiated, what Tasks and MCP Apps add on top of the core protocol, the feature lifecycle that governs deprecation, the SEP process, and a one-table summary of what changed in 2026-07-28.'
+sidebar:
+  order: 6
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## A small core, a growing edge
+
+The `2026-07-28` revision deliberately *shrank* the core protocol: sessions, the handshake, `ping`, `logging/setLevel`, and server-initiated requests all left. What remains is the minimum every implementation must speak. Everything richer now lives in **extensions**, which are optional, additive, composable, and versioned on their own.
+
+That is good news for you as a server author: you implement the core once and opt into exactly the extensions your use case needs.
+
+<Mermaid title="Core plus extensions" code={coreDiagram} />
+
+export const coreDiagram = `flowchart TB
+  core["Core: JSON-RPC, _meta, server/discover, tools, resources, prompts, MRTR, subscriptions"]
+  core --> t["io.modelcontextprotocol/tasks"]
+  core --> u["io.modelcontextprotocol/ui  (MCP Apps)"]
+  core --> a["ext-auth extensions"]
+  core --> v["com.yourco/... vendor extensions"]`;
+
+## How extensions are negotiated
+
+Both sides advertise extensions in an `extensions` map inside their capabilities. Keys follow the `_meta` naming rules with a **mandatory prefix**: official ones under `io.modelcontextprotocol/`, yours under your own reverse-DNS prefix. The value is a per-extension settings object; `{}` means "supported, no settings".
+
+Client, on every request:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {
+      "elicitation": {},
+      "extensions": {
+        "io.modelcontextprotocol/tasks": {},
+        "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] }
+      }
+    }
+  }
+}
+```
+
+Server, in `server/discover`:
+
+```json
+{
+  "capabilities": {
+    "tools": { "listChanged": true },
+    "extensions": {
+      "io.modelcontextprotocol/tasks": {}
+    }
+  }
+}
+```
+
+The fallback rule is simple: if one party supports an extension and the other does not, the supporting party **MUST** either behave as plain core or reject the request with a clear error. Extensions **SHOULD** document which they do. A server must never return an extension-shaped result (for example a task handle) to a client that did not declare the extension on that request.
+
+## Tasks
+
+`io.modelcontextprotocol/tasks` is for work that outlasts a request: CI runs, batch imports, human approvals. Instead of holding the connection open, the server returns a durable handle and the client polls. The earlier lesson on long-running work covers the mechanics; the shape in one paragraph:
+
+- The client declares the extension on the request. The server, *if it chooses*, answers `tools/call` with `resultType: "task"` carrying a `taskId`, a status, a `ttlMs`, and a `pollIntervalMs`.
+- The client calls `tasks/get` until the status is terminal (`completed`, `failed`, or `cancelled`). If the status is `input_required`, the response carries `inputRequests` (an elicitation, say) and the client answers with `tasks/update`.
+- `tasks/cancel` is cooperative. Servers may push `notifications/tasks` to clients that opened `subscriptions/listen` for them, which saves a poll.
+
+Tasks moved *out* of the core in `2026-07-28`, and the redesign replaced the blocking `tasks/result` with polling. If you read an older tutorial, that is why the method names differ.
+
+## MCP Apps
+
+`io.modelcontextprotocol/ui` lets a tool return an **interactive HTML interface** — a chart, a form, a dashboard — that the host renders inside the conversation instead of a wall of text. How it fits together:
+
+1. The tool definition carries `_meta.ui.resourceUri` pointing at a `ui://` resource. The host can preload it before the tool is even called.
+2. That resource is an HTML page (usually bundled with its JS and CSS) served with the MIME type `text/html;profile=mcp-app`. The resource's `_meta.ui` can request `permissions` and declare a `csp` for external origins.
+3. The host renders it in a **sandboxed iframe**. The app cannot touch the parent DOM, cookies, or storage.
+4. App and host talk over `postMessage` using a JSON-RPC dialect of MCP: some methods are shared (`tools/call`), some are new under a `ui/` prefix (`ui/initialize`). The app can call tools on its own server, push context to the model, and receive fresh results from the host.
+
+The `@modelcontextprotocol/ext-apps` package provides an `App` class for the app side and an App Bridge for hosts, with starter templates for React, Vue, Svelte, Preact, Solid, and plain JavaScript. It is a convenience, not a requirement; the postMessage protocol is standard web primitives. Hosts that support Apps today include Claude, Claude Desktop, VS Code GitHub Copilot, Microsoft 365 Copilot, Goose, Postman, MCPJam, and Archestra; the client matrix on the MCP site tracks the list.
+
+Reach for an App when the user needs to *interact* with data (drill into a map, fill a many-option form, watch live metrics), not merely read it.
+
+## Authorization extensions
+
+The core authorization spec covers OAuth 2.1 between client and server. Additional mechanisms — enterprise identity patterns, alternative credential flows — live in the `modelcontextprotocol/ext-auth` repository as optional, composable extensions. Check there before inventing a custom scheme; the odds are good someone has specified yours.
+
+## The feature lifecycle
+
+Since `2026-07-28` every feature is in one of three states, governed by a written policy:
+
+| State | Meaning |
+|-------|---------|
+| **Active** | Part of the spec; implement it. |
+| **Deprecated** | Still in the spec and still functional, with a documented migration path (or a note that none is needed). Stays at least **twelve months** (ninety days under the expedited exception). New implementations should not adopt it. |
+| **Removed** | Gone from a later revision. |
+
+The **deprecated features registry** at `/specification/2026-07-28/deprecated` is the authoritative list. As of this revision it includes:
+
+| Deprecated | Use instead |
+|------------|-------------|
+| Sampling (`sampling/createMessage`) | Call the LLM provider's API directly from the server |
+| Roots (`roots/list`, `notifications/roots/list_changed`) | Pass directories or files as tool parameters, resource URIs, or server configuration |
+| Logging feature (`notifications/message` opt-in remains via `_meta` log level) | stderr on stdio, or OpenTelemetry |
+| HTTP+SSE transport (from 2024-11-05) | Streamable HTTP |
+| Dynamic Client Registration (RFC 7591) | Client ID Metadata Documents |
+| `includeContext` values `thisServer` / `allServers` | Omit the field or use `none` |
+
+Deprecated does not mean broken: a `2025-11-25` server using sampling keeps working during the window. It means *do not start*.
+
+## How the spec changes: SEPs
+
+Changes to MCP go through **Specification Enhancement Proposals**. A SEP is a markdown file opened as a pull request in the `seps/` directory of the specification repository; it gets its number from the PR, needs a sponsor from the core team, and moves through status labels until it is accepted or rejected. The changelog for each revision cites the SEPs behind every change (`SEP-2575` for statelessness, `SEP-2322` for MRTR, `SEP-2549` for caching fields, and so on), so when a behaviour puzzles you, the SEP is where the reasoning lives.
+
+If you want to influence the protocol, that is the door: open a discussion, write the SEP, find a sponsor.
+
+## What changed in 2026-07-28, at a glance
+
+Most tutorials on the web predate this revision. Use this table to translate them:
+
+| Older revisions (`2025-11-25` and earlier) | `2026-07-28` |
+|---------------------------------------------|--------------|
+| `initialize` / `notifications/initialized` handshake | Removed; every request carries `io.modelcontextprotocol/protocolVersion` and `clientCapabilities` in `_meta` |
+| `Mcp-Session-Id` header, HTTP `DELETE` to end a session | Removed; the protocol is stateless, state uses explicit handles |
+| HTTP `GET` opens a server-to-client stream | Removed; `subscriptions/listen` is a long-lived POST response |
+| Server sends `elicitation/create`, `sampling/createMessage`, `roots/list` as requests | MRTR: server returns `resultType: "input_required"` with `inputRequests`; client retries with `inputResponses` |
+| `resources/subscribe` / `unsubscribe` | `subscriptions/listen` with `resourceSubscriptions` |
+| Results have no type marker | Every result has `resultType` (`complete`, `input_required`, or an extension value such as `task`) |
+| `ping`, `logging/setLevel`, `notifications/roots/list_changed` | Removed; log level per request via `_meta` |
+| SSE resumability with `Last-Event-ID` | Removed; re-issue a lost request with a new id |
+| Optional `MCP-Protocol-Version` header | Required, plus `Mcp-Method` and `Mcp-Name` on POSTs; mismatch is `-32020` |
+| Errors `-32001` / `-32003` / `-32004` in the draft; `-32002` resource not found | `-32020` HeaderMismatch, `-32021` MissingRequiredClientCapability, `-32022` UnsupportedProtocolVersion; resource not found is `-32602` |
+| No caching hints | `ttlMs` and `cacheScope` on list results, `resources/read`, and `server/discover` |
+| Tasks in the core | Tasks are an extension, polling via `tasks/get` |
+| No mandatory discovery RPC | `server/discover` is mandatory for servers, optional for clients |
+
+<Callout title="The one-line takeaway">
+MCP now has a deliberately small core and an opt-in edge: extensions are negotiated through prefixed keys in the `extensions` capability map, Tasks give long work a durable handle, MCP Apps give tools a sandboxed UI, the feature lifecycle promises at least twelve months of warning before anything is removed, SEPs are how the spec changes, and the `2026-07-28` table above is your decoder ring for older material.
+</Callout>
+
+export const quizExtensions = [
+  {
+    q: 'Where do a client and a server advertise support for an extension?',
+    options: [
+      'In the HTTP Accept header',
+      'In the extensions map inside capabilities, keyed by a prefixed identifier',
+      'In the tool description',
+      'By calling extensions/list',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which is a deprecated feature as of 2026-07-28?',
+    options: ['Streamable HTTP', 'Elicitation', 'Sampling', 'server/discover'],
+    answer: 2,
+  },
+  {
+    q: 'How does a tool tell the host that it has an MCP App UI?',
+    options: [
+      'By returning HTML in a text content block',
+      'Through _meta.ui.resourceUri on the tool pointing at a ui:// resource of type text/html;profile=mcp-app',
+      'By setting destructiveHint: false',
+      'By naming the tool with a ui_ prefix',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the minimum deprecation window under the feature lifecycle policy?',
+    options: ['One revision', 'Ninety days in all cases', 'Twelve months (ninety days only under the expedited exception)', 'There is no minimum'],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/extensions-and-the-road-ahead" questions={quizExtensions} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/extensions-and-the-road-ahead" />

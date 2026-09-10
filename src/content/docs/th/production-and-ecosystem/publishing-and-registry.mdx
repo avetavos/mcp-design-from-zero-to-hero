@@ -1,0 +1,287 @@
+---
+title: 'Publishing and the MCP Registry'
+description: 'แพ็ก server ให้ใครก็ติดตั้งได้ในบรรทัดเดียว — npm package ที่เป็นมิตรกับ npx, PyPI package ที่เป็นมิตรกับ uvx, ธรรมเนียมของ README, MCP Registry ทางการพร้อม server.json และ mcp-publisher และการแจกจ่ายในทีมผ่าน .mcp.json'
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## บททดสอบบรรทัดเดียว
+
+local MCP server ถูกติดตั้งด้วย *config entry ของ host* ไม่ใช่ด้วยคนที่รัน `npm install` Claude Code, Claude Desktop และ editor ส่วนใหญ่ยินดีรันคำสั่งอะไรก็ตามที่คุณให้ ดังนั้นเกณฑ์ของคำว่า "ติดตั้งได้" คือ:
+
+```bash
+npx -y @acme/mcp-weather
+# or
+uvx mcp-weather
+```
+
+ถ้าคำสั่งนั้นเริ่ม server ของคุณบน stdio และไม่มีอะไรอื่น print ลง stdout คุณก็ติดตั้งได้แล้ว ทุกอย่างในบทนี้รับใช้บรรทัดนั้น แล้วค่อยทำให้บรรทัดนั้น *หาเจอได้*
+
+<Mermaid title="จาก repo ไปสู่ server ที่รันอยู่ใน host" code={publishDiagram} />
+
+export const publishDiagram = `flowchart LR
+  r["your repo"] --> p["npm or PyPI package"]
+  p --> reg["MCP Registry: metadata only"]
+  reg --> h["host config: claude mcp add ..."]
+  p --> h
+  h --> run["npx -y or uvx starts the server"]`;
+
+## แพ็กสำหรับ npm
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```json
+    {
+      "name": "@acme/mcp-weather",
+      "version": "1.2.0",
+      "description": "An MCP server for weather information.",
+      "mcpName": "io.github.acme/weather",
+      "type": "module",
+      "bin": { "mcp-weather": "dist/index.js" },
+      "files": ["dist"],
+      "repository": { "type": "git", "url": "https://github.com/acme/mcp-weather.git" },
+      "engines": { "node": ">=22" },
+      "dependencies": {
+        "@modelcontextprotocol/server": "^2.0.0",
+        "zod": "^4.0.0"
+      }
+    }
+    ```
+
+    ```ts
+    #!/usr/bin/env node
+    // dist/index.js — the bin entry
+    import { McpServer } from '@modelcontextprotocol/server';
+    import { serveStdio } from '@modelcontextprotocol/server/stdio';
+    import * as z from 'zod/v4';
+
+    serveStdio(() => {
+      const server = new McpServer({ name: 'weather', version: '1.2.0' });
+      server.registerTool(
+        'get-forecast',
+        { description: 'Get the weather forecast for a city', inputSchema: z.object({ city: z.string() }) },
+        async ({ city }) => ({ content: [{ type: 'text', text: `Sunny in ${city} all week.` }] }),
+      );
+      return server;
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```toml
+    # pyproject.toml
+    [project]
+    name = "mcp-weather"
+    version = "1.2.0"
+    description = "An MCP server for weather information."
+    requires-python = ">=3.11"
+    dependencies = ["mcp>=2.0"]
+
+    [project.scripts]
+    mcp-weather = "mcp_weather.server:main"
+
+    [build-system]
+    requires = ["hatchling"]
+    build-backend = "hatchling.build"
+    ```
+
+    ```python
+    # src/mcp_weather/server.py
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("weather")
+
+
+    @mcp.tool()
+    def get_forecast(city: str) -> str:
+        """Get the weather forecast for a city."""
+        return f"Sunny in {city} all week."
+
+
+    def main() -> None:
+        mcp.run()  # stdio by default
+    ```
+  </TabItem>
+</Tabs>
+
+checklist สำหรับทั้งสอง ecosystem:
+
+- entry point รัน **stdio เป็น default** โดยไม่ต้องใส่ flag เพื่อให้ `npx -y` / `uvx` ใช้ได้เลย
+- มี shebang และ executable bit (`bin` script บน npm; `[project.scripts]` บน PyPI)
+- **ไม่มี output ลง stdout** นอกจาก protocol message banner ตอน startup ไป stderr หรือไม่ต้องมีเลย
+- config มาจาก **environment variable** (`WEATHER_API_KEY`) ที่ทุก host inject ได้ ไม่ใช่จาก prompt แบบ interactive
+- `mcpName` ใน `package.json` คือชื่อใน registry ที่คุณจะใช้ทีหลัง registry จะตรวจว่า package ที่ publish มี field นี้
+
+publish ตามปกติ: `npm publish --access public` หรือ `uv build && uv publish`
+
+## README คือ UI สำหรับติดตั้ง
+
+host ไม่อ่าน README ของคุณ แต่คนที่ตั้งค่า host อ่าน และเขาจะ paste จากมัน ให้วาง config block ที่พร้อมรันไว้ใกล้ ๆ ด้านบนสำหรับ host หลักแต่ละตัว:
+
+```bash
+# Claude Code
+claude mcp add --transport stdio weather \
+  --env WEATHER_API_KEY=your-key \
+  -- npx -y @acme/mcp-weather
+```
+
+```json
+{
+  "mcpServers": {
+    "weather": {
+      "command": "npx",
+      "args": ["-y", "@acme/mcp-weather"],
+      "env": { "WEATHER_API_KEY": "your-key" }
+    }
+  }
+}
+```
+
+จากนั้นระบุ environment variable ทุกตัวว่าจำเป็นหรือไม่และเป็นความลับหรือไม่, tool ที่ server expose (ชื่อและคำอธิบายหนึ่งบรรทัด) และ scope หรือ permission ที่ตัว remote ต้องการ ผู้อ่านควรตัดสินใจได้ว่า *จะติดตั้งหรือไม่* จาก README อย่างเดียว
+
+## MCP Registry ทางการ
+
+registry ที่ `https://registry.modelcontextprotocol.io` คือ **catalogue ของ metadata** ตอนนี้ยังอยู่ในสถานะ preview: มันเก็บ `server.json` ที่บอกว่า server อยู่ที่ไหน ไม่ได้เก็บ artifact เอง package ของคุณยังอยู่บน npm, PyPI หรือ container registry host และ directory ต่าง ๆ query registry เพื่อค้นหา server
+
+### 1. ติดตั้ง `mcp-publisher`
+
+```bash
+brew install mcp-publisher
+# or the release binary:
+curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+  | tar xz mcp-publisher && sudo mv mcp-publisher /usr/local/bin/
+```
+
+### 2. สร้างและแก้ `server.json`
+
+```bash
+mcp-publisher init
+```
+
+```json
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.acme/weather",
+  "description": "An MCP server for weather information.",
+  "repository": {
+    "url": "https://github.com/acme/mcp-weather",
+    "source": "github"
+  },
+  "version": "1.2.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@acme/mcp-weather",
+      "version": "1.2.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "WEATHER_API_KEY",
+          "description": "API key for the weather provider",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
+```
+
+กฎที่คนมักสะดุด:
+
+- `name` เป็นแบบ **reverse-DNS** และต้องตรงกับ `mcpName` ใน `package.json`
+- ถ้าใช้ GitHub authentication ชื่อ **ต้อง** ขึ้นต้นด้วย `io.github.<your-username>/`
+- `version` ด้านบนและใน package แต่ละตัวควรตาม release ของคุณ
+- `registryType` เป็นได้ทั้ง `npm`, `pypi` หรือ `oci` (container image) ใส่มากกว่าหนึ่ง package ได้ถ้าคุณ ship ทั้ง npm และ PyPI
+- server แบบ hosted เพิ่ม array `remotes` แทน (หรือควบคู่กับ) `packages` โดยใส่ URL ของ Streamable HTTP เพื่อให้ host เชื่อมต่อได้โดยไม่ต้องติดตั้งอะไร
+
+### 3. login แล้ว publish
+
+```bash
+mcp-publisher login github     # device-code flow in the browser
+mcp-publisher publish
+```
+
+### 4. ตรวจสอบ
+
+```bash
+curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.acme/weather"
+```
+
+response คือ `{"servers":[{ ... "name":"io.github.acme/weather" ... }]}`
+
+error ที่พบบ่อย: *Registry validation failed for package* แปลว่า package ที่ publish ไม่มี `mcpName`; *Invalid or expired Registry JWT token* แปลว่าต้อง login ใหม่; *You do not have permission to publish this server* แปลว่า namespace ไม่ตรงกับวิธี authentication ของคุณ
+
+### namespace แบบ custom
+
+GitHub auth ให้ `io.github.<user>/` ถ้าอยาก publish ใต้ domain ของตัวเอง (`com.acme/weather`) ให้ใช้ **DNS authentication**: พิสูจน์ว่าควบคุม domain ได้ด้วย TXT record แล้ว registry จะให้ publish ชื่ออะไรก็ได้ใต้ `com.acme/` docs ของ registry ยังครอบคลุมการ publish จาก GitHub Actions เพื่อ automate release ด้วย
+
+## แจกจ่ายภายในทีม
+
+ไม่ใช่ทุก server ที่ควรอยู่ใน registry สาธารณะ สำหรับ tool ภายใน ให้ commit `.mcp.json` ไว้ที่ root ของ repository ที่ต้องใช้มัน Claude Code จะหยิบมันขึ้นมาด้วย semantic แบบ `--scope project` และเพื่อนร่วมทีมทุกคนได้ server ชุดเดียวกันทันทีที่ checkout:
+
+```json
+{
+  "mcpServers": {
+    "shared-server": {
+      "type": "http",
+      "url": "https://mcp.internal.example.com/mcp"
+    },
+    "local-db": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@acme/mcp-db", "--config", "${CLAUDE_PROJECT_DIR}/db.json"],
+      "env": { "DB_URL": "${DB_URL:-postgresql://localhost/dev}" }
+    }
+  }
+}
+```
+
+`${VAR}` และ `${VAR:-default}` ขยายได้ใน `command`, `args`, `env` และ `headers` ความลับจึงอยู่ใน environment ของ developer แต่ละคน ขณะที่ไฟล์เอง commit ได้อย่างปลอดภัย
+
+<Callout title="สรุปหนึ่งบรรทัด">
+แพ็กให้รันด้วย `npx -y` หรือ `uvx` ได้ (stdio เป็น default, config ผ่าน env var, stdout เงียบ), วาง host config ที่ paste ได้ทันทีไว้บนสุดของ README, อธิบาย package ใน `server.json` แบบ reverse-DNS แล้ว publish ด้วย `mcp-publisher` ไปยัง registry ที่เก็บแค่ metadata และใช้ `.mcp.json` ที่ commit ไว้เมื่อผู้ใช้คือทีมของคุณเอง
+</Callout>
+
+export const quizPublish = [
+  {
+    q: 'MCP Registry ทางการเก็บอะไร?',
+    options: [
+      'binary ของ server และ Docker image',
+      'metadata (server.json) ที่ชี้ไปยัง package บน npm, PyPI หรือ OCI registry หรือไปยัง remote URL',
+      'OAuth token ของ user สำหรับ server',
+      'สำเนา cache ของ tools/list response ทุกอัน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'field ไหนใน package.json ต้องตรงกับ name ใน server.json เพื่อให้ npm verification ผ่าน?',
+    options: ['bin', 'mcpName', 'homepage', 'main'],
+    answer: 1,
+  },
+  {
+    q: 'เมื่อใช้ GitHub authentication ชื่อใน registry ต้องขึ้นต้นด้วย…',
+    options: ['com.github/', 'io.github.<your-username>/', '@<your-username>/', 'mcp/'],
+    answer: 1,
+  },
+  {
+    q: 'จะแชร์ชุด server ให้ทุกคนที่ clone repository ได้อย่างไร?',
+    options: [
+      'publish ขึ้น npm ด้วยชื่อ repo',
+      'commit .mcp.json ไว้ที่ root ของ repo โดยใช้ ${VAR} expansion สำหรับความลับ',
+      'ส่งอีเมลคำสั่ง claude mcp add',
+      'hard-code API key ไว้ใน README',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/publishing-and-registry" questions={quizPublish} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/publishing-and-registry" />

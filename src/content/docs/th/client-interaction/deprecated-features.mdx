@@ -1,0 +1,266 @@
+---
+title: 'Deprecated: Sampling, Roots, and Logging'
+description: 'sampling, roots และ logging เคยทำอะไร, หน้าตาหลัง 2026-07-28 เป็นอย่างไร, ทำไม SEP-2577 ถึง deprecate และวิธี migrate ที่เป็นรูปธรรมของแต่ละตัว — เรียก LLM ตรง, ระบุ path ชัดเจน และ stderr หรือ OpenTelemetry'
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## สาม feature ที่กำลังจะจากไป
+
+revision 2026-07-28 deprecate client feature สามตัวในคราวเดียว (SEP-2577): **sampling**, **roots** และ **logging** พวกมันยังไม่หายไป — feature ที่ถูก deprecate ยังทำงานได้อย่างน้อยสิบสองเดือนตาม feature lifecycle policy และถูกลิสต์ไว้ใน deprecated-features registry ให้ติดตามได้ แต่ implementation ใหม่ไม่ควรเอามาใช้ และของเดิมควรวางแผน migrate
+
+บทนี้ครอบคลุมว่าแต่ละตัวเคยทำอะไร ตอนนี้หน้าตาเป็นอย่างไร และควรใช้อะไรแทน
+
+## Sampling
+
+### เคยทำอะไร
+
+sampling ให้ *server* ขอ completion จาก LLM ของ *host* — "ช่วยสรุป diff นี้ให้หน่อย" — โดยไม่ต้องพ่วง LLM SDK หรือ API key มาด้วย request คือ `sampling/createMessage`:
+
+```json
+{
+  "method": "sampling/createMessage",
+  "params": {
+    "messages": [
+      { "role": "user", "content": { "type": "text", "text": "Summarize this changelog in one line: …" } }
+    ],
+    "systemPrompt": "You are terse.",
+    "maxTokens": 100,
+    "modelPreferences": {
+      "hints": [{ "name": "claude" }],
+      "intelligencePriority": 0.8,
+      "speedPriority": 0.5,
+      "costPriority": 0.2
+    }
+  }
+}
+```
+
+`modelPreferences` เป็นแค่คำแนะนำ: `hints` เป็น substring match กับชื่อ model และ priority สามตัว (0–1) ให้ host เลือก model host ยังคงมีมนุษย์อยู่ใน loop — แสดง, แก้ หรือปฏิเสธทั้ง prompt และ completion ได้
+
+### ตอนนี้หน้าตาเป็นอย่างไร
+
+ใน 2026-07-28 server ส่ง request ไม่ได้ ดังนั้นที่ *เดียว* ที่ `sampling/createMessage` จะปรากฏได้คือใน map `InputRequiredResult.inputRequests` ภายใต้ [MRTR](/mcp/th/client-interaction/multi-round-trip-requests/) client รัน completion แล้ว return `CreateMessageResult` ใน `inputResponses`:
+
+```json
+{
+  "capital": {
+    "role": "assistant",
+    "content": { "type": "text", "text": "The capital of France is Paris." },
+    "model": "claude-opus-5",
+    "stopReason": "endTurn"
+  }
+}
+```
+
+ค่า `includeContext` แบบ `"thisServer"` และ `"allServers"` ถูก soft-deprecate ตั้งแต่ 2025-11-25 และตอนนี้ deprecate อย่างเป็นทางการ ให้ละ field นี้หรือส่ง `"none"`
+
+### ทำไมถึงถูก deprecate
+
+สองเหตุผล หนึ่ง statelessness: completion แพง และการบังคับให้มันผ่าน MRTR retry แปลว่า host จ่ายค่า completion แล้วยังต้องส่ง request เดิมทั้งก้อนซ้ำอีก สอง model ของ host ไม่ใช่ model ของ server — คุณภาพ, ค่าใช้จ่าย และ safety policy เป็นของคนที่ถือ API key server ที่ต้องการ LLM ควรเรียกเองมากกว่า
+
+### Migration: เรียก provider ของคุณโดยตรง
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import Anthropic from '@anthropic-ai/sdk';
+
+    const anthropic = new Anthropic(); // อ่าน ANTHROPIC_API_KEY จาก environment
+
+    async function summarize(text: string): Promise<string> {
+      const msg = await anthropic.messages.create({
+        model: 'claude-opus-5',
+        max_tokens: 256,
+        system: 'You are terse.',
+        messages: [{ role: 'user', content: `Summarize in one line:\n\n${text}` }],
+      });
+      const block = msg.content[0];
+      return block.type === 'text' ? block.text : '';
+    }
+
+    server.registerTool(
+      'summarize_changelog',
+      { description: 'One-line changelog summary', inputSchema: z.object({ text: z.string() }) },
+      async ({ text }) => ({ content: [{ type: 'text', text: await summarize(text) }] })
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import anthropic
+
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("changelog")
+    client = anthropic.Anthropic()  # อ่าน ANTHROPIC_API_KEY จาก environment
+
+
+    @mcp.tool()
+    def summarize_changelog(text: str) -> str:
+        """One-line changelog summary."""
+        msg = client.messages.create(
+            model="claude-opus-5",
+            max_tokens=256,
+            system="You are terse.",
+            messages=[{"role": "user", "content": f"Summarize in one line:\n\n{text}"}],
+        )
+        return msg.content[0].text
+    ```
+  </TabItem>
+</Tabs>
+
+บน stdio key มาจาก environment ที่ host ใช้ launch คุณ บน HTTP มาจาก secret store ของคุณเอง ไม่ว่าทางไหน ตอนนี้ server เป็นเจ้าของการเลือก model, retry และค่าใช้จ่าย
+
+## Roots
+
+### เคยทำอะไร
+
+roots ให้ server ถาม client ว่าตำแหน่งไหนใน filesystem ที่อนุญาตให้ทำงาน — `roots/list` return URI เช่น `file:///home/me/project` — และ `notifications/roots/list_changed` บอก server เมื่อชุดนั้นเปลี่ยน
+
+### ตอนนี้หน้าตาเป็นอย่างไร
+
+`roots/list` เหลืออยู่แค่ในฐานะ MRTR input request ส่วน `notifications/roots/list_changed` ถูกถอดทิ้งทั้งหมด (ใน 2026-07-28 ไม่มี notification จาก client ไป server สำหรับเรื่องนี้) `ListRootsResult` ยังหน้าตาแบบนี้เมื่อกลับมาใน `inputResponses`:
+
+```json
+{
+  "roots": [{ "uri": "file:///home/me/project", "name": "project" }]
+}
+```
+
+### Migration: ระบุ path ให้ชัด
+
+ตัวแทนที่แนะนำเรียบง่ายจนน่าอาย: **ส่ง directory เป็น tool argument, resource URI หรือ server configuration**
+
+- tool ที่ค้นหาไฟล์รับ parameter `path` แล้ว validate กับ allowlist ที่ config ตอน launch
+- server ที่ทำงานกับ project เดียวเสมอรับ directory นั้นเป็น CLI argument หรือ environment variable ตอน host spawn — ซึ่งก็คือวิธีที่ `npx @modelcontextprotocol/server-filesystem ~/Desktop` ทำมาตลอด
+- ไฟล์ที่ model ควร *อ่าน* เหมาะจะเปิดเป็น [resource](/mcp/th/server-primitives/resources/) มากกว่าให้ค้นพบผ่าน roots
+
+path ที่ระบุชัดยัง secure ง่ายกว่าด้วย: คุณ sanitize parameter ได้ แต่ audit สิทธิ์โดยนัยที่ client เคยให้ใน request ก่อนหน้าได้ยาก
+
+## Logging
+
+### เคยทำอะไร
+
+logging ให้ server มี channel ไปยัง log ของ client: client ตั้ง threshold ด้วย `logging/setLevel` แล้ว server push entry `notifications/message` ที่มี `level` (`debug` ถึง `emergency`), ชื่อ `logger` (optional) และ `data` อะไรก็ได้
+
+### ตอนนี้หน้าตาเป็นอย่างไร
+
+`logging/setLevel` ถูกถอดออก threshold ตอนนี้เป็น **ต่อ request** อยู่ใน `_meta`:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/logLevel": "info",
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {}
+  }
+}
+```
+
+server **ต้องไม่** ส่ง `notifications/message` ให้ request ที่ไม่ได้ใส่ field นี้ และที่ส่งออกไปจะวิ่งบน response stream ของ request นั้น ไม่ใช่บน subscription
+
+### Migration: stderr และ OpenTelemetry
+
+- **บน stdio log ลง stderr** transport สงวน stdout ไว้ให้ protocol message แต่ stderr มีไว้สำหรับ log โดยเฉพาะ host อาจ capture, forward หรือเมินก็ได้ ห้ามเขียน log ลง stdout เด็ดขาด
+- **บน HTTP ใช้ logging stack ปกติของคุณ** และเพื่อ correlate ข้าม service ใช้ **OpenTelemetry** key `traceparent`, `tracestate` และ `baggage` ใน `_meta` ถูกสงวนไว้สำหรับ W3C trace-context propagation ดังนั้น client ส่ง trace id มาให้ได้ และ span ของคุณจะเรียงต่อกับของเขา:
+
+```json
+{
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "Bangkok" },
+    "_meta": {
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01",
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // stdio server: log ไป stderr ห้ามลง stdout
+    console.error(JSON.stringify({ level: 'info', msg: 'import started', files: urls.length }));
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import logging
+    import sys
+
+    # stdio server: ตั้ง root logger ให้ไป stderr ครั้งเดียวตอน startup
+    logging.basicConfig(stream=sys.stderr, level=logging.INFO)
+    logging.getLogger("catalog").info("import started: %d files", len(urls))
+    ```
+  </TabItem>
+</Tabs>
+
+## lifecycle เพื่อให้วางแผนได้
+
+<Mermaid title="Feature lifecycle: Active, Deprecated, Removed" code={lifecycleDiagram} />
+
+export const lifecycleDiagram = `flowchart LR
+  A["Active"] --> D["Deprecated (12+ เดือน, อยู่ใน registry)"]
+  D --> R["Removed ใน revision ถัดไป"]`;
+
+feature ที่ถูก deprecate จะระบุทาง migrate และคงอยู่อย่างน้อยสิบสองเดือน (เก้าสิบวันภายใต้ข้อยกเว้นแบบเร่งด่วน) ก่อนจะเข้าข่ายถูกถอด sampling, roots และ logging เข้าสู่สถานะ Deprecated พร้อม 2026-07-28 revision เดียวกันนี้ยังจัด HTTP+SSE transport แบบเก่าและ dynamic client registration เป็น Deprecated ด้วย เช็คหน้า registry เพื่อดูสถานะปัจจุบันก่อนจะสร้างอะไรบนสิ่งที่ถูกทำเครื่องหมาย Deprecated
+
+<Callout title="สรุปหนึ่งบรรทัด">
+sampling, roots และ logging ถูก deprecate ตั้งแต่ 2026-07-28: sampling กับ roots เหลืออยู่แค่ในฐานะ MRTR input request ส่วน logging กลายเป็น level ต่อ request ใน `_meta` แทนที่ด้วยการเรียก LLM ตรงจาก server, path argument ที่ระบุชัด และ stderr หรือ OpenTelemetry — และมองทุกอย่างใน deprecated registry ว่าเป็นเวลาที่ยืมมา
+</Callout>
+
+export const quizDeprecated = [
+  {
+    q: 'ใน exchange แบบ 2026-07-28 sampling/createMessage ยังปรากฏได้ที่ไหน?',
+    options: [
+      'เป็น request ที่ server เริ่มเองบน SSE stream',
+      'เฉพาะใน InputRequiredResult.inputRequests ภายใต้ MRTR',
+      'บน stream ของ subscriptions/listen',
+      'ถูกถอดออกทั้งหมดแล้ว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'อะไรมาแทน logging/setLevel?',
+    options: [
+      'request ใหม่ชื่อ logging/configure',
+      'key io.modelcontextprotocol/logLevel ใน _meta ของแต่ละ request',
+      'flag capability ใน server/discover',
+      'ไม่มี — log level ถูกล็อกไว้ที่ info',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทาง migrate ที่แนะนำจาก roots คืออะไร?',
+    options: [
+      'ใช้ notifications/roots/list_changed แทน',
+      'ส่ง directory ให้ชัดเจนเป็น tool parameter, resource URI หรือ server configuration',
+      'อ่าน config file ของ host โดยตรง',
+      'elicit path ด้วย URL mode',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'stdio server ควรเขียน log ไปที่ไหน?',
+    options: [
+      'stdout เป็น JSON-RPC notification',
+      'stdout เป็นบรรทัดธรรมดา',
+      'stderr',
+      'ไฟล์ที่ client มา poll',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="client-interaction/deprecated-features" questions={quizDeprecated} />
+
+<ProgressTracker client:visible id="client-interaction/deprecated-features" />

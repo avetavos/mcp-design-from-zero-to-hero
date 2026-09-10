@@ -1,0 +1,242 @@
+---
+title: 'Discovery, Versions, and Statelessness'
+description: 'Date-based protocol versions, why MCP has no handshake and no sessions, the server/discover exchange, per-request version negotiation, capability objects, and explicit handles instead of session state.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Versions are dates
+
+MCP versions its protocol with a `YYYY-MM-DD` string that marks the last date a backwards-incompatible change was made. Compatible additions do not bump the version.
+
+| Revision | Notable for |
+|----------|-------------|
+| `2026-07-28` | **Current.** Stateless: no `initialize`, no sessions, per-request `_meta`, `server/discover`, multi round-trip requests, `subscriptions/listen` |
+| `2025-11-25` | Legacy. URL-mode elicitation, tasks (then experimental), `Mcp-Session-Id` sessions |
+| `2025-06-18` | Legacy. `MCP-Protocol-Version` header, structured tool output, OAuth resource indicators |
+| `2025-03-26` | Legacy. Introduced Streamable HTTP, deprecated HTTP+SSE |
+| `2024-11-05` | Legacy. The original release; HTTP+SSE transport |
+
+A revision is **Draft** (in progress), **Current** (ready for use, may still gain compatible additions), or **Final** (frozen). Individual features can also be marked **Deprecated** under a lifecycle policy that guarantees at least twelve months before removal.
+
+## MCP is stateless
+
+The defining property of the current revision: **every request contains everything needed to process it.** A server infers nothing from earlier requests, even on the same connection.
+
+Concretely:
+
+- There is **no `initialize` handshake**. Legacy revisions (2025-11-25 and earlier) opened every connection with `initialize` → `notifications/initialized`, then remembered the negotiated version and capabilities. Now each request carries `io.modelcontextprotocol/protocolVersion` and `io.modelcontextprotocol/clientCapabilities` in `_meta`.
+- There are **no protocol-level sessions**. Legacy Streamable HTTP servers minted an `Mcp-Session-Id` header. Now there is none; list endpoints must not vary per connection.
+- An open connection — even a stdio subprocess — is **not a conversation**. A client may interleave unrelated requests on one transport, and the server must not treat process or connection identity as a proxy for continuity.
+- State that spans requests (a long job, a shopping cart) must be referenced by an **explicit identifier** the client passes each time.
+
+<Mermaid title="Legacy handshake versus stateless per-request metadata" code={statelessDiagram} />
+
+export const statelessDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  Note over C,S: legacy (2025-11-25 and earlier)
+  C->>S: initialize (version, capabilities)
+  S-->>C: version, capabilities, session id
+  C->>S: notifications/initialized
+  C->>S: tools/call (relies on remembered session)
+  Note over C,S: current (2026-07-28)
+  C->>S: tools/call + _meta (version, capabilities)
+  S-->>C: result + _meta (serverInfo)
+  C->>S: resources/read + _meta (version, capabilities)
+  S-->>C: result`;
+
+Why go stateless? Remote servers run behind load balancers as many replicas. Session affinity, sticky routing, and shared session stores were the hardest part of operating a legacy server. With no session, any replica can answer any request, and a crashed replica loses nothing but the in-flight call, which the client simply retries.
+
+## `server/discover`
+
+Clients can learn everything about a server in one request. Servers **must** implement it; clients **may** call it.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "discover-1",
+  "method": "server/discover",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "ExampleClient", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "discover-1",
+  "result": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"],
+    "capabilities": {
+      "tools": { "listChanged": true },
+      "resources": { "subscribe": true }
+    },
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": { "name": "ExampleServer", "version": "1.0.0" }
+    },
+    "instructions": "This server provides weather and resource utilities.",
+    "ttlMs": 3600000,
+    "cacheScope": "public"
+  }
+}
+```
+
+| Field | Use |
+|-------|-----|
+| `supportedVersions` | Pick one of these for subsequent requests |
+| `capabilities` | Which primitives and notifications the server supports |
+| `_meta.io.modelcontextprotocol/serverInfo` | Name and version for display and logs (unverified) |
+| `instructions` | Free-text guidance for the model on how to use this server well — a good place for "always call `list_projects` before `create_issue`" |
+| `ttlMs`, `cacheScope` | The result can be cached for an hour and shared by intermediaries |
+
+Two reasons to call it: to **present** a server's identity and features in one shot instead of probing `tools/list`, `prompts/list`, and `resources/list` separately, and as a **backward-compatibility probe** on stdio, where there is no HTTP status to tell a modern server from a legacy one.
+
+## Version negotiation, per request
+
+There is no negotiation handshake. A client sends a request declaring its preferred version. If the server does not support it, the server replies with `UnsupportedProtocolVersionError`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32022,
+    "message": "Unsupported protocol version",
+    "data": {
+      "supported": ["2026-07-28", "2025-11-25"],
+      "requested": "1900-01-01"
+    }
+  }
+}
+```
+
+The client picks a mutually supported version from `data.supported` and retries, or surfaces an error if none exists. Both sides may support several versions at once. On Streamable HTTP the version is also mirrored into an `MCP-Protocol-Version` header so proxies can route on it without parsing the body.
+
+## Capabilities
+
+Capabilities are objects, not booleans, so each can carry settings.
+
+**Server capabilities** (returned by `server/discover`):
+
+```json
+{
+  "capabilities": {
+    "tools": { "listChanged": true },
+    "resources": { "listChanged": true, "subscribe": true },
+    "prompts": { "listChanged": true },
+    "extensions": { "io.modelcontextprotocol/tasks": {} }
+  }
+}
+```
+
+- `tools`, `resources`, `prompts` — present means the primitive is supported. `listChanged: true` means the server can emit list-changed notifications; `resources.subscribe: true` means it can emit per-resource update notifications.
+- `extensions` — a map of extension identifiers (named like `_meta` keys, prefix mandatory) to per-extension settings.
+
+**Client capabilities** (sent in `_meta` on every request):
+
+```json
+{
+  "io.modelcontextprotocol/clientCapabilities": {
+    "elicitation": { "form": {}, "url": {} },
+    "extensions": { "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] } }
+  }
+}
+```
+
+- `elicitation` — which modes the client can render. An empty object `{}` means form mode only, for backwards compatibility.
+- `extensions` — same shape as on the server side.
+
+A server **must not** use a capability the client did not declare on *this* request. Because the declaration travels with every message, the rule is trivially enforceable: no memory, no race.
+
+## Handles instead of sessions
+
+Without sessions, how does a multi-step workflow work? The server mints an **explicit handle** and the model carries it forward as an ordinary tool argument:
+
+```json
+{ "name": "create_basket", "arguments": {} }
+```
+
+```json
+{
+  "content": [{ "type": "text", "text": "Created basket bsk_a1b2c3" }],
+  "structuredContent": { "basket_id": "bsk_a1b2c3" }
+}
+```
+
+```json
+{ "name": "add_item", "arguments": { "basket_id": "bsk_a1b2c3", "sku": "MUG-01" } }
+```
+
+From the wire's point of view `basket_id` is just a string. Design rules that make it safe:
+
+- **Authorization** — for an authenticated server, a handle is a *name*, not a *capability*: check the caller owns it on every call. For an unauthenticated server the handle *is* the bearer token, so generate it with real entropy (UUIDv4) and expire it.
+- **Opacity** — do not encode structure a caller could parse or guess.
+- **Lifetime** — say in the creating tool's description how long the handle lives ("baskets expire after 24 hours"), so the model sees it.
+- **Expiry errors** — a call with an unknown or expired handle returns a tool execution error that says so, so the model can create a new one.
+
+## Modern vs legacy: a preview
+
+The current revision calls per-request-metadata implementations **modern** and handshake-based ones (`2025-11-25` and earlier) **legacy**. A **dual-era** implementation supports both. The rule of thumb: a modern client talking to a legacy server fails unless the client is dual-era; a legacy client talking to a modern-only server fails and has no way to upgrade itself. How clients detect the era — `server/discover` on stdio, inspecting a `400` body on HTTP — is covered in [Transports → Backward Compatibility](/mcp/en/transports/backward-compatibility/).
+
+<Callout title="The one-line takeaway">
+MCP versions are dates, `2026-07-28` is current, and the protocol is stateless: no handshake, no sessions, every request declares its version and capabilities in `_meta`, `server/discover` answers "what do you support" in one round trip, version mismatches surface as `-32022` with a `supported` list, and cross-request state lives in explicit handles the model passes back.
+</Callout>
+
+export const quizDiscovery = [
+  {
+    q: 'What does the protocol version string 2026-07-28 encode?',
+    options: [
+      'The release date of the SDK',
+      'The last date a backwards-incompatible change was made to the protocol',
+      'The build number of the server',
+      'The expiry date of the specification',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a modern server learn a client’s capabilities?',
+    options: [
+      'From the initialize handshake at connection start',
+      'From the Mcp-Session-Id header',
+      'From _meta on every request',
+      'It asks the client with capabilities/get',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A server returns error -32022 with data.supported. What should the client do?',
+    options: [
+      'Fall back to the HTTP+SSE transport',
+      'Retry the request declaring one of the supported versions, or report an error if none match',
+      'Send initialize',
+      'Ignore it and continue',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A server needs to keep a shopping cart across several tool calls. What does the spec recommend?',
+    options: [
+      'Use the connection as the session boundary',
+      'Return an explicit handle from a creation tool and accept it as an argument on later calls',
+      'Store the cart in the client’s _meta',
+      'Send Mcp-Session-Id',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/discovery-and-versioning" questions={quizDiscovery} />
+
+<ProgressTracker client:visible id="mcp-foundations/discovery-and-versioning" />

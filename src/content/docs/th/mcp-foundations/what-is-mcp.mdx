@@ -1,0 +1,137 @@
+---
+title: 'What Is MCP?'
+description: 'host, client และ server; primitive สามอย่างฝั่ง server และ primitive ฝั่ง client; local server กับ remote server; และสิ่งที่ MCP จงใจไม่ทำ'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ผู้เล่นสามฝ่าย
+
+MCP เป็น client-server protocol ที่มีจุดพลิกอยู่นิดหนึ่ง: "client" ไม่ใช่ตัว application ของผู้ใช้เอง แต่เป็น component ที่อยู่ *ภายใน* มัน
+
+- **MCP host** — AI application: Claude Desktop, Claude Code, VS Code หรือ agent ที่คุณกำลังสร้าง มันเป็นคนประสานทุกอย่าง: จะเชื่อม server ไหน จะโชว์ tool ไหนให้ model จะขอ approval จากผู้ใช้เมื่อไร
+- **MCP client** — object ที่ host สร้างขึ้นสำหรับ server **แต่ละตัว** ที่เชื่อมต่อ มันถือ connection เส้นนั้น ส่ง request และรับผลลัพธ์ หนึ่ง server หนึ่ง client หนึ่ง connection เฉพาะ
+- **MCP server** — โปรแกรมที่ให้ context อาจเป็น [filesystem server](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem) ที่รันเป็น subprocess บน laptop ของคุณ หรือ server ที่ Sentry host ไว้อีกฟากของอินเทอร์เน็ตก็ได้
+
+<Mermaid title="host เดียว หลาย client หลาย server" code={participantsDiagram} />
+
+export const participantsDiagram = `flowchart TB
+  subgraph Host["MCP Host: e.g. VS Code"]
+    C1["MCP Client 1"]
+    C2["MCP Client 2"]
+    C3["MCP Client 3"]
+    C4["MCP Client 4"]
+  end
+  C1 ---|"dedicated connection"| A["Server A: filesystem (local)"]
+  C2 ---|"dedicated connection"| B["Server B: database (local)"]
+  C3 ---|"dedicated connection"| S["Server C: Sentry (remote)"]
+  C4 ---|"dedicated connection"| S`;
+
+คำว่า **server** บอกบทบาทของโปรแกรม ไม่ได้บอกว่ามันรันอยู่ที่ไหน เมื่อ Claude Desktop เปิด filesystem server เป็น child process โปรเซสนั้นก็คือ server — แบบ *local* ส่วน endpoint ที่ Sentry host ไว้ก็เป็น server เหมือนกัน — แบบ *remote* ทั้งสองพูด protocol เดียวกันเป๊ะ
+
+## server มีอะไรให้: primitive สามอย่าง
+
+server เปิดของให้ใช้ได้สูงสุดสามประเภท คำถามด้านการออกแบบที่สำคัญของแต่ละประเภทคือ *ใครเป็นคนตัดสินใจว่าจะใช้มันเมื่อไร*
+
+| Primitive | ควบคุมโดย | มันคืออะไร | method บน wire |
+|-----------|---------------|------------|--------------|
+| **Tools** | **model** | function ที่ model เรียกเพื่อลงมือทำ: รัน query, สร้าง issue, ส่งอีเมล | `tools/list`, `tools/call` |
+| **Resources** | **application** | ข้อมูลที่ให้ context กับ model: ไฟล์, schema, record | `resources/list`, `resources/read`, `resources/templates/list` |
+| **Prompts** | **ผู้ใช้** | message template ที่ใช้ซ้ำได้ ผู้ใช้เลือกเองอย่างชัดเจน มักอยู่ในรูป slash command | `prompts/list`, `prompts/get` |
+
+คอลัมน์ "ควบคุมโดย" คือหัวใจของการออกแบบ MCP:
+
+- **Tools ถูกควบคุมโดย model** model อ่าน description ของ tool แล้วตัดสินใจเรียกเอง นี่คือเหตุผลที่ description ของ tool สำคัญมาก และเป็นเหตุผลที่ host ต้องให้มนุษย์อยู่ใน loop สำหรับอะไรที่อ่อนไหว
+- **Resources ถูกขับเคลื่อนโดย application** host เป็นคนตัดสินใจว่าจะแสดงมันอย่างไร — file picker, ช่องค้นหา, ใส่เข้า context อัตโนมัติ model ไม่ได้ "เรียก" resource แต่ host เป็นคนอ่านแล้วใส่เข้า context
+- **Prompts ถูกควบคุมโดยผู้ใช้** มันปรากฏเป็นคำสั่งที่ผู้ใช้จงใจเรียก server เป็นคนเขียนเนื้อหาของ prompt ผู้ใช้เป็นคนเลือกว่าจะใช้เมื่อไร
+
+ลองนึกถึง database server มันจะเปิด **tool** ชื่อ `run_query` (model ตัดสินใจว่าจะ query เมื่อไร), **resource** ชื่อ `schema://main` (host แนบ schema เป็น context) และ **prompt** ชื่อ `explain_slow_query` (ผู้ใช้รันเป็น slash command โดยใส่ query เป็น argument)
+
+## client มีอะไรให้: elicitation
+
+การไหลของข้อมูลไม่ได้เป็นทางเดียว server ขออะไรบางอย่างจาก client กลางคันได้ และ primitive ฝั่ง client สำหรับเรื่องนี้คือ **elicitation**: "ถามผู้ใช้หน่อย แล้วเอาคำตอบมาให้ฉัน" tool สำหรับจองโต๊ะอาจ elicit ว่า *"ยืนยัน: จองโต๊ะ 4 ที่นั่งวันศุกร์?"* ก่อนจะทำจริง
+
+elicitation มีสองโหมด: **form** (client แสดงฟอร์มเล็ก ๆ ตาม schema แล้วส่งค่ากลับ) และ **URL** (client เปิดหน้าเว็บใน browser สำหรับการโต้ตอบที่ห้ามผ่าน client เช่น การกรอก credential) ใน revision ปัจจุบัน request นี้ถูกส่งมาใน *ผลลัพธ์* ของ tool ด้วยแพทเทิร์น multi round-trip ซึ่งโมดูล [Client Interaction](/mcp/th/client-interaction/) จะอธิบายเต็ม ๆ
+
+client feature อีกสองอย่าง — **sampling** (server ขอ completion จาก model ของ host) และ **roots** (server ถามว่าทำงานใน directory ไหนได้บ้าง) — ถูก deprecate ตั้งแต่ 2026-07-28 มันยังทำงานได้ในช่วง deprecation window แต่ server ใหม่ไม่ควรนำมาใช้ โมดูลเดียวกันจะอธิบายว่าควรทำอย่างไรแทน
+
+## local server กับ remote server
+
+| | Local server | Remote server |
+|--|--------------|---------------|
+| Transport | **stdio** — host spawn server เป็น subprocess แล้วคุยผ่าน stdin/stdout | **Streamable HTTP** — server เป็น web service ที่มี `POST` endpoint เดียว |
+| ตัวอย่างทั่วไป | Filesystem, git, local database, ตัวครอบ CLI | Sentry, GitHub, Notion, API ภายในบริษัท |
+| ให้บริการ | ปกติ client เดียว | หลาย client พร้อมกัน |
+| Credential | อ่านจาก environment (env var, config file) | OAuth 2.1 bearer token |
+| ใครรันได้ | ใครก็ได้ที่ติดตั้ง package | องค์กรที่ host มัน |
+
+ทางเลือกนี้เป็นการตัดสินใจด้านการออกแบบที่ทำครั้งเดียวต่อ server server ที่ครอบของบนเครื่องผู้ใช้ (ไฟล์, Docker daemon) ต้องเป็น local server ที่อยู่หน้า SaaS แบบ multi-tenant ควรเป็น remote เพื่อให้ผู้ให้บริการควบคุมการอัปเดตและ auth ได้ โมดูล [Transports](/mcp/th/transports/) จะลงรายละเอียดทั้งสองแบบ
+
+## สิ่งที่ MCP จงใจไม่ทำ
+
+ขอบเขตของ MCP แคบโดยตั้งใจ และการรู้ขอบเขตจะช่วยให้คุณไม่ออกแบบสวนทางกับมัน:
+
+- **มันไม่คุยกับ model** host ใช้ LLM API ของตัวเอง (สำหรับ Claude คือ Messages API) MCP ไม่เคยเห็น prompt หรือ completion
+- **มันไม่กำหนดว่า host ใช้ context อย่างไร** host จะใส่ tool ทุกตัวเข้า context ของ model, ซ่อนไว้หลัง search tool หรือถามผู้ใช้ก่อนทุก call ก็ได้ protocol บอกแค่ว่ามีอะไร *ให้ใช้* ไม่ได้บอกว่าจะ *ใช้* อย่างไร
+- **มันไม่จัดการ conversation หรือ session** MCP เป็น stateless: แต่ละ request อยู่ได้ด้วยตัวเอง ถ้า server ต้องการ state ข้าม call ให้แจก handle ที่ชัดเจน (cart ID, job ID) แล้วผู้เรียกส่งกลับมา
+- **มันไม่นิยาม domain ของคุณ** `run_query` ทำอะไร, `schema://main` มีอะไร — เป็นของคุณทั้งหมด
+
+## mental model ที่ควรจำไว้
+
+มอง host เป็น **hub** และ server แต่ละตัวเป็น **device** hub รู้วิธีไล่ดู feature ของ device (`server/discover`, `tools/list`), วิธีใช้มัน (`tools/call`, `resources/read`) และวิธีรับรู้เมื่อมีการเปลี่ยนแปลง (`subscriptions/listen`) device ไม่รู้อะไรเลยเกี่ยวกับ model, UI หรือ device ตัวอื่น การแยกกันแบบนี้คือสิ่งที่ทำให้ server ตัวเดียวใช้ได้กับทุก host และ host ตัวเดียวใช้ได้กับทุก server
+
+<Callout title="สรุปหนึ่งบรรทัด">
+host สร้าง MCP client หนึ่งตัวต่อ MCP server หนึ่งตัว; server เปิด tools (model ควบคุม), resources (application ขับเคลื่อน) และ prompts (ผู้ใช้ควบคุม); client เปิด elicitation; local server รันบน stdio ส่วน remote รันบน Streamable HTTP — และ MCP ไม่ยุ่งกับวิธีที่ host คุยกับ model
+</Callout>
+
+export const quizWhatIs = [
+  {
+    q: 'primitive ไหนที่ถูกเรียกว่า "model-controlled"?',
+    options: [
+      'Resources',
+      'Prompts',
+      'Tools',
+      'Elicitation',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ผู้ใช้พิมพ์ slash command ที่เติมค่าลงใน template ที่ server ให้มา นั่นคือ primitive ไหน?',
+    options: [
+      'prompt',
+      'tool',
+      'resource',
+      'root',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'ข้อความเกี่ยวกับ "server" ข้อใดถูกต้อง?',
+    options: [
+      'server ต้องรันบนเครื่อง remote เสมอ',
+      'server คือโปรแกรมที่ให้ context ไม่ว่าจะรัน local เป็น subprocess หรือ remote ผ่าน HTTP',
+      'server คือตัว AI application เอง',
+      'server เป็นเจ้าของ language model เสมอ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อใดเป็น primitive ฝั่ง client ไม่ใช่ฝั่ง server?',
+    options: [
+      'Elicitation',
+      'Tools',
+      'Resources',
+      'Prompts',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/what-is-mcp" questions={quizWhatIs} />
+
+<ProgressTracker client:visible id="mcp-foundations/what-is-mcp" />

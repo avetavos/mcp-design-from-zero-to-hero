@@ -1,0 +1,135 @@
+---
+title: 'MCP Foundations'
+description: 'The N×M integration problem MCP solves, the host/client/server picture, where MCP sits next to the LLM API, and what this module teaches.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The problem: N apps × M integrations
+
+Every AI application wants the same things: read the user's files, query a database, search an issue tracker, call an internal API. Before MCP, each application built each integration itself. Claude Desktop wrote a GitHub connector; VS Code wrote a GitHub connector; your in-house agent wrote a GitHub connector. Three apps, one API, three integrations — and the same again for every other data source.
+
+That is the **N×M problem**: N applications times M data sources equals N×M bespoke adapters, every one of them slightly different, every one maintained by someone else.
+
+<Mermaid title="Before MCP: every app integrates every source itself" code={nxmDiagram} />
+
+export const nxmDiagram = `flowchart LR
+  A1["App 1"] --> S1["GitHub"]
+  A1 --> S2["Postgres"]
+  A1 --> S3["Files"]
+  A2["App 2"] --> S1
+  A2 --> S2
+  A2 --> S3
+  A3["App 3"] --> S1
+  A3 --> S2
+  A3 --> S3`;
+
+The **Model Context Protocol (MCP)** replaces the grid with a standard. A data source implements the protocol once, as an **MCP server**. An application implements the protocol once, as an **MCP host**. After that, any host can talk to any server: N + M implementations instead of N×M.
+
+<Mermaid title="With MCP: implement the protocol once on each side" code={mcpDiagram} />
+
+export const mcpDiagram = `flowchart LR
+  A1["App 1 (host)"] --> P["MCP"]
+  A2["App 2 (host)"] --> P
+  A3["App 3 (host)"] --> P
+  P --> S1["GitHub server"]
+  P --> S2["Postgres server"]
+  P --> S3["Filesystem server"]`;
+
+## "USB-C for AI applications"
+
+The usual analogy is USB-C. A laptop does not carry a bespoke port for every monitor, drive, and keyboard; it carries one standard port, and peripherals carry the matching plug. MCP is that port for AI applications: the host has one connector, and every context source — a database, a SaaS API, your local files — plugs into it.
+
+The analogy holds in a second way. USB-C defines the plug and the negotiation, not what the device does. MCP defines the messages, the discovery, and the transport, not what your tools do or how the host uses the model. That deliberate scope is a strength: the protocol stays small, and everything domain-specific lives in your server.
+
+## Where MCP sits next to the LLM API
+
+MCP is **not** an LLM API. It does not send prompts to a model or stream tokens back. It sits beside the model API, feeding it context:
+
+| Layer | Talks to | Examples |
+|-------|----------|----------|
+| LLM API | The model | Claude Messages API, tool-use loop |
+| MCP host | MCP servers via MCP clients | Claude Desktop, Claude Code, VS Code, your agent |
+| MCP servers | The outside world | Filesystem, GitHub, Sentry, your internal API |
+
+A host asks its MCP servers what tools they offer, passes those tool definitions to the model, and when the model decides to call one, the host routes the call to the right server and hands the result back to the model. MCP covers the host↔server half of that loop. The host↔model half is the model provider's API.
+
+## Who's who
+
+<Mermaid title="A host runs one MCP client per server" code={whoDiagram} />
+
+export const whoDiagram = `flowchart TB
+  subgraph H["MCP Host (the AI application)"]
+    C1["MCP Client 1"]
+    C2["MCP Client 2"]
+    C3["MCP Client 3"]
+  end
+  C1 --- S1["Local server: filesystem (stdio)"]
+  C2 --- S2["Local server: database (stdio)"]
+  C3 --- S3["Remote server: Sentry (Streamable HTTP)"]`;
+
+- **Host** — the application the user is actually using. It owns the model, the UI, and the decision about what to expose to the model.
+- **Client** — a component inside the host that holds one connection to one server. A host with three servers has three clients.
+- **Server** — a program that exposes context: **tools** to act, **resources** to read, **prompts** to reuse. It can run as a subprocess on the user's machine or as a service on the internet.
+
+## What this module covers
+
+| Lesson | After it, you can |
+|--------|-------------------|
+| [What Is MCP?](/mcp/en/mcp-foundations/what-is-mcp/) | Name the three participants and the primitives each side offers |
+| [Architecture and Layers](/mcp/en/mcp-foundations/architecture-and-layers/) | Trace a full discover → list → call → notify exchange on the wire |
+| [JSON-RPC and _meta](/mcp/en/mcp-foundations/json-rpc-and-meta/) | Read any MCP message and know which fields are required and why |
+| [Discovery and Versioning](/mcp/en/mcp-foundations/discovery-and-versioning/) | Explain why MCP is stateless and how versions are negotiated per request |
+| [Setup and Your First Server](/mcp/en/mcp-foundations/setup-and-first-server/) | Run a working server in TypeScript and Python and inspect it |
+
+## How this course is built
+
+Every lesson starts from the **wire** — the JSON that actually crosses between client and server — and only then shows the SDK call that produces it. You will see the same server written in **TypeScript** (`@modelcontextprotocol/server`) and **Python** (`mcp`) side by side, in synced tabs. Pick your language once and it follows you through every lesson.
+
+The course targets protocol revision **2026-07-28**, the current one. Where an older behaviour still matters for interoperability, it is called out explicitly as *legacy (2025-11-25 and earlier)* so you never confuse the two.
+
+<Callout title="The one-line takeaway">
+MCP turns the N×M integration grid into N + M by standardising how an AI application discovers and uses context: a host runs one client per server, and every server implements the same small protocol — leaving what the tools do, and how the host uses the model, entirely up to you.
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'What problem is MCP designed to remove?',
+    options: [
+      'Slow token streaming from LLM APIs',
+      'Every application building its own integration for every data source (N×M adapters)',
+      'The need for a database behind an AI app',
+      'Prompt engineering',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How many MCP clients does a host create when it connects to three servers?',
+    options: [
+      'One shared client',
+      'Three — one dedicated client per server',
+      'None; the host talks to servers directly',
+      'Six — one per direction',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which of these does MCP NOT define?',
+    options: [
+      'How a server advertises its tools',
+      'The message format between client and server',
+      'How the host sends prompts to the language model',
+      'How a client discovers a server’s supported protocol versions',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="mcp-foundations/index" />

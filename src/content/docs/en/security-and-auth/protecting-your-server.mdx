@@ -1,0 +1,245 @@
+---
+title: 'Protecting Your Server'
+description: 'What an MCP resource server must check on every request, how to wire bearer-token verification and metadata endpoints in the TypeScript and Python SDKs, and how to design scopes and step-up challenges.'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Your server's job: verify, never issue
+
+An HTTP MCP server is an OAuth 2.1 *resource server*. It does not log users in and it does not mint tokens; the authorization server does that. The server's whole responsibility is to answer one question on every single request: *is this token good, for me, for this operation?*
+
+<Mermaid title="What happens to every request before a tool runs" code={verifyDiagram} />
+
+export const verifyDiagram = `flowchart LR
+  R["POST /mcp"] --> T{"Bearer token present?"}
+  T -->|no| E401["401 + WWW-Authenticate"]
+  T -->|yes| V{"signature and expiry ok?"}
+  V -->|no| E401
+  V -->|yes| A{"audience is this server?"}
+  A -->|no| E401
+  A -->|yes| S{"scopes cover the operation?"}
+  S -->|no| E403["403 insufficient_scope"]
+  S -->|yes| H["MCP handler runs the request"]`;
+
+The checks, in order, per OAuth 2.1 section 5.2 and RFC 8707:
+
+1. **Presence and format.** A missing or malformed `Authorization: Bearer` header is a `401` with a `WWW-Authenticate` challenge pointing to your resource metadata.
+2. **Signature and expiry.** Validate against the AS's keys (JWT) or by introspection (opaque tokens). Invalid or expired means `401`.
+3. **Audience.** The token MUST have been issued for *this* server, identified by its canonical URI. This is the check that makes token passthrough impossible. Wrong audience means `401`, not "accept but restrict".
+4. **Scopes.** If the operation needs a scope the token lacks, answer `403` with `error="insufficient_scope"` and the full scope set required, so the client can step up in one round.
+
+Two absolute rules follow: the server MUST NOT accept tokens not issued to it, and MUST NOT transit any token it receives to another service.
+
+## The three endpoints you host
+
+| Path | Purpose |
+|------|---------|
+| `/mcp` (your MCP endpoint) | The protected resource. Every POST is checked as above. |
+| `/.well-known/oauth-protected-resource/mcp` | RFC 9728 Protected Resource Metadata (path-aware form; a root form is also allowed). Lists your `authorization_servers` and `scopes_supported`. |
+| `/.well-known/oauth-authorization-server` (optional mirror) | If your AS is co-located, you may serve its RFC 8414 metadata here too. |
+
+Both SDKs give you these with a few lines.
+
+## Wiring it up in the SDKs
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    The Express helpers provide the metadata router and a bearer middleware. You supply the verifier, which is the only part that knows your AS.
+
+    ```ts
+    import type { OAuthTokenVerifier } from '@modelcontextprotocol/express';
+    import {
+        createMcpExpressApp,
+        getOAuthProtectedResourceMetadataUrl,
+        mcpAuthMetadataRouter,
+        requireBearerAuth
+    } from '@modelcontextprotocol/express';
+    import { toNodeHandler } from '@modelcontextprotocol/node';
+    import type { AuthInfo, OAuthMetadata } from '@modelcontextprotocol/server';
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+
+    const mcpServerUrl = new URL('https://api.example.com/mcp');
+
+    // Your verifier: check signature, expiry, audience; return AuthInfo or throw.
+    async function verifyAccessToken(token: string): Promise<AuthInfo> {
+        const claims = await verifyJwt(token, { audience: mcpServerUrl.href });
+        return { token, clientId: claims.client_id, scopes: claims.scope.split(' ') };
+    }
+    const verifier: OAuthTokenVerifier = { verifyAccessToken };
+
+    const auth = requireBearerAuth({
+        verifier,
+        requiredScopes: ['mcp'],
+        resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpServerUrl)
+    });
+
+    const app = createMcpExpressApp({ host: '0.0.0.0', allowedHosts: ['api.example.com'] });
+    app.use(mcpAuthMetadataRouter({ oauthMetadata, resourceServerUrl: mcpServerUrl }));
+
+    const node = toNodeHandler(createMcpHandler(buildServer));
+    app.all('/mcp', auth, (req, res) => void node(req, res, req.body));
+    ```
+
+    `mcpAuthMetadataRouter` serves `/.well-known/oauth-protected-resource/mcp` (RFC 9728) and mirrors the `oauthMetadata` you pass at `/.well-known/oauth-authorization-server`. `requireBearerAuth` answers `401`/`403` with the correct `WWW-Authenticate` challenges and attaches the verified `AuthInfo` to the request.
+
+    Inside a tool, the caller's identity arrives on the request context:
+
+    ```ts
+    server.registerTool('whoami', { description: 'Report the authenticated caller' }, async ctx => {
+        const caller = ctx.http?.authInfo;
+        return { content: [{ type: 'text', text: `${caller?.clientId} [${caller?.scopes.join(' ')}]` }] };
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    The Python SDK's contract is a `TokenVerifier` protocol with one async method. Return an `AccessToken` for a good token, `None` for anything else.
+
+    ```python
+    from mcp.server import MCPServer
+    from mcp.server.auth.provider import AccessToken, TokenVerifier
+    from mcp.server.auth.settings import AuthSettings
+
+
+    class JwtVerifier(TokenVerifier):
+        async def verify_token(self, token: str) -> AccessToken | None:
+            try:
+                claims = verify_jwt(token, audience="https://api.example.com/mcp")
+            except Exception:
+                return None  # invalid signature, expired, wrong audience -> 401
+            return AccessToken(
+                token=token,
+                client_id=claims["client_id"],
+                scopes=claims["scope"].split(),
+                expires_at=claims["exp"],
+            )
+
+
+    mcp = MCPServer(
+        "Files",
+        token_verifier=JwtVerifier(),
+        auth=AuthSettings(
+            issuer_url="https://auth.example.com",
+            resource_server_url="https://api.example.com/mcp",
+            required_scopes=["mcp"],
+        ),
+    )
+    ```
+
+    `AuthSettings` configures the server's public face: which AS to advertise in the Protected Resource Metadata (`issuer_url`), the canonical URI used as the audience (`resource_server_url`), and the scopes every token must carry. Run it over Streamable HTTP with `mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)`; the well-known routes and challenges are served for you.
+
+    Inside a tool, read the authenticated token from the request context:
+
+    ```python
+    from mcp.server.auth.middleware.auth_context import get_access_token
+
+
+    @mcp.tool()
+    def whoami() -> str:
+        """Report the authenticated caller."""
+        token = get_access_token()
+        if token is None:
+            return "anonymous"
+        return f"{token.client_id} [{' '.join(token.scopes)}]"
+    ```
+  </TabItem>
+</Tabs>
+
+Whichever SDK you use, the verifier is where the audience check lives. Do not skip it because "the AS only issues tokens for us"; the moment a second resource appears behind the same AS, that assumption is a vulnerability.
+
+## Authorization is per request, and lists may vary
+
+MCP is stateless: credentials are per-request input, not connection state. That has a useful consequence the spec calls out explicitly. `tools/list`, `resources/list`, and `prompts/list` MUST NOT vary per connection, but they MAY vary by the authorization presented on the request. A token with `files:read` can legitimately see a shorter tool list than one with `files:write`.
+
+Do this by filtering on the verified scopes inside your list handler or tool registration, never by trusting something the client sent in `_meta` or in tool arguments. The `clientInfo` field is self-reported and MUST NOT drive security decisions.
+
+## Designing scopes
+
+Poor scope design is a security problem, not just a UX one: an over-broad token stolen from a log grants access to everything at once. The spec's guidance is a progressive, least-privilege model:
+
+**Start small.** `scopes_supported` in your resource metadata should list only the minimal set for basic functionality (say `mcp:tools-basic` for discovery and read-only tools), not your whole catalog.
+
+**Challenge precisely.** When a tool needs more, answer `403` with *all* scopes that operation requires, together. Challenging one scope at a time forces multiple consent rounds for a single action.
+
+```http
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope",
+                         scope="files:write files:delete",
+                         resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp"
+```
+
+You may choose the minimum (only what this operation needs), the recommended middle (this operation plus scopes that commonly go with it), or an extended set the client will probably need soon. Whatever you pick, be consistent so clients can predict you.
+
+**Accept down-scoped tokens.** An AS MAY grant a subset of what was requested. Your server should work with less, not fail closed on the first missing optional scope.
+
+**Honour hierarchies.** If your AS defines `admin` as implying `read`, a token with `admin` must satisfy a `read` check. Encode that mapping server-side; do not rely on the client to expand it.
+
+**Never trust claimed scopes alone.** A scope in a token says the user *consented* to that class of action. Your server still decides whether *this* user may touch *this* resource, with ordinary business-logic authorization.
+
+Common mistakes the spec lists: publishing every scope in `scopes_supported`, omnibus scopes like `*` or `full-access`, bundling unrelated privileges to avoid future prompts, returning the whole catalog in every challenge, and silently changing what a scope means without versioning it.
+
+## Operational hygiene
+
+Beyond token checks, the tools spec says servers MUST rate-limit invocations, validate inputs, implement access controls, and sanitise outputs. Concretely for an authenticated server:
+
+- **Rate limit per principal**, using the verified `client_id` or subject, not per IP.
+- **Log tool usage with the principal and a correlation ID.** Log scope elevations (requested, granted subset) so audits can reconstruct who escalated what.
+- **Use TLS.** Bearer tokens are only as safe as the channel; `https://` is a hard requirement for production, with plain `http://` tolerated only on loopback during development.
+- **Bind state handles to the user.** If a tool returns a handle for later calls, key the stored state as `user_id:handle` where `user_id` comes from the verified token. Possession of a handle is never authentication.
+
+<Callout title="The one-line takeaway">
+A resource server verifies on every request: presence, signature and expiry, audience equal to its own canonical URI, then scopes; the SDKs give you `requireBearerAuth` plus `mcpAuthMetadataRouter` or `TokenVerifier` plus `AuthSettings`, and your job is the verifier, minimal initial scopes, and precise one-shot `403` challenges.
+</Callout>
+
+export const quizProtect = [
+  {
+    q: 'A token is well-signed and unexpired but its audience is a different service. Which response is correct?',
+    options: [
+      '200, run the tool with reduced scopes',
+      '401 Unauthorized',
+      '403 Forbidden with insufficient_scope',
+      '400 Bad Request',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In the Python SDK, what does a `TokenVerifier.verify_token` implementation return for an invalid token?',
+    options: [
+      'An `AccessToken` with empty scopes',
+      'The string "invalid"',
+      '`None`',
+      'It raises `ToolError`',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'May `tools/list` return different tools to different callers?',
+    options: [
+      'No, it must be identical for everyone',
+      'Yes, by connection, so the server can remember what it showed before',
+      'Yes, by the authorization presented on the request, but not by connection',
+      'Only over stdio',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A tool needs both `files:write` and `files:delete`. What should a 403 challenge contain?',
+    options: [
+      'Only `files:write`, then `files:delete` on the next retry',
+      'Both scopes in one `scope` parameter',
+      'The full scope catalog of the server',
+      'No scope parameter, so the client requests everything',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/protecting-your-server" questions={quizProtect} />
+
+<ProgressTracker client:visible id="security-and-auth/protecting-your-server" />

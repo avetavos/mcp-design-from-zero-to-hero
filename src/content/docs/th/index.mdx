@@ -1,0 +1,60 @@
+---
+title: MCP Design — From Zero to Hero
+description: ออกแบบและสร้าง server/client ของ Model Context Protocol ตั้งแต่พื้นฐาน — JSON-RPC message และ _meta, tools/resources/prompts, stdio และ Streamable HTTP, multi round-trip request และ elicitation, OAuth 2.1, ภัยคุกคามด้าน security, การ deploy ขึ้น production และ registry พร้อมโค้ด TypeScript และ Python เทียบกัน
+template: splash
+hero:
+  tagline: คอร์สแบบ standalone ตั้งแต่ผู้เริ่มต้นจนถึงขั้นสูง ว่าด้วยการออกแบบด้วย Model Context Protocol (spec 2026-07-28) ตั้งแต่โมเดล host/client/server และ wire protocol ไปจนถึง tools, resources, prompts, transport, elicitation, งานที่รันนาน, OAuth 2.1, security และการส่งขึ้น production — ทุกหัวข้อมี JSON บน wire คู่กับโค้ด SDK ทั้ง TypeScript และ Python
+  actions:
+    - text: เริ่มที่นี่
+      link: /mcp/th/mcp-foundations/
+      icon: right-arrow
+      variant: primary
+    - text: ข้ามไปที่ Server Primitives
+      link: /mcp/th/server-primitives/
+      icon: open-book
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## สิ่งที่คุณจะได้เรียน
+
+<CardGrid>
+  <Card title="MCP Foundations" icon="rocket">
+    MCP คืออะไร, host/client/server, data layer กับ transport layer, JSON-RPC และ `_meta`, discovery กับ versioning และ server ตัวแรกของคุณใน Inspector [เริ่ม →](/mcp/th/mcp-foundations/)
+  </Card>
+  <Card title="Server Primitives" icon="seti:json">
+    tools, structured output และ annotation, resources กับ URI template, prompts, change notification และ caching [สร้าง →](/mcp/th/server-primitives/)
+  </Card>
+  <Card title="Transports" icon="random">
+    stdio และ Streamable HTTP — framing, header, SSE stream, การสร้าง HTTP server และ backward compatibility กับ protocol ยุคเก่า [เชื่อมต่อ →](/mcp/th/transports/)
+  </Card>
+  <Card title="Client Interaction" icon="seti:plan">
+    multi round-trip request, elicitation (form และ URL), progress กับ cancellation, Tasks extension และ sampling/roots/logging ที่ถูก deprecate [โต้ตอบ →](/mcp/th/client-interaction/)
+  </Card>
+  <Card title="Building Clients & Hosts" icon="seti:config">
+    การเขียน client, ต่อ tools เข้ากับ LLM agent loop, ใช้ server ใน Claude Code และ Claude API, scale ไปถึงหลายร้อย tool [เชื่อมระบบ →](/mcp/th/building-clients/)
+  </Card>
+  <Card title="Security & Authorization" icon="approve-check">
+    OAuth 2.1 สำหรับ MCP — discovery, PKCE, resource indicator, client registration, การป้องกัน server, ภัยคุกคามและวิธีรับมือ, third-party auth [ป้องกัน →](/mcp/th/security-and-auth/)
+  </Card>
+  <Card title="Production & Ecosystem" icon="puzzle">
+    ออกแบบ tool ที่ agent ใช้ได้ดี, ทดสอบและ debug, deploy remote server, เผยแพร่ลง registry, extension และสิ่งที่เปลี่ยนไป [ส่งขึ้น production →](/mcp/th/production-and-ecosystem/)
+  </Card>
+</CardGrid>
+
+## คอร์สนี้ทำงานยังไง
+
+<CardGrid>
+  <Card title="Wire-first เสมอ" icon="seti:json">
+    ทุกแนวคิดเริ่มจาก JSON-RPC message ที่ส่งกันจริงบน wire แล้วค่อยแสดงว่า SDK ของ TypeScript และ Python generate มันออกมาอย่างไร จะได้ไม่มีอะไรเป็น magic
+  </Card>
+  <Card title="สอง SDK เทียบกันชัด ๆ" icon="seti:config">
+    ตัวอย่าง server และ client ใน TypeScript (`@modelcontextprotocol/server`, `@modelcontextprotocol/client`) และ Python (`mcp`) ผ่านแท็บที่ sync กัน เลือกภาษาครั้งเดียวแล้วตามไปทุกที่
+  </Card>
+  <Card title="เน้นการออกแบบ ไม่ใช่แค่ syntax" icon="approve-check">
+    ทำไม protocol ถึง stateless, เมื่อไร tool ดีกว่า resource, ออกแบบ tool ให้ agent ใช้ได้ดีอย่างไร, ทำให้ remote server ปลอดภัยอย่างไร — มี trade-off ให้คิดทุกหน้า
+  </Card>
+  <Card title="spec ปัจจุบัน พร้อมประวัติ" icon="puzzle">
+    เขียนตาม protocol revision 2026-07-28 พร้อมหมายเหตุที่ระบุชัดถึงยุคเก่า (2025-11-25 และก่อนหน้า) เพื่อให้ tutorial เก่า ๆ ยังอ่านรู้เรื่อง สองภาษา (English / ไทย) พร้อมบันทึกความคืบหน้า quiz
+  </Card>
+</CardGrid>

@@ -1,0 +1,242 @@
+---
+title: 'Discovery, Versions, and Statelessness'
+description: 'protocol version แบบวันที่, ทำไม MCP ไม่มี handshake และ session, การแลกเปลี่ยน server/discover, การ negotiate version รายรีเควสต์, capability object และ handle ที่ชัดเจนแทน session state'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## version คือวันที่
+
+MCP กำหนด version ของ protocol ด้วย string รูปแบบ `YYYY-MM-DD` ซึ่งระบุวันที่ล่าสุดที่มีการเปลี่ยนแปลงแบบ backwards-incompatible การเพิ่มที่ compatible ไม่ทำให้ version ขยับ
+
+| Revision | จุดเด่น |
+|----------|-------------|
+| `2026-07-28` | **ปัจจุบัน** Stateless: ไม่มี `initialize`, ไม่มี session, `_meta` ต่อ request, `server/discover`, multi round-trip request, `subscriptions/listen` |
+| `2025-11-25` | Legacy elicitation แบบ URL, tasks (ตอนนั้นยัง experimental), session ผ่าน `Mcp-Session-Id` |
+| `2025-06-18` | Legacy header `MCP-Protocol-Version`, structured tool output, OAuth resource indicator |
+| `2025-03-26` | Legacy เปิดตัว Streamable HTTP, deprecate HTTP+SSE |
+| `2024-11-05` | Legacy รุ่นแรก; transport แบบ HTTP+SSE |
+
+revision จะเป็น **Draft** (กำลังทำ), **Current** (พร้อมใช้ อาจเพิ่มของที่ compatible ได้อีก) หรือ **Final** (แช่แข็งแล้ว) feature แต่ละตัวยังถูกทำเครื่องหมาย **Deprecated** ได้ตาม lifecycle policy ที่รับประกันเวลาอย่างน้อยสิบสองเดือนก่อนถูกถอดออก
+
+## MCP เป็น stateless
+
+คุณสมบัติที่นิยาม revision ปัจจุบัน: **ทุก request มีทุกอย่างที่จำเป็นในการประมวลผลมัน** server ไม่อนุมานอะไรจาก request ก่อนหน้า แม้จะอยู่บน connection เดียวกัน
+
+พูดให้เป็นรูปธรรม:
+
+- **ไม่มี handshake `initialize`** revision ยุค legacy (2025-11-25 และก่อนหน้า) เปิดทุก connection ด้วย `initialize` → `notifications/initialized` แล้วจำ version และ capability ที่ negotiate ได้ ตอนนี้แต่ละ request พก `io.modelcontextprotocol/protocolVersion` และ `io.modelcontextprotocol/clientCapabilities` มาใน `_meta`
+- **ไม่มี session ระดับ protocol** Streamable HTTP server ยุค legacy เคยออก header `Mcp-Session-Id` ตอนนี้ไม่มีแล้ว list endpoint ห้ามให้ผลต่างกันตาม connection
+- connection ที่เปิดอยู่ — แม้แต่ subprocess ของ stdio — **ไม่ใช่ conversation** client อาจสลับ request ที่ไม่เกี่ยวกันบน transport เดียว และ server ห้ามใช้ตัวตนของ process หรือ connection แทนความต่อเนื่อง
+- state ที่ข้าม request (งานที่รันนาน, ตะกร้าสินค้า) ต้องอ้างอิงด้วย **identifier ที่ชัดเจน** ซึ่ง client ส่งมาทุกครั้ง
+
+<Mermaid title="handshake ยุค legacy เทียบกับ metadata ต่อ request แบบ stateless" code={statelessDiagram} />
+
+export const statelessDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  Note over C,S: legacy (2025-11-25 และก่อนหน้า)
+  C->>S: initialize (version, capabilities)
+  S-->>C: version, capabilities, session id
+  C->>S: notifications/initialized
+  C->>S: tools/call (พึ่ง session ที่จำไว้)
+  Note over C,S: ปัจจุบัน (2026-07-28)
+  C->>S: tools/call + _meta (version, capabilities)
+  S-->>C: result + _meta (serverInfo)
+  C->>S: resources/read + _meta (version, capabilities)
+  S-->>C: result`;
+
+ทำไมถึงไป stateless? remote server รันหลัง load balancer เป็น replica หลายตัว session affinity, sticky routing และ shared session store คือส่วนที่ยากที่สุดในการดูแล server ยุค legacy เมื่อไม่มี session replica ไหนก็ตอบ request ไหนก็ได้ และ replica ที่ crash เสียแค่ call ที่กำลังค้างอยู่ ซึ่ง client ก็แค่ retry
+
+## `server/discover`
+
+client รู้ทุกอย่างเกี่ยวกับ server ได้ใน request เดียว server **ต้อง** implement มัน; client **จะเรียกหรือไม่ก็ได้**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "discover-1",
+  "method": "server/discover",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "ExampleClient", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "discover-1",
+  "result": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"],
+    "capabilities": {
+      "tools": { "listChanged": true },
+      "resources": { "subscribe": true }
+    },
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": { "name": "ExampleServer", "version": "1.0.0" }
+    },
+    "instructions": "This server provides weather and resource utilities.",
+    "ttlMs": 3600000,
+    "cacheScope": "public"
+  }
+}
+```
+
+| Field | การใช้ |
+|-------|-----|
+| `supportedVersions` | เลือกหนึ่งในนี้สำหรับ request ต่อ ๆ ไป |
+| `capabilities` | primitive และ notification ที่ server รองรับ |
+| `_meta.io.modelcontextprotocol/serverInfo` | ชื่อและ version สำหรับแสดงผลและ log (ไม่ได้ verify) |
+| `instructions` | คำแนะนำแบบ free-text สำหรับ model ว่าจะใช้ server นี้ให้ดีอย่างไร — ที่ดีสำหรับใส่ "เรียก `list_projects` ก่อน `create_issue` เสมอ" |
+| `ttlMs`, `cacheScope` | cache result ได้หนึ่งชั่วโมง และ intermediary แชร์ได้ |
+
+เหตุผลสองข้อที่จะเรียกมัน: เพื่อ **แสดง** ตัวตนและ feature ของ server ในครั้งเดียว แทนที่จะแยก probe `tools/list`, `prompts/list` และ `resources/list` และเพื่อเป็น **backward-compatibility probe** บน stdio ซึ่งไม่มี HTTP status ให้แยก server รุ่นใหม่ออกจากรุ่น legacy
+
+## negotiate version ต่อ request
+
+ไม่มี handshake สำหรับ negotiate client ส่ง request โดยประกาศ version ที่ตัวเองต้องการ ถ้า server ไม่รองรับ server จะตอบด้วย `UnsupportedProtocolVersionError`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": {
+    "code": -32022,
+    "message": "Unsupported protocol version",
+    "data": {
+      "supported": ["2026-07-28", "2025-11-25"],
+      "requested": "1900-01-01"
+    }
+  }
+}
+```
+
+client เลือก version ที่รองรับร่วมกันจาก `data.supported` แล้ว retry หรือแสดง error ถ้าไม่มีตัวไหนตรงกัน ทั้งสองฝั่งรองรับหลาย version พร้อมกันได้ บน Streamable HTTP version ยังถูก mirror ไปที่ header `MCP-Protocol-Version` เพื่อให้ proxy route ตามมันได้โดยไม่ต้อง parse body
+
+## Capability
+
+capability เป็น object ไม่ใช่ boolean เพื่อให้แต่ละตัวพก setting ได้
+
+**Server capability** (return จาก `server/discover`):
+
+```json
+{
+  "capabilities": {
+    "tools": { "listChanged": true },
+    "resources": { "listChanged": true, "subscribe": true },
+    "prompts": { "listChanged": true },
+    "extensions": { "io.modelcontextprotocol/tasks": {} }
+  }
+}
+```
+
+- `tools`, `resources`, `prompts` — มีอยู่แปลว่ารองรับ primitive นั้น `listChanged: true` แปลว่า server ส่ง list-changed notification ได้; `resources.subscribe: true` แปลว่าส่ง update notification ราย resource ได้
+- `extensions` — map จาก extension identifier (ตั้งชื่อเหมือน key ใน `_meta` และบังคับมี prefix) ไปยัง setting ของแต่ละ extension
+
+**Client capability** (ส่งใน `_meta` ทุก request):
+
+```json
+{
+  "io.modelcontextprotocol/clientCapabilities": {
+    "elicitation": { "form": {}, "url": {} },
+    "extensions": { "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] } }
+  }
+}
+```
+
+- `elicitation` — โหมดที่ client แสดงผลได้ object ว่าง `{}` หมายถึงเฉพาะโหมด form เพื่อความเข้ากันได้กับของเก่า
+- `extensions` — รูปร่างเดียวกับฝั่ง server
+
+server **ห้าม** ใช้ capability ที่ client ไม่ได้ประกาศใน request *นี้* เพราะการประกาศเดินทางมากับทุก message กฎนี้จึงบังคับใช้ได้ง่ายมาก: ไม่ต้องจำ ไม่มี race
+
+## handle แทน session
+
+ไม่มี session แล้ว workflow หลายขั้นตอนทำงานอย่างไร? server ออก **handle ที่ชัดเจน** และ model พกมันต่อไปเป็น argument ธรรมดาของ tool:
+
+```json
+{ "name": "create_basket", "arguments": {} }
+```
+
+```json
+{
+  "content": [{ "type": "text", "text": "Created basket bsk_a1b2c3" }],
+  "structuredContent": { "basket_id": "bsk_a1b2c3" }
+}
+```
+
+```json
+{ "name": "add_item", "arguments": { "basket_id": "bsk_a1b2c3", "sku": "MUG-01" } }
+```
+
+จากมุมของ wire `basket_id` เป็นแค่ string กฎการออกแบบที่ทำให้มันปลอดภัย:
+
+- **Authorization** — สำหรับ server ที่มี authentication handle เป็น *ชื่อ* ไม่ใช่ *capability*: ตรวจว่าผู้เรียกเป็นเจ้าของมันทุก call สำหรับ server ที่ไม่มี authentication handle *คือ* bearer token ดังนั้นต้อง generate ด้วย entropy จริง (UUIDv4) และมีวันหมดอายุ
+- **Opacity** — อย่า encode โครงสร้างที่ผู้เรียก parse หรือเดาได้
+- **Lifetime** — ระบุใน description ของ tool ที่สร้าง handle ว่ามันอยู่ได้นานแค่ไหน ("ตะกร้าหมดอายุหลัง 24 ชั่วโมง") เพื่อให้ model เห็น
+- **Expiry error** — call ที่ใช้ handle ที่ไม่รู้จักหรือหมดอายุแล้ว ต้อง return tool execution error ที่บอกชัด เพื่อให้ model สร้างใหม่ได้
+
+## ยุคใหม่กับยุค legacy: ดูคร่าว ๆ
+
+revision ปัจจุบันเรียก implementation ที่ใช้ metadata ต่อ request ว่า **modern** และแบบที่ใช้ handshake (`2025-11-25` และก่อนหน้า) ว่า **legacy** implementation แบบ **dual-era** รองรับทั้งคู่ กฎง่าย ๆ: client รุ่นใหม่คุยกับ server รุ่น legacy จะล้มเหลว เว้นแต่ client เป็น dual-era; client รุ่น legacy คุยกับ server ที่เป็น modern อย่างเดียวจะล้มเหลวและไม่มีทาง upgrade ตัวเอง วิธีที่ client ตรวจจับยุค — `server/discover` บน stdio, ตรวจ body ของ `400` บน HTTP — อยู่ใน [Transports → Backward Compatibility](/mcp/th/transports/backward-compatibility/)
+
+<Callout title="สรุปหนึ่งบรรทัด">
+version ของ MCP คือวันที่ `2026-07-28` เป็นตัวปัจจุบัน และ protocol เป็น stateless: ไม่มี handshake ไม่มี session ทุก request ประกาศ version และ capability ของตัวเองใน `_meta`, `server/discover` ตอบคำถาม "รองรับอะไรบ้าง" ใน round trip เดียว, version ไม่ตรงกันจะโผล่เป็น `-32022` พร้อมรายการ `supported` และ state ข้าม request อยู่ใน handle ที่ชัดเจนซึ่ง model ส่งกลับมา
+</Callout>
+
+export const quizDiscovery = [
+  {
+    q: 'string ของ protocol version 2026-07-28 บอกอะไร?',
+    options: [
+      'วันที่ปล่อย SDK',
+      'วันที่ล่าสุดที่มีการเปลี่ยนแปลงแบบ backwards-incompatible กับ protocol',
+      'build number ของ server',
+      'วันหมดอายุของ specification',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'server รุ่นใหม่รู้ capability ของ client ได้อย่างไร?',
+    options: [
+      'จาก handshake initialize ตอนเริ่ม connection',
+      'จาก header Mcp-Session-Id',
+      'จาก _meta บนทุก request',
+      'มันถาม client ด้วย capabilities/get',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'server ตอบ error -32022 พร้อม data.supported client ควรทำอย่างไร?',
+    options: [
+      'ถอยไปใช้ transport แบบ HTTP+SSE',
+      'retry request โดยประกาศหนึ่งใน version ที่รองรับ หรือรายงาน error ถ้าไม่มีตัวไหนตรง',
+      'ส่ง initialize',
+      'ไม่สนใจแล้วทำต่อ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'server ต้องเก็บตะกร้าสินค้าข้ามหลาย tool call spec แนะนำอะไร?',
+    options: [
+      'ใช้ connection เป็นขอบเขตของ session',
+      'return handle ที่ชัดเจนจาก tool ที่สร้าง แล้วรับมันเป็น argument ใน call ต่อ ๆ ไป',
+      'เก็บตะกร้าใน _meta ของ client',
+      'ส่ง Mcp-Session-Id',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/discovery-and-versioning" questions={quizDiscovery} />
+
+<ProgressTracker client:visible id="mcp-foundations/discovery-and-versioning" />

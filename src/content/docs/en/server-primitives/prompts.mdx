@@ -1,0 +1,250 @@
+---
+title: 'Prompts'
+description: 'User-controlled prompt templates — listing and fetching them with arguments, the message and content types they return, argument completion, and when a prompt is the right primitive.'
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## A workflow the user invokes
+
+A **prompt** is a reusable message template the server offers and the *user* chooses to run. The typical UI is a slash command: the user types `/code_review`, the host asks for the arguments, calls `prompts/get`, and injects the returned messages into the conversation.
+
+"User-controlled" describes who decides *when* the prompt is used — not who wrote it. The server authors the content; the person triggers it. That distinction is why prompts are safe to make powerful: they can encode your team's review checklist, a debugging playbook, or a few-shot example set, and they only run when someone asks.
+
+<Mermaid title="Slash command to messages" code={promptFlow} />
+
+export const promptFlow = `sequenceDiagram
+  participant U as User
+  participant C as Host
+  participant S as Server
+  C->>S: prompts/list
+  S-->>C: prompts[] shown as slash commands
+  U->>C: /code_review code=...
+  C->>S: prompts/get name=code_review arguments
+  S-->>C: messages[]
+  C->>U: messages injected into the conversation`;
+
+## `prompts/list`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "prompts": [
+      {
+        "name": "code_review",
+        "title": "Request Code Review",
+        "description": "Asks the LLM to analyze code quality and suggest improvements",
+        "arguments": [
+          { "name": "code", "description": "The code to review", "required": true },
+          { "name": "language", "description": "Programming language", "required": false }
+        ]
+      }
+    ],
+    "nextCursor": "next-page-cursor",
+    "ttlMs": 600000,
+    "cacheScope": "public"
+  }
+}
+```
+
+A prompt has a `name`, optional `title` and `description`, optional `icons`, and an optional list of `arguments`, each with a name, description, and `required` flag. Arguments are always strings on the wire — the host collects them from the user as text.
+
+## `prompts/get`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "prompts/get",
+  "params": { "name": "code_review", "arguments": { "code": "def hello():\n    print('world')" } }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "description": "Code review prompt",
+    "messages": [
+      {
+        "role": "user",
+        "content": { "type": "text", "text": "Please review this Python code:\ndef hello():\n    print('world')" }
+      }
+    ]
+  }
+}
+```
+
+`messages` is an ordered list of `PromptMessage` objects, each with a `role` of `user` or `assistant` and a single `content` block. Because you control the whole sequence, you can return a *conversation*, not just one instruction — a system-style framing as the first user message, an assistant message showing the expected format, then the user's actual input.
+
+Like the other act methods, `prompts/get` **MAY** return an `InputRequiredResult` when the server needs to elicit something before it can build the messages.
+
+### Content types in messages
+
+| `type` | Fields | Use for |
+|--------|--------|---------|
+| `text` | `text` | Instructions, few-shot examples |
+| `image` | `data` (base64), `mimeType` | A screenshot to critique, a design mock |
+| `audio` | `data` (base64), `mimeType` | Audio to transcribe or discuss |
+| `resource_link` | `uri`, `name`, `description`, `mimeType` | Point at a resource the host can fetch |
+| `resource` | `resource: { uri, mimeType, text or blob }` | Embed a document, schema, or code sample inline |
+
+Embedded resources are the strongest feature here: a `db_query_help` prompt can embed the live database schema so the model does not have to guess table names. All content blocks support the usual `annotations` (`audience`, `priority`, `lastModified`).
+
+## Implementing prompts
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer, completable } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    const server = new McpServer({ name: 'review', version: '1.0.0' });
+
+    server.registerPrompt(
+      'code_review',
+      {
+        title: 'Request Code Review',
+        description: 'Asks the LLM to analyze code quality and suggest improvements',
+        argsSchema: z.object({
+          code: z.string().describe('The code to review'),
+          language: completable(z.string().describe('Programming language'), (value) =>
+            ['typescript', 'javascript', 'python', 'rust', 'go'].filter((l) => l.startsWith(value)),
+          ),
+        }),
+      },
+      ({ code, language }) => ({
+        messages: [
+          {
+            role: 'user' as const,
+            content: {
+              type: 'text' as const,
+              text: `Review this ${language} code. Check correctness first, then readability.\n\n${code}`,
+            },
+          },
+        ],
+      }),
+    );
+    ```
+    `argsSchema` drives the `arguments` list in `prompts/list`; wrapping a field in `completable(...)` makes the server answer `completion/complete` for it.
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("review")
+
+
+    @mcp.prompt(title="Request Code Review")
+    def code_review(code: str, language: str = "python") -> str:
+        """Asks the LLM to analyze code quality and suggest improvements."""
+        return f"Review this {language} code. Check correctness first, then readability.\n\n{code}"
+    ```
+    Function parameters become prompt `arguments` (defaults make them optional). Returning a `str` yields a single user text message; return a list of message objects when you need a multi-turn or multi-modal prompt.
+  </TabItem>
+</Tabs>
+
+## Argument completion
+
+Hosts call `completion/complete` as the user types an argument value, so the picker can suggest valid entries:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "completion/complete",
+  "params": {
+    "ref": { "type": "ref/prompt", "name": "code_review" },
+    "argument": { "name": "language", "value": "py" }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": { "resultType": "complete", "completion": { "values": ["python"], "hasMore": false } }
+}
+```
+
+The same request with `"type": "ref/resource"` and a `uri` template completes [resource template](/mcp/en/server-primitives/resources/) variables. Completion is a `completions` server capability; declare it if you implement it.
+
+## Designing good prompts
+
+Prompts shine when a task is *repeated* and has a *known good shape*. Some patterns:
+
+- **Checklists.** "Release readiness review" that walks through tests, changelog, migration notes — as a numbered list the model must address in order.
+- **Few-shot sets.** Two or three worked examples of the output format you want, as alternating user/assistant messages, followed by the real input.
+- **Grounded prompts.** Embed a resource (schema, style guide, glossary) so the model works from the source of truth instead of memory.
+- **Parameterized playbooks.** `incident_triage(service, severity)` that pulls the right runbook section for that service.
+
+When is a prompt the *wrong* choice?
+
+| Situation | Use instead |
+|-----------|-------------|
+| The model should decide when to do it | A [tool](/mcp/en/server-primitives/tools/) |
+| It is just data with no instructions | A [resource](/mcp/en/server-primitives/resources/) |
+| It needs to *do* something (write, call an API) | A tool — prompts only produce messages |
+
+A prompt never executes anything. If your "prompt" needs to fetch live data, have it embed a resource or tell the model which tool to call next.
+
+## Errors and validation
+
+- Unknown prompt name → `-32602` (Invalid params).
+- Missing required argument → `-32602`.
+- Internal failure → `-32603`.
+
+Servers SHOULD validate arguments before building messages, and — since arguments are user-supplied text that ends up in the model's context — treat them as untrusted input. Do not let an argument break out of the framing you intended (for example, by interpolating it into a place where it can masquerade as an assistant turn).
+
+<Callout title="The one-line takeaway">
+A prompt is a user-triggered template that returns a list of messages — text, images, audio, or embedded resources — built from string arguments the host collects, optionally auto-completed via `completion/complete`. Use prompts for repeated workflows with a known shape; use tools when the model must decide, and resources when it is only data.
+</Callout>
+
+export const quizPrompts = [
+  {
+    q: 'In the prompts interaction model, who decides WHEN a prompt is used?',
+    options: [
+      'The language model',
+      'The user, explicitly (for example via a slash command)',
+      'The server, on a timer',
+      'The authorization server',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which method lets a host suggest valid values for a prompt argument as the user types?',
+    options: [
+      'prompts/suggest',
+      'completion/complete',
+      'prompts/get with a partial argument',
+      'resources/templates/list',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A team wants a "/deploy" command that actually triggers a deployment. What is the right primitive?',
+    options: [
+      'A prompt — slash commands are prompts',
+      'A tool — prompts only produce messages and cannot perform actions',
+      'A resource with a deploy:// scheme',
+      'A subscription',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/prompts" questions={quizPrompts} />
+
+<ProgressTracker client:visible id="server-primitives/prompts" />

@@ -1,0 +1,109 @@
+---
+title: 'Building Clients and Hosts'
+description: 'What a host owns versus what a client owns, why there is one client per server, and how the LLM loop, consent UI, and tool registry fit together.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The other half of the protocol
+
+So far this course has mostly looked at MCP from the server side: how to expose tools, resources, and prompts. This module flips the viewpoint. If you are building an AI application — an IDE assistant, a chat product, an autonomous agent — you are building a **host**, and inside that host you will create one **client** per server you connect to.
+
+The distinction matters because the protocol assigns them different jobs:
+
+- A **client** is a protocol object. It speaks JSON-RPC to exactly one server over one transport, sends `_meta` on every request, and turns wire results into typed values.
+- A **host** is the application. It owns the language model, the conversation, the user interface, the consent decisions, and the registry that merges tools from many clients into one list the model can see.
+
+<Mermaid title="One host, many clients, one client per server" code={hostDiagram} />
+
+export const hostDiagram = `flowchart LR
+  subgraph host["Host (your AI app)"]
+    llm["LLM loop"]
+    ui["Consent UI"]
+    reg["Tool registry"]
+    c1["Client 1"]
+    c2["Client 2"]
+    c3["Client 3"]
+  end
+  s1["Server A (stdio, local)"]
+  s2["Server B (HTTP, remote)"]
+  s3["Server C (HTTP, remote)"]
+  c1 --- s1
+  c2 --- s2
+  c3 --- s3
+  reg --> llm
+  ui --> llm`;
+
+## Why one client per server
+
+MCP is stateless: every request carries its protocol version, client capabilities, and client identity. There is still a good reason to keep one client object per server — each server has its own transport (a subprocess or an HTTP origin), its own discovered capabilities, its own credentials, and its own tool names. Bundling several servers behind one client would force the host to disambiguate all of that at every call. Keeping them separate lets the host treat a server as a unit it can connect, disconnect, and revoke independently.
+
+The host is where the merging happens. It asks each client for `tools/list`, prefixes or otherwise namespaces the names to avoid collisions (two servers can both expose `search`), and hands the combined list to the model.
+
+## What the host owns
+
+| Concern | Who | Why it lives there |
+|---------|-----|--------------------|
+| Speaking JSON-RPC, adding `_meta`, parsing results | Client | Purely mechanical; one per transport |
+| Deciding which server a tool call goes to | Host | Only the host sees all servers |
+| Calling the LLM and running the tool loop | Host | The protocol never talks to a model |
+| Asking the user before a destructive tool runs | Host | The spec says a human should be able to deny any call |
+| Rendering elicitation forms and URL consent | Host | It owns the UI |
+| Holding OAuth tokens and API keys | Host | Credentials must never reach the model or a sandbox |
+| Caching `tools/list` by `ttlMs`, refreshing on `list_changed` | Host | Cross-request policy |
+
+## What this module covers
+
+| Lesson | You will learn |
+|--------|----------------|
+| [Writing a Client](/mcp/en/building-clients/writing-a-client/) | Connect over stdio or HTTP, list and call tools, read resources, answer elicitation |
+| [Wiring Tools to an LLM](/mcp/en/building-clients/wiring-tools-to-an-llm/) | Turn `tools/list` into model tool definitions and run the agent loop |
+| [Using Servers in Real Hosts](/mcp/en/building-clients/using-servers-in-hosts/) | Claude Code, Claude Desktop, the Claude API MCP connector, the Inspector |
+| [Scaling Tools](/mcp/en/building-clients/scaling-tools/) | Progressive discovery, caching, and programmatic tool calling |
+| [Client Security Duties](/mcp/en/building-clients/client-security-duties/) | What a well-behaved client must do to protect its user |
+
+<Callout title="The one-line takeaway">
+A client is the wire: one per server, stateless, mechanical. A host is the application: it runs the model, merges tools from every client into one registry, and is the place where the user says yes or no.
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'How many MCP clients does a host typically create?',
+    options: [
+      'One for the whole application',
+      'One per server it connects to',
+      'One per tool',
+      'One per user message',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which of these is the host responsible for, not the client?',
+    options: [
+      'Adding the _meta fields to a request',
+      'Parsing a JSON-RPC error response',
+      'Deciding which server receives a given tool call and asking the user for consent',
+      'Encoding a newline-delimited message on stdio',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Why does a host namespace tool names (for example server__tool)?',
+    options: [
+      'The spec requires it',
+      'Two servers can each expose a tool with the same name, and the host must route unambiguously',
+      'It makes tool calls faster',
+      'It is needed for OAuth',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="building-clients/index" />

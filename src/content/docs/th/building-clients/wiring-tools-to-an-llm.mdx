@@ -1,0 +1,288 @@
+---
+title: 'Wiring MCP Tools to an LLM'
+description: 'แปลง tools/list เป็น tool definition ของ model, รัน agent loop ที่ route tool_use block ไปยัง server ที่ถูกต้อง และคืน tool_result ทุกตัวเพื่อให้ model ลงมือทำและแก้ตัวเองได้'
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## protocol จบแค่ tool list
+
+MCP บอกวิธี discover และเรียก tool แต่ไม่พูดถึง language model เลย สะพานเชื่อมระหว่างสองฝั่งคือโค้ดของ host ที่คุณต้องเขียนเอง: แปลง tool definition ของ MCP ให้เป็นรูปแบบที่ model provider ของคุณต้องการ, ให้ model เลือก tool, route call ไปยัง client ที่ถูกต้อง แล้วส่งผลลัพธ์กลับไป นี่คือ **agent loop** และ MCP host ทุกตัวมีมัน
+
+<Mermaid title="agent loop ภายใน host" code={loopDiagram} />
+
+export const loopDiagram = `sequenceDiagram
+  participant U as User
+  participant H as Host
+  participant M as LLM
+  participant C as MCP client
+  participant S as MCP server
+  U->>H: message
+  H->>C: tools/list (ครั้งเดียว, cache ไว้)
+  C->>S: tools/list
+  S-->>C: tools[]
+  H->>M: messages + tool definitions
+  M-->>H: tool_use (name, input)
+  H->>H: ถามผู้ใช้ไหม? (annotations)
+  H->>C: callTool(name, input)
+  C->>S: tools/call
+  S-->>C: content[], isError
+  H->>M: tool_result blocks
+  M-->>H: final text
+  H-->>U: answer`;
+
+## ขั้นที่ 1: map tool definition
+
+tool ของ MCP มี `name`, `description` และ `inputSchema` ที่เป็น JSON Schema ส่วน Anthropic Messages API ต้องการ `name`, `description` และ `input_schema` การ map แทบจะเป็นแค่เปลี่ยนชื่อ แต่การตัดสินใจสำคัญของ host คือ **namespace**: ใส่ prefix ชื่อ server ให้ทุก tool เพื่อไม่ให้ server สองตัวที่เปิด `search` ทั้งคู่ชนกัน และเพื่อให้ route call กลับไปถูกที่ทีหลัง
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import type Anthropic from '@anthropic-ai/sdk';
+    import type { Client } from '@modelcontextprotocol/client';
+
+    type Route = { client: Client; toolName: string };
+    const routes = new Map<string, Route>();
+
+    async function collectTools(servers: Record<string, Client>): Promise<Anthropic.Tool[]> {
+      const defs: Anthropic.Tool[] = [];
+      for (const [serverName, client] of Object.entries(servers)) {
+        const { tools } = await client.listTools();
+        for (const t of tools) {
+          const name = `${serverName}__${t.name}`;
+          routes.set(name, { client, toolName: t.name });
+          defs.push({
+            name,
+            description: t.description ?? '',
+            input_schema: t.inputSchema as Anthropic.Tool.InputSchema,
+          });
+        }
+      }
+      return defs;
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+
+    routes: dict[str, tuple[Client, str]] = {}
+
+    async def collect_tools(servers: dict[str, Client]) -> list[dict]:
+        defs: list[dict] = []
+        for server_name, client in servers.items():
+            listing = await client.list_tools()
+            for t in listing.tools:
+                name = f"{server_name}__{t.name}"
+                routes[name] = (client, t.name)
+                defs.append({
+                    "name": name,
+                    "description": t.description or "",
+                    "input_schema": t.input_schema,
+                })
+        return defs
+    ```
+  </TabItem>
+</Tabs>
+
+รักษาลำดับ tool ให้ **คงที่** ระหว่างแต่ละ turn server ถูกขอให้คืน `tools/list` ในลำดับที่ deterministic ก็เพราะเหตุผลนี้: array `tools` เป็นส่วนหนึ่งของ prompt prefix ที่ถูก cache การสลับลำดับทำให้ cache หลุด
+
+## ขั้นที่ 2: map tool result
+
+result ของ MCP คือ array `content` ของ block (`text`, `image`, `audio`, `resource_link`, `resource`) บวกกับ `structuredContent` และ `isError` ที่อาจมี ส่วน block `tool_result` ของ Messages API รับ content แบบ text และ image แปลงสิ่งที่ map ได้ สรุปสิ่งที่ map ไม่ได้ และที่สำคัญมาก ส่ง `isError` ต่อไปเป็น `is_error` เพื่อให้ model รู้ว่าต้องลองใหม่
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    function toToolResult(
+      toolUseId: string,
+      result: Awaited<ReturnType<Client['callTool']>>,
+    ): Anthropic.ToolResultBlockParam {
+      const content: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
+      for (const block of result.content as any[]) {
+        if (block.type === 'text') content.push({ type: 'text', text: block.text });
+        else if (block.type === 'image')
+          content.push({ type: 'image', source: { type: 'base64', media_type: block.mimeType, data: block.data } });
+        else content.push({ type: 'text', text: `[${block.type}] ${block.uri ?? ''}` });
+      }
+      return { type: 'tool_result', tool_use_id: toolUseId, content, is_error: result.isError === true };
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.types import ImageContent, TextContent
+
+    def to_tool_result(tool_use_id: str, result) -> dict:
+        content = []
+        for block in result.content:
+            if isinstance(block, TextContent):
+                content.append({"type": "text", "text": block.text})
+            elif isinstance(block, ImageContent):
+                content.append({"type": "image", "source": {
+                    "type": "base64", "media_type": block.mime_type, "data": block.data}})
+            else:
+                content.append({"type": "text", "text": f"[{block.type}] {getattr(block, 'uri', '')}"})
+        return {"type": "tool_result", "tool_use_id": tool_use_id,
+                "content": content, "is_error": bool(result.is_error)}
+    ```
+  </TabItem>
+</Tabs>
+
+## ขั้นที่ 3: ตัว loop
+
+เรียก model ถ้ามันหยุดด้วย `tool_use` ให้รัน `tool_use` block **ทุกตัว** ใน turn นั้น (อาจมาแบบขนาน), รวบรวมผลลัพธ์ แล้วคืนทั้งหมดใน user message **เดียว** การแยกผลลัพธ์ออกเป็นหลาย message จะสอน model เงียบ ๆ ให้เลิกเรียกแบบขนาน วน loop จนกว่า stop reason จะเป็นอย่างอื่น
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import Anthropic from '@anthropic-ai/sdk';
+
+    const anthropic = new Anthropic();
+
+    async function runAgent(userText: string, tools: Anthropic.Tool[]) {
+      const messages: Anthropic.MessageParam[] = [{ role: 'user', content: userText }];
+
+      while (true) {
+        const response = await anthropic.messages.create({
+          model: 'claude-opus-5',
+          max_tokens: 16000,
+          tools,
+          messages,
+        });
+        messages.push({ role: 'assistant', content: response.content });
+
+        if (response.stop_reason !== 'tool_use') return response;
+
+        const uses = response.content.filter((b): b is Anthropic.ToolUseBlock => b.type === 'tool_use');
+        const results = await Promise.all(
+          uses.map(async (use) => {
+            const route = routes.get(use.name)!;
+            if (!(await userApproves(use))) {
+              return { type: 'tool_result', tool_use_id: use.id, content: 'User denied this call.', is_error: true } as const;
+            }
+            const result = await route.client.callTool({ name: route.toolName, arguments: use.input as Record<string, unknown> });
+            return toToolResult(use.id, result);
+          }),
+        );
+        messages.push({ role: 'user', content: results }); // ผลลัพธ์ทั้งหมด ใน message เดียว
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import anthropic
+
+    client = anthropic.Anthropic()
+
+    async def run_agent(user_text: str, tools: list[dict]):
+        messages = [{"role": "user", "content": user_text}]
+
+        while True:
+            response = client.messages.create(
+                model="claude-opus-5",
+                max_tokens=16000,
+                tools=tools,
+                messages=messages,
+            )
+            messages.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason != "tool_use":
+                return response
+
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                mcp_client, tool_name = routes[block.name]
+                if not await user_approves(block):
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": "User denied this call.", "is_error": True})
+                    continue
+                result = await mcp_client.call_tool(tool_name, dict(block.input))
+                results.append(to_tool_result(block.id, result))
+
+            messages.append({"role": "user", "content": results})  # ผลลัพธ์ทั้งหมด ใน message เดียว
+    ```
+  </TabItem>
+</Tabs>
+
+มีสองรายละเอียดที่พลาดง่าย อย่างแรก ให้ parse `tool_use.input` เป็นข้อมูล JSON เสมอ อย่า match string จากรูปแบบที่ serialize มา อย่างที่สอง เมื่อผู้ใช้ปฏิเสธ call ก็ยังต้องคืน `tool_result` สำหรับ `tool_use_id` นั้น (ติด `is_error`) เพื่อให้บทสนทนายังอยู่ในรูปแบบที่ถูกต้อง และ model อธิบายหรือเลือกทางอื่นได้
+
+## consent อยู่ตรงไหน
+
+spec ขอให้ host มีมนุษย์อยู่ใน loop ที่มีอำนาจปฏิเสธ invocation ใดก็ได้ `annotations` ของ tool คือสัญญาณที่ถูกที่สุดที่คุณมี:
+
+| Annotation | policy ที่สมเหตุสมผลสำหรับ host |
+|------------|------------------------|
+| `readOnlyHint: true` | อนุมัติอัตโนมัติ แสดงใน log |
+| `destructiveHint: true` | ถามเสมอ แสดง argument แบบเป๊ะ ๆ |
+| `idempotentHint: true` | retry ได้อย่างปลอดภัยหลัง timeout |
+| `openWorldHint: true` | เตือนว่า tool นี้ไปแตะระบบภายนอก |
+
+annotation เป็น **hint จาก server** และ spec บอกให้มองว่าไว้ใจไม่ได้ เว้นแต่ server นั้นเป็นที่ไว้ใจ server ที่ประสงค์ร้ายสามารถติดป้าย tool ที่ทำลายข้อมูลว่า read-only ได้ ใช้ annotation เพื่อลดความยุ่งยากกับ server ที่คุณไว้ใจ แต่อย่าใช้เป็นด่านเดียวกับ server ที่ไม่ไว้ใจ
+
+## ข้อคิดด้านการออกแบบ
+
+- **cache `tools/list`** เคารพ `ttlMs` และ refresh เมื่อ `notifications/tools/list_changed` มาถึงบน stream `subscriptions/listen` ของคุณ
+- **จำกัดงบของ tool output** tool ที่คืน JSON 200 KB จะกิน context window หมด ให้ตัดหรือสรุปฝั่ง host และเลือกใช้ `structuredContent` เมื่อ tool มี `outputSchema`
+- **จำกัดเวลาทุก call** ตั้ง timeout ต่อ `tools/call` เมื่อ timeout ให้คืน result แบบ `is_error` แทนที่จะปล่อย loop ค้าง
+- **log ไว้เพื่อ audit** บันทึกว่า server ไหนรัน tool อะไรด้วย argument อะไร เพราะ server อาจเป็นของบุคคลที่สาม
+
+<Callout title="สรุปหนึ่งบรรทัด">
+agent loop คือโค้ดของ host: เปลี่ยนชื่อ `inputSchema` เป็น `input_schema`, ใส่ namespace ตาม server, ให้ model เลือก, route `tool_use` แต่ละตัวไปยัง client ของมัน, รัน call แบบขนานพร้อมกัน แล้วคืน `tool_result` ทุกตัว (รวม error) ใน user message เดียว จนกว่า model จะเลิกขอ tool
+</Callout>
+
+export const quizLoop = [
+  {
+    q: 'เมื่อ model คืน tool_use block สามตัวใน turn เดียว host ควรคืนผลลัพธ์อย่างไร?',
+    options: [
+      'user message แยกสามอัน อันละหนึ่งผลลัพธ์',
+      'user message เดียวที่มี tool_result block ทั้งสามตัว',
+      'เฉพาะผลลัพธ์แรก ทิ้งที่เหลือ',
+      'เป็น string เดียวที่ต่อกัน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมต้องใส่ prefix ชื่อ server ให้ชื่อ tool ของ MCP ก่อนส่งให้ model?',
+    options: [
+      'Messages API ปฏิเสธชื่อที่ไม่มี prefix',
+      'เพื่อกันการชนกันระหว่าง server และเพื่อ route call กลับไปยัง client ที่ถูกต้อง',
+      'เพื่อให้ tool เรียงตามตัวอักษร',
+      'เพราะ MCP บังคับ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'tool คืน isError: true พร้อมข้อความ "quantity must be positive" host ควรทำอย่างไร?',
+    options: [
+      'throw exception แล้วจบบทสนทนา',
+      'คืนให้ model เป็น tool_result ที่มี is_error เพื่อให้ model แก้ argument ได้',
+      'retry call เดิมสามครั้ง',
+      'ทิ้งเงียบ ๆ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'host ควรปฏิบัติกับ tool จาก server ที่ไม่รู้จัก ซึ่ง annotation บอกว่า readOnlyHint: true อย่างไร?',
+    options: [
+      'ไว้ใจเต็มที่และรันอัตโนมัติโดยไม่ log อะไรเลย',
+      'มอง annotation เป็น hint ที่ไว้ใจไม่ได้ มันอาจลดความยุ่งยากกับ server ที่ไว้ใจ แต่ไม่ใช่ด่าน security',
+      'ปฏิเสธที่จะ list tool นั้น',
+      'แปลงมันเป็น resource',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/wiring-tools-to-an-llm" questions={quizLoop} />
+
+<ProgressTracker client:visible id="building-clients/wiring-tools-to-an-llm" />

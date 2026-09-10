@@ -1,0 +1,301 @@
+---
+title: 'Elicitation'
+description: 'ขอข้อมูลหรือ consent จากผู้ใช้จากภายใน tool — form mode กับ schema subset ที่จงใจทำให้เล็ก, URL mode สำหรับสิ่งที่อ่อนไหว, response action สามแบบ และกฎ UI ฝั่ง client ที่ทำให้มันปลอดภัย'
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## elicitation คืออะไร
+
+**Elicitation** ให้ server ถาม *ผู้ใช้* ได้กลางคันของ tool call, resource read หรือ prompt fetch มันเป็น client feature ตัวเดียวที่รอดจากการ deprecate ใน 2026-07-28 แบบไม่ถูกแตะ เพราะเป็นสิ่งเดียวที่ server ทำเองไม่ได้จริง ๆ: การให้คนตัดสินใจ
+
+มีสอง mode:
+
+- **Form mode** — server อธิบาย form เล็ก ๆ client render ให้ ผู้ใช้กรอก แล้วข้อมูลวิ่งกลับมาผ่าน client เหมาะกับตัวเลือก, การยืนยัน, ชื่อ, วันที่
+- **URL mode** — server ยื่น URL มา client ขอ consent จากผู้ใช้แล้วเปิดให้ อะไรที่เกิดขึ้นในนั้น **client มองไม่เห็นเลย** จำเป็นสำหรับ secret, การจ่ายเงิน และ OAuth กับ third party
+
+ภายใต้ MRTR ทั้งสอง mode ถูกส่งมาเป็น entry `elicitation/create` ใน `inputRequests` และตอบกลับใน `inputResponses` ตอน retry (ดู [MRTR](/mcp/th/client-interaction/multi-round-trip-requests/))
+
+## การประกาศ capability
+
+client ที่รองรับ elicitation ต้องบอกใน **ทุก request** ผ่าน `_meta`:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/clientCapabilities": {
+      "elicitation": { "form": {}, "url": {} }
+    }
+  }
+}
+```
+
+`"elicitation": {}` ว่างเปล่าหมายถึง *form mode เท่านั้น* (เพื่อ backward compatibility) client ที่ประกาศ capability นี้ต้องรองรับอย่างน้อยหนึ่ง mode และ server ห้ามส่ง mode ที่ client ไม่ได้ประกาศ
+
+## Form mode
+
+form request มี `mode: "form"` (หรือไม่ใส่ `mode` ซึ่งมีความหมายเดียวกัน), `message` ที่คนอ่านรู้เรื่อง และ `requestedSchema`
+
+<Mermaid title="Form mode ภายใต้ MRTR" code={formDiagram} />
+
+export const formDiagram = `sequenceDiagram
+  participant U as User
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (id 1)
+  S-->>C: input_required: elicitation/create mode form
+  C->>U: render form จาก requestedSchema
+  U-->>C: กรอกแล้วกด submit
+  C->>S: tools/call (id 2, inputResponses)
+  S-->>C: final result`;
+
+### schema ถูกจำกัดให้เล็กโดยตั้งใจ
+
+`requestedSchema` **ไม่ใช่** JSON Schema อะไรก็ได้ เพื่อให้ form ฝั่ง client เรียบง่ายและคาดเดาได้ มันถูกจำกัดให้เป็น object แบน ๆ ที่ property เป็น primitive เท่านั้น:
+
+| ชนิด | keyword ที่ใช้ได้ |
+|------|------------------|
+| string | `title`, `description`, `minLength`, `maxLength`, `default`, `format` ∈ `email`, `uri`, `date`, `date-time` |
+| number / integer | `title`, `description`, `minimum`, `maximum`, `default` |
+| boolean | `title`, `description`, `default` |
+| enum เลือกได้หนึ่ง | `type: "string"` กับ `enum: [...]` หรือตัวเลือกแบบมี title ผ่าน `oneOf: [{ const, title }]` |
+| enum เลือกได้หลาย | `type: "array"` กับ `items.enum` หรือแบบมี title ผ่าน `items.anyOf: [{ const, title }]` บวก `minItems` / `maxItems` |
+
+ไม่มี nested object, ไม่มี array ของ object, ไม่มี `$ref`, ไม่มี conditional ถ้าต้องการมากกว่านี้ ให้แตกเป็นหลายคำถาม หรือย้ายไปไว้ใน `inputSchema` ของ tool เอง
+
+```json
+{
+  "method": "elicitation/create",
+  "params": {
+    "mode": "form",
+    "message": "Confirm the deployment",
+    "requestedSchema": {
+      "type": "object",
+      "properties": {
+        "environment": {
+          "type": "string",
+          "title": "Environment",
+          "oneOf": [
+            { "const": "stg", "title": "Staging" },
+            { "const": "prd", "title": "Production" }
+          ],
+          "default": "stg"
+        },
+        "notify": { "type": "boolean", "title": "Notify the on-call channel", "default": true },
+        "window": { "type": "string", "format": "date-time", "title": "Deploy at" }
+      },
+      "required": ["environment"]
+    }
+  }
+}
+```
+
+client ที่รองรับ default ควรเติมค่าให้ล่วงหน้า server ควร validate สิ่งที่ได้กลับมากับ schema — client ควรทำอยู่แล้ว แต่คุณคือ trust boundary
+
+### ห้ามขอ secret ผ่าน form
+
+spec ฟันธงชัด: server **ห้าม** ใช้ form mode กับ password, API key, access token หรือข้อมูลการชำระเงิน ข้อมูลใน form ผ่านมือ client อาจถูก log และ LLM อาจเห็น ส่วนชื่อ อีเมล username นั้นให้ server ใช้ดุลยพินิจ อะไรก็ตามที่ *ให้สิทธิ์เข้าถึง* ต้องไปทาง URL mode
+
+## URL mode
+
+URL request มี `mode: "url"`, `message` และตัว `url` เอง:
+
+```json
+{
+  "method": "elicitation/create",
+  "params": {
+    "mode": "url",
+    "url": "https://mcp.example.com/connect/github?flow=8f1c…",
+    "message": "Connect your GitHub account to continue."
+  }
+}
+```
+
+flow ต่างจาก form mode ในจุดสำคัญจุดเดียว: **`accept` แปลว่าผู้ใช้ยินยอมให้เปิด URL — ไม่ได้แปลว่าการโต้ตอบเสร็จแล้ว**
+
+<Mermaid title="URL mode: client รู้แค่ว่าผู้ใช้ยินยอม นอกนั้นไม่รู้อะไรเลย" code={urlDiagram} />
+
+export const urlDiagram = `sequenceDiagram
+  participant B as Browser
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (id 1)
+  S-->>C: input_required: elicitation/create mode url, requestState
+  C->>C: แสดง URL เต็ม ขอ consent
+  C->>B: เปิด URL
+  C->>S: tools/call (id 2, accept, requestState)
+  B->>S: ผู้ใช้ทำ flow จนจบแบบ out of band
+  Note over S: เช็คผ่าน requestState ว่าเสร็จหรือยัง
+  S-->>C: final result หรือ input_required อีกรอบ`;
+
+ตอน retry server ดู `requestState` ที่ถูกส่งคืน (หรือ state ที่ตัวเองเก็บไว้) เพื่อตัดสินว่างาน out-of-band เสร็จหรือยัง ถ้ายัง ก็ return `InputRequiredResult` อีกอัน แล้ว client ค่อยลองใหม่ทีหลัง — client ควรมีปุ่ม retry และ cancel ให้ผู้ใช้กดเองสำหรับกรณีนี้โดยเฉพาะ
+
+URL mode *ไม่ใช่* วิธีที่ client ใช้ authorize กับ MCP server เอง อันนั้นคือ [OAuth flow](/mcp/th/security-and-auth/oauth-flow/) URL mode มีไว้ให้ server ไปเอาอะไรบางอย่างในนามของผู้ใช้ — token ของ third party, API key ที่พิมพ์ลงหน้าเว็บที่ server ควบคุม, การจ่ายเงิน credential พวกนี้ห้ามผ่าน client เด็ดขาด
+
+## action สามแบบ
+
+ผลลัพธ์ elicitation ทุกอัน ไม่ว่า mode ไหน มี `action`:
+
+| `action` | ความหมาย | `content` |
+|----------|---------|-----------|
+| `accept` | ผู้ใช้อนุมัติ / submit อย่างชัดเจน | มีใน form mode ไม่มีใน URL mode |
+| `decline` | ผู้ใช้ปฏิเสธอย่างชัดเจน | ไม่มี |
+| `cancel` | ผู้ใช้ปิดทิ้งโดยไม่ได้เลือก (ปิด dialog, กด Escape, หน้าเว็บโหลดไม่ขึ้น) | ไม่มี |
+
+รับมือให้ครบทั้งสาม `decline` มักแปลว่า "เสนอทางเลือกอื่นหรือหยุด" ส่วน `cancel` มักแปลว่า "ถามใหม่ทีหลังได้" ห้ามตีความ `content` ที่หายไปว่าเป็น form ว่างที่ถูก submit
+
+## กฎ UI ฝั่ง client
+
+เพราะ elicitation เอาคำพูดของ server ไปวางตรงหน้าผู้ใช้ client จึงมีภาระหน้าที่:
+
+- ทำให้ **ชัดเจนว่า server ไหน** เป็นคนถาม
+- มีปุ่ม **decline และ cancel** ที่ชัดเจน
+- ใน form mode ให้ผู้ใช้ **ตรวจและแก้** ก่อนส่ง
+- ใน URL mode: แสดง **URL เต็ม** ก่อนขอ consent, เน้น domain ให้เห็น, เตือนเมื่อเจอ Punycode หรือ host น่าสงสัย, **ห้าม prefetch**, ห้ามเปิดโดยไม่ได้ consent ชัดเจน และเปิดด้วยวิธีที่ client กับ LLM แอบดูข้างในไม่ได้ (system browser หรือ `SFSafariViewController` ไม่ใช่ web view ฝังในแอป)
+- ห้าม render URL เป็น link กดได้ในส่วนใด ๆ ของ elicitation *ยกเว้น* field `url` ของ request แบบ URL mode
+
+ฝั่ง server ก็เช่นกัน ห้ามฝัง credential หรือ PII ใน URL, ห้ามแจก link ที่ pre-authenticate มาแล้ว และต้องตรวจสอบว่าคนที่เปิด URL คือผู้ใช้คนเดียวกับที่ trigger elicitation (กรณี phishing อยู่ใน [Security](/mcp/th/security-and-auth/third-party-auth-and-url-elicitation/))
+
+## ในโค้ด
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Server: ถามจากภายใน tool handler
+    server.registerTool(
+      'collect_feedback',
+      { description: 'Ask how something went', inputSchema: z.object({ topic: z.string() }) },
+      async ({ topic }, ctx) => {
+        const result = await ctx.mcpReq.elicitInput({
+          mode: 'form',
+          message: `How was ${topic}?`,
+          requestedSchema: {
+            type: 'object',
+            properties: {
+              rating: { type: 'number', title: 'Rating (1-5)', minimum: 1, maximum: 5 },
+              comment: { type: 'string', title: 'Comment' },
+            },
+            required: ['rating'],
+          },
+        });
+        if (result.action !== 'accept') {
+          return { content: [{ type: 'text', text: `Feedback ${result.action}.` }] };
+        }
+        return { content: [{ type: 'text', text: `Recorded: ${JSON.stringify(result.content)}` }] };
+      }
+    );
+
+    // Client: ตอบ elicitation request ที่ SDK ดึงออกมาจาก inputRequests
+    client.setRequestHandler('elicitation/create', async (request) => {
+      if (request.params.mode === 'url') {
+        // แสดง URL, ขอ consent, เปิดใน system browser
+        return { action: 'accept' };
+      }
+      // render request.params.requestedSchema เป็น form
+      return { action: 'accept', content: { rating: 5, comment: 'great' } };
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from pydantic import BaseModel
+
+    from mcp import Client
+    from mcp.client import ClientRequestContext
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver import Context
+    from mcp.types import ElicitRequestParams, ElicitResult
+
+    mcp = MCPServer("feedback")
+
+
+    class Feedback(BaseModel):
+        rating: int
+        comment: str = ""
+
+
+    # Server: ถามจากภายใน tool handler
+    @mcp.tool()
+    async def collect_feedback(topic: str, ctx: Context) -> str:
+        result = await ctx.elicit(f"How was {topic}?", schema=Feedback)
+        if result.action != "accept":
+            return f"Feedback {result.action}."
+        return f"Recorded: {result.data.rating}/5 {result.data.comment!r}"
+
+
+    # Client: callback ที่ตอบ elicitation input request
+    async def on_elicit(context: ClientRequestContext, params: ElicitRequestParams) -> ElicitResult:
+        # render params.requested_schema เป็น form; ตรงนี้ตอบอัตโนมัติเพื่อเป็นตัวอย่าง
+        return ElicitResult(action="accept", content={"rating": 5, "comment": "great"})
+
+
+    async def main() -> None:
+        async with Client("http://127.0.0.1:8000/mcp", elicitation_callback=on_elicit) as client:
+            result = await client.call_tool("collect_feedback", {"topic": "the demo"})
+            print(result.content)
+    ```
+  </TabItem>
+</Tabs>
+
+## ข้อคิดด้านการออกแบบ
+
+- **ถามให้ช้าที่สุด และถามครั้งเดียว** อย่า elicit จนกว่าจะรู้แน่ว่า tool เดินต่อไม่ได้ถ้าไม่มีคำตอบ ผู้ใช้เห็นทุกคำถาม
+- **ใช้ tool argument แทน elicitation** เมื่อ LLM น่าจะให้ค่านั้นได้เอง elicitation มีไว้สำหรับการตัดสินใจที่ *มนุษย์* ต้องเป็นเจ้าของ
+- **ยังต้อง stateless อยู่** ถ้าจะเก็บอะไรเกี่ยวกับ elicitation ไว้ ให้ผูกกับตัวตนผู้ใช้ที่ verify แล้ว (`sub` ของ token) ไม่ใช่สิ่งที่ client บอกมา
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Elicitation ถามผู้ใช้ ไม่ใช่ถาม model: form mode สำหรับคำถามเล็ก ๆ ไม่ลับ schema แบน; URL mode — พร้อม consent บน URL เต็มและ client มองไม่เห็น — สำหรับทุกอย่างที่ให้สิทธิ์เข้าถึง รับมือ `accept`, `decline`, `cancel` ให้ครบ และจำไว้ว่าใน URL mode `accept` แปลแค่ว่า "ฉันจะเปิดให้"
+</Callout>
+
+export const quizElicit = [
+  {
+    q: 'ข้อไหนใช้ได้ใน requestedSchema ของ form mode?',
+    options: [
+      'property ที่เป็น nested object',
+      'array ของ object',
+      'property แบบ string ที่มี format "date-time"',
+      '$ref ไปยัง definition ที่ใช้ร่วมกัน',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'tool ต้องให้ผู้ใช้กรอก API key ของ third party ต้องใช้ mode ไหน?',
+    options: [
+      'form mode กับ string field แบบซ่อนตัวอักษร',
+      'URL mode เพื่อให้ secret ไม่ผ่านมือ client',
+      'ได้ทั้งคู่ ขอแค่ schema ระบุว่า required',
+      'ไม่ใช้ทั้งคู่ — ใส่ใน tool argument',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ใน URL mode action "accept" บอกอะไรกับ server?',
+    options: [
+      'การโต้ตอบ out-of-band เสร็จสมบูรณ์แล้ว',
+      'ผู้ใช้ยินยอมให้เปิด URL — ต้องเช็คความสำเร็จแยกต่างหาก (เช่นผ่าน requestState)',
+      'client fetch URL แล้วและมีข้อมูลอยู่ในมือ',
+      'ผู้ใช้ปฏิเสธ',
+    ],
+    answer: 1,
+  },
+  {
+    q: '"elicitation": {} ใน clientCapabilities หมายความว่าอะไร?',
+    options: [
+      'elicitation ถูกปิด',
+      'รองรับทั้ง form และ URL mode',
+      'form mode เท่านั้น (ตัวย่อเพื่อ backward compatibility)',
+      'URL mode เท่านั้น',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="client-interaction/elicitation" questions={quizElicit} />
+
+<ProgressTracker client:visible id="client-interaction/elicitation" />

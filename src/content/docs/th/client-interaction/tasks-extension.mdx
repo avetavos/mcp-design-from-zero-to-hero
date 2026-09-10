@@ -1,0 +1,246 @@
+---
+title: 'Long-Running Work: the Tasks Extension'
+description: 'เมื่อ request เปิดค้างไว้ไม่ได้ — extension io.modelcontextprotocol/tasks, task handle, การ poll ด้วย tasks/get, การส่ง input กลางทางผ่าน tasks/update และ cancellation แบบร่วมมือกัน'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ทำไมไม่ block ไปเลย?
+
+progress notification ทำให้ request ซื่อสัตย์ แต่มันยังต้องการให้ request *เปิดค้าง* อยู่ ซึ่งใช้ไม่ได้กับงานจริง:
+
+- **ตัวกลาง timeout** load balancer, gateway และเครือข่ายมือถือตัด connection ที่ idle หรือยาวเกินไปภายในไม่กี่วินาทีถึงไม่กี่นาที
+- **client crash หรือย้ายที่** ฝาแล็ปท็อปปิด มือถือสลับจาก Wi-Fi ไป cellular request ที่ค้างอยู่ก็หายไปเฉย ๆ
+- **มนุษย์ช้า** approval gate อาจค้างอยู่หลายชั่วโมง
+
+**Tasks extension** (`io.modelcontextprotocol/tasks`) ให้ server ตอบ *ทันที* ด้วย **task handle** ที่คงทน แทนที่จะเป็นผลลัพธ์ client poll handle นั้น ส่ง input ถ้าถูกขอ แล้วเก็บผลลัพธ์เมื่อไรก็ได้ที่มันพร้อม — แม้จาก connection ใหม่หรือ process ใหม่
+
+Tasks ย้ายออกจาก core protocol ไปเป็น extension ทางการใน 2026-07-28 (SEP-2663) spec ฉบับเต็มอยู่ใน repository `modelcontextprotocol/ext-tasks` ส่วน shape ด้านล่างคือสิ่งที่คุณจะเห็นบน wire
+
+## การ negotiate extension
+
+extension ถูกประกาศใน field `extensions` ของ capabilities — ในทุก client request และใน response ของ `server/discover` ฝั่ง server:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {
+      "extensions": { "io.modelcontextprotocol/tasks": {} }
+    }
+  }
+}
+```
+
+```json
+{
+  "result": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"],
+    "capabilities": {
+      "tools": {},
+      "extensions": { "io.modelcontextprotocol/tasks": {} }
+    }
+  }
+}
+```
+
+กฎเข้มงวด: server **ห้าม** return task ให้ client ที่ไม่ได้ประกาศ extension ใน request *นั้น* เพราะ protocol เป็น stateless ให้เช็ค capability ทุกครั้ง — ไม่มีอะไรให้จำจาก call ก่อนหน้า
+
+## flow
+
+<Mermaid title="task คือ handle ที่คุณ poll" code={tasksDiagram} />
+
+export const tasksDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (พร้อม tasks capability)
+  S-->>C: resultType task (taskId, status working)
+  loop จนกว่าจะถึง terminal
+    C->>S: tasks/get (taskId)
+    S-->>C: status working
+  end
+  C->>S: tasks/get (taskId)
+  S-->>C: status input_required, inputRequests
+  C->>S: tasks/update (taskId, inputResponses)
+  S-->>C: ack
+  C->>S: tasks/get (taskId)
+  S-->>C: status completed, result`;
+
+### 1. server ตัดสินใจ return task
+
+server เลือก *ต่อ request* ว่างานยาวพอที่จะเป็น task ไหม client ไม่ได้ขอ แค่ต้องพร้อมรับได้ทั้งสอง shape
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "task",
+    "task": {
+      "taskId": "tsk_9f2c1a",
+      "status": "working",
+      "statusMessage": "Queued behind 2 other builds",
+      "ttlMs": 3600000,
+      "pollIntervalMs": 5000
+    }
+  }
+}
+```
+
+task ต้อง **ถูกสร้างอย่างคงทนก่อน** ส่ง response นี้ — `taskId` ที่ server ลืมไปแล้วแย่กว่าไม่มี task เสียอีก
+
+### 2. client poll
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tasks/get",
+  "params": { "taskId": "tsk_9f2c1a" }
+}
+```
+
+เคารพ `pollIntervalMs` เก็บ `taskId` ไว้ในที่ที่คงทน เพื่อให้ poll ต่อได้หลัง crash — ความคงทนนี่แหละคือประเด็นทั้งหมด
+
+### 3. status
+
+| Status | ความหมาย | Terminal |
+|--------|---------|----------|
+| `working` | กำลังทำอยู่ | ไม่ |
+| `input_required` | server ต้องการ input จาก client ดู `inputRequests` | ไม่ |
+| `completed` | เสร็จแล้ว `result` เก็บสิ่งที่ request เดิมควรจะ return | ใช่ |
+| `failed` | เกิด JSON-RPC error `error` เก็บรายละเอียด | ใช่ |
+| `cancelled` | การ cancel ได้รับการยอมรับ | ใช่ |
+
+เมื่อ task ถึง terminal state แล้ว จะไม่เปลี่ยนอีก
+
+### 4. input กลางทาง
+
+เมื่อ task ต้องการผู้ใช้ — การอนุมัติ, การเลือก — มันจะเปลี่ยนเป็น `input_required` และ response ของ `tasks/get` จะมี map `inputRequests` ที่ใช้ shape เดียวกับ MRTR (elicitation ฯลฯ) client ตอบด้วย `tasks/update`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tasks/update",
+  "params": {
+    "taskId": "tsk_9f2c1a",
+    "inputResponses": {
+      "approve_prod": { "action": "accept", "content": { "confirm": true } }
+    }
+  }
+}
+```
+
+server ตอบรับด้วย result ว่าง และเมิน response ของ key ที่ไม่ได้ขอหรือได้รับแล้ว ไม่มี connection ที่สอง ไม่มี message ที่ server เริ่มเอง — วินัยแบบ stateless เดียวกับ MRTR
+
+### 5. เสร็จและเก็บผล
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "resultType": "complete",
+    "task": {
+      "taskId": "tsk_9f2c1a",
+      "status": "completed",
+      "ttlMs": 3600000
+    },
+    "result": {
+      "content": [{ "type": "text", "text": "Build 4812 passed in 6m 12s" }],
+      "structuredContent": { "buildId": 4812, "ok": true }
+    }
+  }
+}
+```
+
+`result` คือสิ่งเดียวกับที่ `tools/call` แบบ synchronous จะ return เป๊ะ ๆ `ttlMs` บอก client ว่า server สัญญาจะเก็บ task ให้ดึงได้อีกนานแค่ไหน
+
+### 6. Cancellation
+
+`tasks/cancel` ถูกตอบรับด้วย result ว่าง แต่เป็นแบบ **ร่วมมือกัน**: server อาจหยุดงานข้างใต้ได้หรือไม่ได้ และ task อาจยังจบด้วย `completed` หรือ `failed` ให้มอง `cancelled` เป็นผลลัพธ์ที่เป็นไปได้อันหนึ่ง ไม่ใช่การรับประกัน
+
+## notification แทนการ poll
+
+server อาจ push snapshot ของ task ทั้งก้อนเป็น `notifications/tasks` client opt-in ผ่านกลไก `subscriptions/listen` ปกติ (ดู [change notifications](/mcp/th/server-primitives/notifications-and-caching/)) แต่ละ notification มี state ของ task ทั้งหมด จึงไม่ต้อง `tasks/get` ตามอีก การ poll ยังเป็นค่าเริ่มต้นและเป็น fallback
+
+## เมื่อไรควรใช้ task
+
+| สถานการณ์ | ทำไม task ถึงเหมาะ |
+|-----------|---------------|
+| CI pipeline, batch job, model training | หลายนาทีถึงหลายชั่วโมง block ไม่ได้ |
+| approval gate, human review | `input_required` ยกคำขอขึ้นมา ไม่มีใครต้องถือ connection ค้าง |
+| ห่อ API ที่มี job id อยู่แล้ว | return task ตอนสร้าง job แล้ว resolve ตอน job เสร็จ |
+| มือถือ / เครือข่ายไม่เสถียร | `taskId` รอดจากการหลุด connection |
+| งาน bulk ที่ partial progress มีความหมาย | `statusMessage` รายงาน progress โดยไม่ต้องมี stream สด |
+
+และเมื่อไร *ไม่ควร*: อะไรที่เสร็จภายในไม่กี่วินาที task เพิ่มอย่างน้อยสอง round trip กับ polling loop `tools/call` ธรรมดาพร้อม progress ถูกกว่าและง่ายกว่า
+
+## checklist ฝั่ง server
+
+1. ประกาศ `io.modelcontextprotocol/tasks` ใน capabilities ของ `server/discover`
+2. ทุก request เช็ค `extensions` ของ client ก่อน return task
+3. persist task **ก่อน** ตอบ `resultType: "task"`
+4. รองรับ `tasks/get` โดย return `result` เมื่อ `completed` และ `error` เมื่อ `failed`
+5. รับ `tasks/update` และ `tasks/cancel` ตอบรับทั้งคู่ด้วย result ว่าง
+6. ผูก task กับผู้ใช้ที่ authenticate แล้ว `taskId` เป็น handle ไม่ใช่ credential — validate ผู้เรียกทุกครั้งที่ poll (ดู [state handle hijacking](/mcp/th/security-and-auth/threats-and-mitigations/))
+
+การรองรับ extension นี้ใน SDK ยังพัฒนาอยู่ ถ้า SDK ของคุณมี task helper ก็ใช้ ไม่งั้น shape บน wire ข้างต้นเล็กพอที่จะ implement เองบน request handler ธรรมดา
+
+<Callout title="สรุปหนึ่งบรรทัด">
+เมื่องานอยู่นานกว่า request ให้ return `resultType: "task"` พร้อม `taskId` ที่คงทน — แต่เฉพาะกับ client ที่ประกาศ `io.modelcontextprotocol/tasks` ใน request นั้น — แล้วให้มัน poll `tasks/get`, ตอบ `input_required` ผ่าน `tasks/update` และมอง `tasks/cancel` เป็นการขอร้องอย่างสุภาพ ไม่ใช่สวิตช์ฆ่างาน
+</Callout>
+
+export const quizTasks = [
+  {
+    q: 'ใครตัดสินว่า tools/call ครั้งหนึ่ง ๆ จะ return task แทนผลลัพธ์?',
+    options: [
+      'client โดยตั้ง flag ต่อ request',
+      'server ต่อ request — ตราบใดที่ client ประกาศ tasks extension ใน request นั้น',
+      'transport layer',
+      'LLM',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'status ไหนเป็น terminal?',
+    options: [
+      'working และ input_required',
+      'completed, failed และ cancelled',
+      'completed เท่านั้น',
+      'failed เท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client ตอบ task ที่อยู่ในสถานะ input_required อย่างไร?',
+    options: [
+      'retry tools/call เดิมพร้อม inputResponses',
+      'เรียก tasks/update พร้อม inputResponses ที่ key ตรงกับ inputRequests ของ task',
+      'เปิด stream subscriptions/listen',
+      'เรียก elicitation/create ไปที่ server',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การตอบรับ tasks/cancel ที่สำเร็จรับประกันอะไร?',
+    options: [
+      'งานหยุดแล้ว',
+      'task จะจบด้วย status cancelled',
+      'ไม่รับประกันอะไรนอกจากรับรู้เจตนา — cancellation เป็นแบบร่วมมือกัน',
+      'ผลลัพธ์ถูกทิ้ง',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="client-interaction/tasks-extension" questions={quizTasks} />
+
+<ProgressTracker client:visible id="client-interaction/tasks-extension" />

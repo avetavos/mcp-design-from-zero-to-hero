@@ -1,0 +1,262 @@
+---
+title: 'Testing and Debugging'
+description: 'ยิง server โดยไม่ต้องมี LLM ด้วย MCP Inspector, เขียน in-process test ที่รันใน CI ได้ทั้ง TypeScript และ Python, log บน stdio อย่างปลอดภัย, ส่งต่อ trace context และไล่ checklist ของความผิดพลาดที่พบบ่อย'
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## เอา model ออกจาก loop ก่อน
+
+การ debug ผ่านหน้าต่างแชตทั้งช้าและมี noise เยอะ: คุณบอกไม่ได้ว่า model เลือกผิด, client encode ผิด หรือ server ของคุณตอบผิด ทางแก้คือคุยกับ server *โดยตรง* ด้วย client ที่คุณควบคุมได้ แล้วดู JSON-RPC บน wire
+
+<Mermaid title="สามวิธีในการขับ server" code={driveDiagram} />
+
+export const driveDiagram = `flowchart LR
+  i["Inspector: web, cli, tui"] --> s["your server"]
+  t["in-process test client"] --> s
+  h["real host, e.g. Claude Code"] --> s
+  s --> w["wire: JSON-RPC you can read"]`;
+
+## MCP Inspector
+
+[Inspector](https://github.com/modelcontextprotocol/inspector) คือ developer tool อ้างอิงของ MCP หนึ่ง package สาม client หนึ่ง core ที่ใช้ร่วมกัน ทำให้การเชื่อมต่อทำงานเหมือนกันทุกโหมด ต้องใช้ **Node 22.19.0 ขึ้นไป** และรันผ่าน `npx` ได้เลยโดยไม่ต้องติดตั้ง:
+
+```bash
+# Web UI (default): launches a browser tab with a one-time session token
+npx @modelcontextprotocol/inspector node dist/index.js
+
+# Or start empty and add servers from the UI
+npx @modelcontextprotocol/inspector
+
+# A published npm server
+npx -y @modelcontextprotocol/inspector npx @modelcontextprotocol/server-filesystem ~/Desktop
+
+# A PyPI server
+npx @modelcontextprotocol/inspector uvx mcp-server-git --repository ~/code/repo
+
+# A remote Streamable HTTP server
+npx @modelcontextprotocol/inspector --server-url https://api.example.com/mcp --transport http
+```
+
+web client มีแท็บสำหรับ tools, resources และ prompts มี OAuth flow สำหรับ server ที่ป้องกันไว้ และมี monitoring sidebar ที่แสดงทุก message แบบสด ๆ มัน negotiate protocol era ให้อัตโนมัติ คุณจึงชี้ไปที่ server ยุค `2025-11-25` หรือ `2026-07-28` ก็ได้
+
+### โหมด CLI สำหรับ script และ CI
+
+`--cli` เปลี่ยน core เดียวกันให้เป็น client แบบ script ได้ พร้อม output ที่เครื่องอ่านได้:
+
+```bash
+# List tools and exit
+npx @modelcontextprotocol/inspector --cli node dist/index.js --method tools/list
+
+# Call a tool and pipe into jq
+npx @modelcontextprotocol/inspector --cli https://api.example.com/mcp --transport http \
+  --method tools/call --tool-name get_weather --tool-arg city=Boston --format json | jq .result
+```
+
+นี่คือ smoke test ที่เร็วที่สุดที่ใส่ใน pipeline ได้: มี exit code, ได้ JSON ออกมา, ไม่ต้องมี browser
+
+### โหมด TUI
+
+```bash
+npx @modelcontextprotocol/inspector --tui node dist/index.js
+```
+
+feature เดียวกันแต่อยู่ใน terminal สำหรับ SSH session และเครื่องที่ไม่มี browser
+
+flag เลือกโหมดต้องมาก่อน: `--web` (default), `--cli` หรือ `--tui` ทุกอย่างหลัง token แรกที่ไม่ใช่ flag โหมดจะถูกส่งต่อให้ client แล้วต่อไปยัง server ของคุณ นั่นคือเหตุผลที่ server เองก็รับ argument `--cli` ตรง ๆ ได้
+
+## In-process test
+
+Inspector มีไว้สำรวจ แต่สำหรับ regression test คุณต้องการ client ที่อยู่ใน process เดียวกับ server ไม่มี port ไม่มี subprocess และรันภายใต้ test runner ปกติของคุณ
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import assert from 'node:assert/strict';
+    import { test } from 'node:test';
+    import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    function createServer() {
+      const server = new McpServer({ name: 'pricing', version: '1.0.0' });
+      server.registerTool(
+        'apply-discount',
+        {
+          description: 'Apply a percentage discount to a price',
+          inputSchema: z.object({ price: z.number(), percent: z.number().min(0).max(100) }),
+          outputSchema: z.object({ total: z.number() }),
+        },
+        async ({ price, percent }) => {
+          if (price < 0) {
+            return { content: [{ type: 'text', text: 'price must be >= 0' }], isError: true };
+          }
+          const total = price * (1 - percent / 100);
+          return { content: [{ type: 'text', text: `$${total}` }], structuredContent: { total } };
+        },
+      );
+      return server;
+    }
+
+    test('discount math and error path', async () => {
+      const handler = createMcpHandler(createServer);
+      // Route the client's fetch straight into the handler — no network.
+      const transport = new StreamableHTTPClientTransport(new URL('http://test.local/mcp'), {
+        fetch: (url, init) => handler.fetch(new Request(url, init)),
+      });
+      const client = new Client({ name: 'test', version: '0.0.0' });
+      await client.connect(transport);
+
+      const ok = await client.callTool({ name: 'apply-discount', arguments: { price: 100, percent: 25 } });
+      assert.equal(ok.isError, undefined);
+      assert.deepEqual(ok.structuredContent, { total: 75 });
+
+      const bad = await client.callTool({ name: 'apply-discount', arguments: { price: -1, percent: 0 } });
+      assert.equal(bad.isError, true);
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import pytest
+    from pydantic import BaseModel
+
+    from mcp import Client
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+    from mcp.types import TextContent
+
+    mcp = MCPServer("Pricing")
+
+
+    class Discounted(BaseModel):
+        total: float
+
+
+    @mcp.tool()
+    def apply_discount(price: float, percent: float) -> Discounted:
+        """Apply a percentage discount to a price."""
+        if price < 0:
+            raise ToolError("price must be >= 0")
+        return Discounted(total=price * (1 - percent / 100))
+
+
+    @pytest.mark.anyio
+    async def test_discount_and_error():
+        # Client(mcp) connects in-process — no subprocess, no port.
+        async with Client(mcp) as client:
+            ok = await client.call_tool("apply_discount", {"price": 100, "percent": 25})
+            assert not ok.is_error
+            assert ok.structured_content == {"total": 75.0}
+
+            bad = await client.call_tool("apply_discount", {"price": -1, "percent": 0})
+            assert bad.is_error
+            assert isinstance(bad.content[0], TextContent)
+    ```
+  </TabItem>
+</Tabs>
+
+ทั้งสองแบบวิ่งผ่าน protocol path จริง: request ถูก serialize, `_meta` ถูกเติม, handler validate schema และ result กลับมาในแบบเดียวกับที่ model จะเห็น ให้ assert ที่ `isError`, ที่ `structuredContent` และที่ *text* — เพราะ text คือสิ่งที่ model อ่าน
+
+## log โดยไม่ทำ transport พัง
+
+บน **stdio** `stdout` คือ wire `console.log` หรือ `print()` หลุดมาแค่บรรทัดเดียวก็ทำ framing เสีย client จะเห็น parse error ไม่ใช่ข้อความของคุณ กฎคือ:
+
+- log ไปที่ **stderr** เท่านั้น spec อนุญาต UTF-8 อะไรก็ได้บน stderr client อาจ capture, forward หรือเมินก็ได้
+- ใน Node `console.error` ไปที่ stderr ใน Python ใช้ `logging` กับ `StreamHandler(sys.stderr)` หรือ `print(..., file=sys.stderr)`
+- library ภายนอกที่ print ลง stdout ต้องถูกปิดเสียงหรือ redirect ก่อน server เริ่มทำงาน
+
+บน **Streamable HTTP** ไม่มีอันตรายแบบนี้ แต่ feature logging ของ protocol เองถูก deprecate แล้ว (ดูบทสุดท้าย) ถ้า client อยากได้ log message ต่อ request มันจะ opt in ด้วย `io.modelcontextprotocol/logLevel` ใน `_meta` และ server **ต้องไม่** ส่ง `notifications/message` สำหรับ request ที่ไม่ได้ใส่ field นี้ ส่วนอย่างอื่นให้ใช้ logger ของ platform คุณ
+
+## Trace context
+
+key ที่สงวนไว้ใน `_meta` อย่าง `traceparent`, `tracestate` และ `baggage` พา W3C Trace Context ผ่าน MCP ได้ ทำให้ tool call เข้าร่วม distributed trace เดียวกับ HTTP request ที่ trigger agent:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "Lisbon" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"
+    }
+  }
+}
+```
+
+อ่าน `traceparent` ใน handler เริ่ม child span แล้ว downstream call ของ tool คุณจะไปโผล่ใต้ trace ของ agent ตรงตาม OpenTelemetry semantic convention สำหรับ MCP
+
+## checklist ความผิดพลาดที่พบบ่อย
+
+เวลา server "ไม่ทำอะไรเลย" หรือ client "ต่อไม่ได้" แทบทุกครั้งจะเป็นหนึ่งในนี้:
+
+| อาการ | สาเหตุที่น่าจะเป็น | ตรวจอย่างไร |
+|---------|--------------|-------|
+| client รายงาน JSON parse error บน stdio | มีอะไรเขียนลง stdout | grep หา `console.log` / `print(` ที่ไม่มี `file=sys.stderr` |
+| HTTP 400, error `-32020` HeaderMismatch | `Mcp-Method` / `Mcp-Name` / `MCP-Protocol-Version` หายไปหรือไม่ตรงกับ body | เทียบ header กับ `params.name` และ `_meta` |
+| HTTP 400, error `-32022` UnsupportedProtocolVersion | client ส่ง version ที่ server ไม่รองรับ | อ่าน `error.data.supported` แล้ว retry ด้วยหนึ่งในนั้น |
+| HTTP 400, error `-32602` และ "missing _meta" | request ไม่มี `io.modelcontextprotocol/protocolVersion` หรือ `clientCapabilities` | ใช้ SDK client หรือเติม field เอง |
+| HTTP 403 | มี header `Origin` แต่ไม่ได้รับอนุญาต | ตั้ง allowed host / origin ของ server |
+| HTTP 406 หรือ response ค้าง | `Accept` ของ client ไม่ได้ระบุทั้ง `application/json` และ `text/event-stream` | แก้ header ของ client |
+| tool "ใช้ได้ใน Inspector แต่พังจาก host" | `inputSchema` เข้มเกินไป หรือ model ส่ง string มาแทน number | ผ่อนหรือ coerce; เติม `description` ให้ property |
+| `structuredContent` ถูกปฏิเสธ | result ไม่ตรงกับ `outputSchema` | validate ก่อน return; เก็บ text fallback ไว้ |
+| legacy client ได้ 405 บน GET | server รองรับแค่ยุคใหม่ แต่ client คาดหวัง GET stream แบบเก่า | serve แบบ dual-era หรือบอกให้ client อัปเกรด |
+
+อ่าน wire ก่อนเสมอ monitor sidebar ของ Inspector หรือ `--format json` ของ CLI จะบอกคุณชัด ๆ ว่าเป็นข้อไหน
+
+<Callout title="สรุปหนึ่งบรรทัด">
+debug MCP โดยไม่ต้องมี model: สำรวจด้วย Inspector (web, `--cli` สำหรับ CI, `--tui` สำหรับ terminal), ทำ regression ด้วย in-process client (`handler.fetch` ใน TypeScript, `Client(mcp)` ใน Python), ห้ามเขียนลง stdout บน stdio, ร้อย `traceparent` ผ่าน `_meta` และอ่าน error code บน wire — `-32020`, `-32022`, `-32602` — ก่อนแตะ code
+</Callout>
+
+export const quizTesting = [
+  {
+    q: 'MCP Inspector ต้องใช้ Node เวอร์ชันต่ำสุดเท่าไร?',
+    options: ['16', '18', '20', '22.19.0'],
+    answer: 3,
+  },
+  {
+    q: 'จะรัน TypeScript server แบบ in-process สำหรับ test โดยไม่เปิด port ได้อย่างไร?',
+    options: [
+      'spawn ด้วย child_process แล้ว parse stdout',
+      'ส่ง fetch แบบ custom ให้ StreamableHTTPClientTransport ที่เรียก handler.fetch(new Request(url, init))',
+      'ใช้ HTTP+SSE transport ที่ deprecate ไปแล้ว',
+      'ตั้ง stateless_http: true',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'stdio server print "starting…" ด้วย console.log จะเกิดอะไรขึ้น?',
+    options: [
+      'ไม่มีอะไร client เมินบรรทัดที่ไม่ใช่ JSON',
+      'client เห็น wire ที่เสียหายและรายงาน parse error เพราะ stdout คือ transport',
+      'ข้อความโผล่ใน UI ของ host เป็น notification',
+      'server สลับไปใช้ HTTP',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'remote server ตอบ HTTP 400 พร้อม JSON-RPC error code -32020 หมายความว่าอะไร?',
+    options: [
+      'protocol version ไม่รองรับ',
+      'ไม่รู้จัก tool',
+      'HTTP header ที่ mirror มาไม่ตรงกับ request body หรือ header ที่จำเป็นหายไป',
+      'โดน rate limit',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/testing-and-debugging" questions={quizTesting} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/testing-and-debugging" />

@@ -1,0 +1,222 @@
+---
+title: 'Third-Party Authorization with URL Elicitation'
+description: 'เมื่อ server ของคุณต้องเข้าถึง API อื่นด้วยตัวเอง: ความต่างระหว่าง MCP authorization กับ external authorization, flow ของ URL-mode elicitation ผ่านหน้า connect ที่ server เป็นเจ้าของ, phishing attack ที่ต้องรับมือ และกฎ URL ที่ปลอดภัยทั้งสองฝั่ง'
+sidebar:
+  order: 6
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## authorization สองแบบที่ไม่เหมือนกัน
+
+ทุกอย่างก่อนหน้านี้ในโมดูลว่าด้วย client พิสูจน์ตัวเองกับ server แต่ server จริง ๆ หลายตัวมีปัญหาที่สอง: เพื่อทำงานให้เสร็จ มันต้องเรียก API *อีกตัว* แทน user และ API นั้นก็มี login ของตัวเอง
+
+| | MCP authorization | External (third-party) authorization |
+|---|---|---|
+| ใครให้สิทธิ์ใคร | MCP client → MCP server | MCP server → third-party API |
+| กำหนดโดย | MCP authorization spec | OAuth ของ third party บวก URL-mode elicitation ของ MCP |
+| บทบาทของ server | OAuth **resource server** | OAuth **client** ของ third party |
+| token ที่ใช้ | ออกโดย AS ของ MCP server, audience = MCP server | ออกโดย third-party AS, audience = third-party API |
+| ผ่าน MCP client ไหม | ผ่าน นั่นคือจุดประสงค์ของมัน | ไม่มีทาง |
+
+สิ่งที่ล่อใจคือยุบสองอย่างนี้เข้าด้วยกัน: เอา token ที่ client ส่งมาแล้วส่งต่อไป third party นั่นคือ token passthrough และมันต้องห้าม MCP server MUST ได้ credential ของตัวเองสำหรับ third party และกลไกที่ spec ให้ไว้คือ **URL-mode elicitation**
+
+## URL-mode elicitation มีไว้ทำอะไร
+
+form-mode elicitation เก็บข้อมูลแบบมีโครงสร้าง *ผ่าน* client ซึ่ง client เห็นทุก field นั่นโอเคสำหรับวันที่จอง แต่ยอมรับไม่ได้สำหรับรหัสผ่าน server MUST NOT ใช้ form mode กับ secret, API key, token หรือข้อมูลการชำระเงิน และ MUST ใช้ URL mode สำหรับสิ่งเหล่านั้น
+
+URL mode ส่ง user ไปยังหน้าที่ server ควบคุม อะไรก็ตามที่เกิดขึ้นบนหน้านั้น (พิมพ์ API key, ทำ OAuth flow กับ third party, จ่ายเงิน) MCP client และ LLM มองไม่เห็น งานเดียวของ client คือแสดงให้ user เห็นว่า server ไหนกำลังขอและ URL เต็ม ๆ, ขอ consent และเปิดมันอย่างปลอดภัย
+
+ภายใต้ MRTR request จะมาใน `InputRequiredResult`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "input_required",
+    "inputRequests": {
+      "connect_calendar": {
+        "method": "elicitation/create",
+        "params": {
+          "mode": "url",
+          "url": "https://mcp.example.com/connect?flow=calendar",
+          "message": "Connect your calendar account so I can read your events."
+        }
+      }
+    },
+    "requestState": "v1.AEAD-protected-blob"
+  }
+}
+```
+
+client ตอบด้วยการ retry request เดิมพร้อม `inputResponses` และ `requestState` ที่ไม่แตะต้อง:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "list_events",
+    "arguments": { "day": "2026-09-10" },
+    "inputResponses": { "connect_calendar": { "action": "accept" } },
+    "requestState": "v1.AEAD-protected-blob"
+  }
+}
+```
+
+สังเกตว่า `accept` ตรงนี้หมายถึงอะไร: user *ยินยอมให้เปิด URL* มันไม่ได้บอกเลยว่าการโต้ตอบนอก band เสร็จแล้วหรือยัง server ตัดสินเรื่องนั้นจาก state ที่ตัวเองเก็บไว้ (หรือ `requestState` ที่ echo กลับมา) แล้วคืนผลลัพธ์สุดท้ายหรือ `InputRequiredResult` อีกอัน client SHOULD ให้ user มีปุ่ม retry และ cancel ด้วยมือสำหรับกรณีนี้โดยเฉพาะ
+
+## flow แบบเต็ม
+
+<Mermaid title="server เป็น OAuth client ของ third party ผ่าน URL elicitation" code={thirdPartyDiagram} />
+
+export const thirdPartyDiagram = `sequenceDiagram
+  participant U as User
+  participant B as Browser
+  participant C as MCP Client
+  participant S as MCP Server
+  participant TA as Third-party AS
+  participant TR as Third-party API
+  C->>S: tools/call list_events (Bearer MCP token)
+  Note over S: ไม่มี calendar token สำหรับ user นี้
+  S-->>C: InputRequiredResult (mode url, /connect, requestState)
+  C->>U: แสดงชื่อ server และ URL เต็ม ขอ consent
+  U-->>C: consent
+  C->>B: เปิด https://mcp.example.com/connect
+  C->>S: tools/call retry (accept, requestState)
+  B->>S: GET /connect
+  Note over S: ตรวจว่า session user เท่ากับ MCP user (sub)
+  S-->>B: redirect ไป third-party authorize
+  B->>TA: user ยินยอมให้ S เข้าถึง calendar
+  TA-->>B: redirect ไป callback ของ S พร้อม code
+  B->>S: GET /callback
+  S->>TA: แลก code (client_id ของ S เอง)
+  TA-->>S: third-party token เก็บผูกกับ user
+  S->>TR: อ่าน event ด้วย third-party token
+  S-->>C: ผลลัพธ์สุดท้ายของ tools/call`;
+
+pattern การ implement ทีละขั้น:
+
+1. server (ในฐานะ OAuth client ของ third party) เตรียม authorization request แต่ **ไม่** ส่ง third-party URL นั้นให้ MCP client ตรง ๆ
+2. server เก็บ state ที่ผูก elicitation นี้เข้ากับ MCP user ที่ authenticate แล้ว และสร้าง `requestState` ที่เข้ารหัส request เดิมและ user ถ้าจำเป็น
+3. server คืน URL-mode elicitation ที่ชี้ไปยังหน้า connect *ของตัวเอง* (`https://mcp.example.com/connect?…`)
+4. user ให้ consent ใน client ซึ่งเปิด URL ใน browser context ที่ปลอดภัย
+5. หน้า connect ตรวจว่าคนที่เปิดมันคือ user คนเดียวกับที่ trigger elicitation (หัวข้อถัดไป) แล้วค่อย redirect ไป third-party authorization endpoint
+6. third-party AS redirect กลับมายัง `redirect_uri` ที่ server ลงทะเบียนไว้ server ยืนยันว่า URI นั้นเป็นของตัวเองแล้วแลก code ด้วย `client_id` แบบ static ของตัวเอง
+7. server เก็บ third-party token ผูกกับตัวตนของ MCP user ตอนนี้มันจำเป็นต้อง **stateful** สำหรับเรื่องนี้
+8. MCP request ครั้งต่อ ๆ ไปจาก user คนนั้นใช้ token ที่เก็บไว้ token ของ MCP client เองไม่เคยถูกใช้เลย
+
+กฎสามข้อที่ spec ทำให้เด็ดขาด:
+
+- third-party credential MUST NOT ผ่าน MCP client
+- server MUST NOT ใช้ MCP token ของ client เรียก third party (token passthrough)
+- server MUST NOT ส่ง credential ที่ได้จาก URL elicitation กลับไปให้ MCP client
+
+และอีกข้อที่คนมักสะดุด: URL-mode elicitation *ไม่ใช่* สำหรับให้ MCP client ขอสิทธิ์กับ MCP server นั่นคือ flow ปกติจากต้นโมดูล server MUST NOT พึ่ง URL elicitation เพื่อ authenticate ผู้เรียกของตัวเอง
+
+## phishing attack ที่คุณต้องรับมือ
+
+URL คือแค่ string ใครได้รับก็ส่งต่อได้ ถ้าไม่มีการตรวจว่าเป็น user คนเดียวกัน วิธีต่อไปนี้ใช้ได้กับ server ที่ปลอดภัยดีทุกอย่าง:
+
+1. Alice ซึ่งเชื่อมต่อกับ server ที่ปลอดภัย trigger calendar elicitation
+2. server สร้าง connect URL สำหรับ request ที่ค้างอยู่ของ Alice
+3. client ของ Alice แสดง URL ให้เธอ แทนที่จะเปิด เธอส่งมันให้ Bob ซึ่งเป็น user อีกคนของ server เดียวกัน โดยแต่งว่า "คลิกเพื่อเชื่อมต่อ calendar ของคุณ"
+4. Bob เปิดมันแล้วทำ third-party authorization จนจบ โดยเชื่อว่ากำลังเชื่อมต่อบัญชีของตัวเอง
+5. third-party AS เรียกกลับ server จับคู่ callback กับ request ที่ค้างอยู่ *ของ Alice*
+6. calendar token ของ Bob ถูกเก็บภายใต้ตัวตนของ Alice ตอนนี้ Alice อ่าน calendar ของ Bob ได้
+
+**วิธีรับมือ** server MUST ทำให้แน่ใจว่า user ที่ *เริ่ม* elicitation คือ user ที่ *ทำ* authorization จนจบ สูตรแบบไม่บังคับของ spec สำหรับ server ที่เข้าถึงได้ทางเว็บ:
+
+- elicit ไปยังหน้า connect ที่ server เป็นเจ้าของ ไม่ใช่ตรงไปที่ authorize endpoint ของ third party
+- บนหน้านั้น บังคับให้มี session กับ MCP server (หรือ AS ของมัน) เช่น login cookie
+- เทียบ subject (`sub`) ที่เชื่อถือได้จาก MCP access token ที่สร้าง elicitation กับ subject ของ browser session ไม่ตรงคือหยุด
+- จากนั้นถึงค่อย redirect ต่อไป third-party AS และผูก token ที่ได้มาในที่สุดกับ subject ที่ตรวจแล้วนั้น
+
+server ที่ใช้ browser session ไม่ได้ต้องหาวิธีอื่นเพื่อยืนยันว่าเป็นคนเดียวกันทั้งสองฝั่ง และไม่ว่าจะใช้กลไกไหน มัน MUST ทนต่อผู้โจมตีที่แก้ elicitation URL ได้
+
+หลักเรื่องตัวตนเดียวกันนี้ใช้ทุกที่ใน elicitation: server MUST NOT เชื่อการอ้างตัวตนที่ client ส่งมา "ฉันคือ joe@example.com" ที่พิมพ์ลงใน form ไม่ใช่ authentication MCP token ที่ตรวจแล้วต่างหากที่ใช่
+
+## กฎ URL ที่ปลอดภัย
+
+เพราะ URL elicitation เป็นช่องทางที่ชอบธรรมในการส่ง user ไปยัง link ทั้งสองฝ่ายจึงมีภาระหน้าที่ที่กันไม่ให้มันกลายเป็นเครื่องมือ phishing
+
+server ที่ขอ elicitation:
+
+- MUST NOT ใส่ข้อมูลอ่อนไหวของ user (credential, PII) ใน URL
+- MUST NOT แจก URL ที่ authenticate ล่วงหน้าไปยัง protected resource client ที่มุ่งร้ายจะเอาไปสวมรอยเป็น user ได้
+- SHOULD NOT ใส่ URL ที่ดูเหมือนคลิกได้ในทุก field ของ request แบบ *form* mode
+- SHOULD ใช้ HTTPS นอกสภาพแวดล้อมพัฒนา
+
+client ที่จัดการ URL-mode request:
+
+- MUST NOT prefetch URL หรือ metadata ของมัน
+- MUST NOT เปิดโดยไม่มี consent ชัดเจนจาก user และ MUST แสดง URL เต็มให้ตรวจดูก่อน
+- MUST เปิดในแบบที่ client และ LLM ตรวจดูเนื้อหาไม่ได้ (system browser หรือ web view นอก process อย่าง SFSafariViewController ไม่ใช่ WKWebView ฝังในแอปที่แอปอ่านได้)
+- SHOULD เน้น domain ให้เห็นเพื่อเปิดโปงกลลวง subdomain และเตือนเมื่อ host น่าสงสัยหรือเป็น Punycode
+- SHOULD NOT render URL ให้คลิกได้ที่ไหนก็ตาม ยกเว้น field `url` ของ URL-mode request
+
+## ภาระหน้าที่เรื่อง state และการจัดเก็บ
+
+elicitation ไม่ *บังคับ* ให้ server มี state ขอบคุณ MRTR แต่ third-party authorization บังคับ เพราะต้องมีใครสักคนถือ upstream token เมื่อคุณเก็บ state นั้น:
+
+- ป้องกันไม่ให้ถูกเข้าถึงโดยไม่ได้รับอนุญาต
+- ดึงตัวตนของ user จาก MCP authorization credential (claim `sub`) ไม่ใช่จากอะไรก็ตามที่ client พิมพ์
+- ผูก third-party token ทุกตัวที่เก็บไว้กับตัวตนนั้น และค้นหามันเฉพาะสำหรับ request ที่มี token ที่ subject เดียวกัน
+
+อ่านคู่กับ [Threats and Mitigations](/mcp/th/security-and-auth/threats-and-mitigations/) นี่คือเรื่อง confused-deputy จากมุมของ server: server ของคุณคือ deputy, third-party API คือสิ่งที่มันกระทำแทน และการผูกต่อ user บวกการตรวจว่าเป็นคนเดียวกันคือสิ่งที่กันไม่ให้มันสับสน
+
+<Callout title="สรุปหนึ่งบรรทัด">
+เมื่อ server ของคุณต้องใช้ third-party API มันกลายเป็น OAuth client ของ API นั้นและขอ consent ผ่าน URL-mode elicitation ไปยังหน้า connect ที่ตัวเองเป็นเจ้าของ หน้านั้นต้องพิสูจน์ว่าเป็น user คนเดียวกันทั้งสองฝั่ง token ที่ได้ผูกกับ user คนนั้นและไม่เคยแสดงให้ MCP client เห็น และ token ของ client เองไม่เคยถูกส่งต่อ
+</Callout>
+
+export const quizThirdParty = [
+  {
+    q: 'server ต้องการ API key ของ user สำหรับ upstream service มันใช้ elicitation mode ไหนได้?',
+    options: [
+      'form mode พร้อม field แบบ password',
+      'URL mode เท่านั้น เพื่อให้ secret ไม่ผ่าน MCP client',
+      'แบบไหนก็ได้ ตราบใดที่ message อธิบายเหตุผล',
+      'ไม่ได้ทั้งคู่ secret ต้องเป็น argument ของ tool',
+    ],
+    answer: 1,
+  },
+  {
+    q: '`action: "accept"` ใน response ของ URL-mode elicitation หมายความว่าอะไร?',
+    options: [
+      'การโต้ตอบนอก band เสร็จสมบูรณ์แล้ว',
+      'user ยินยอมให้เปิด URL ส่วนความสำเร็จ server ตัดสินจาก state ของตัวเอง',
+      'user พิมพ์ credential ลงใน client',
+      'third-party token แนบมาใน `content`',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม elicitation URL ควรชี้ไปที่หน้า connect ที่ server เป็นเจ้าของ แทนที่จะเป็น authorize endpoint ของ third party?',
+    options: [
+      'endpoint ของ third party ช้ากว่า',
+      'เพื่อให้ server ตรวจได้ว่า user ที่เปิด link คือ user คนเดียวกับที่ trigger elicitation ก่อน redirect',
+      'เพราะ client block domain ภายนอก',
+      'เพื่อ cache authorization code',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อไหนคือ token passthrough?',
+    options: [
+      'server เก็บ third-party token โดยใช้ `sub` ของ MCP user เป็น key',
+      'server ใช้ client_id แบบ static ของตัวเองกับ third-party AS',
+      'server เรียก third-party API ด้วย bearer token ที่ MCP client ส่งมาให้',
+      'client ส่ง MCP token ของตัวเองไปกับทุก request',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/third-party-auth-and-url-elicitation" questions={quizThirdParty} />
+
+<ProgressTracker client:visible id="security-and-auth/third-party-auth-and-url-elicitation" />

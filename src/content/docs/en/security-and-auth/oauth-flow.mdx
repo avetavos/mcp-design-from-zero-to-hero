@@ -1,0 +1,268 @@
+---
+title: 'The Authorization Flow'
+description: 'From an unauthenticated 401 to a working bearer token: Protected Resource Metadata, authorization server discovery, PKCE, resource indicators, issuer validation, and step-up authorization, with exact headers and documents.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The whole flow at a glance
+
+A client that has never seen a server before needs to find out *who* issues tokens for it, identify itself to that issuer, get the user's consent, and come back with a token bound to this one server. MCP specifies each step so that any client can do it with any server without a prior relationship:
+
+<Mermaid title="From first request to authenticated MCP traffic" code={flowDiagram} />
+
+export const flowDiagram = `sequenceDiagram
+  participant B as Browser
+  participant C as MCP Client
+  participant M as MCP Server (RS)
+  participant A as Authorization Server
+  C->>M: POST /mcp (no token)
+  M-->>C: 401 + WWW-Authenticate (resource_metadata, scope)
+  C->>M: GET /.well-known/oauth-protected-resource
+  M-->>C: authorization_servers, scopes_supported
+  C->>A: GET /.well-known/oauth-authorization-server
+  A-->>C: issuer, endpoints, capabilities
+  Note over C,A: register or identify client (next lesson)
+  C->>B: open authorize URL + code_challenge + resource
+  B->>A: user authenticates and consents
+  A-->>B: redirect with code + iss
+  B-->>C: callback
+  C->>A: POST token (code_verifier, resource)
+  A-->>C: access token
+  C->>M: POST /mcp with Authorization: Bearer
+  M-->>C: MCP result`;
+
+Let's walk it one hop at a time.
+
+## Step 1: the 401 challenge
+
+The client sends an ordinary MCP request with no token. The server answers `401 Unauthorized` and, per RFC 6750 and RFC 9728, tells the client where to look next:
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource",
+                         scope="files:read"
+```
+
+Two parameters matter:
+
+- `resource_metadata` is the URL of the server's Protected Resource Metadata document.
+- `scope` (optional but recommended) is the *minimum* scope set needed for this request. Clients MUST treat it as authoritative for the current operation.
+
+If the header carries no `resource_metadata`, the client MUST fall back to constructing the well-known URI itself: first at the endpoint's path (`https://example.com/.well-known/oauth-protected-resource/public/mcp` for an endpoint at `/public/mcp`), then at the root.
+
+## Step 2: Protected Resource Metadata
+
+The document (RFC 9728) tells the client which authorization servers can issue tokens for this resource:
+
+```json
+{
+  "resource": "https://mcp.example.com/mcp",
+  "authorization_servers": ["https://auth.example.com"],
+  "scopes_supported": ["files:read", "files:write"],
+  "bearer_methods_supported": ["header"]
+}
+```
+
+MCP servers MUST serve this document, and it MUST contain at least one entry in `authorization_servers`. If several are listed, the client chooses; each one is an independent issuer with its own client registration and tokens.
+
+`scopes_supported` is meant to be the *minimal* set for basic functionality, not the full catalog. Additional scopes are requested later through step-up (below).
+
+## Step 3: authorization server discovery
+
+With an issuer URL in hand, the client fetches the authorization server's metadata. MCP clients MUST try multiple well-known locations, in priority order, because issuers may be OAuth-only or OpenID providers and may have a path component.
+
+For an issuer **with** a path (`https://auth.example.com/tenant1`):
+
+1. `https://auth.example.com/.well-known/oauth-authorization-server/tenant1` (RFC 8414, path insertion)
+2. `https://auth.example.com/.well-known/openid-configuration/tenant1` (OIDC, path insertion)
+3. `https://auth.example.com/tenant1/.well-known/openid-configuration` (OIDC, path appending)
+
+For an issuer **without** a path (`https://auth.example.com`):
+
+1. `https://auth.example.com/.well-known/oauth-authorization-server`
+2. `https://auth.example.com/.well-known/openid-configuration`
+
+The document looks like:
+
+```json
+{
+  "issuer": "https://auth.example.com",
+  "authorization_endpoint": "https://auth.example.com/authorize",
+  "token_endpoint": "https://auth.example.com/token",
+  "code_challenge_methods_supported": ["S256"],
+  "client_id_metadata_document_supported": true,
+  "authorization_response_iss_parameter_supported": true,
+  "scopes_supported": ["files:read", "files:write", "offline_access"]
+}
+```
+
+One validation is mandatory: the `issuer` value inside the document MUST be identical to the issuer used to build the well-known URL. A document fetched from `attacker.example` that claims `"issuer": "https://honest.example"` MUST be rejected. This single check is what makes the later `iss` comparison meaningful.
+
+## Step 4: identify the client
+
+Before it can ask for a code, the client needs a `client_id`. There are three ways (pre-registered, Client ID Metadata Document, or the deprecated dynamic registration), and they get their [own lesson](/mcp/en/security-and-auth/client-registration/). For this walkthrough assume the client uses an HTTPS URL as its identifier.
+
+## Step 5: the authorization request
+
+The client generates PKCE parameters, picks scopes, records the issuer it is about to talk to, and opens the browser:
+
+```http
+GET /authorize?response_type=code
+  &client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
+  &redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback
+  &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &code_challenge_method=S256
+  &resource=https%3A%2F%2Fmcp.example.com%2Fmcp
+  &scope=files%3Aread
+  &state=af0ifjsldkj HTTP/1.1
+Host: auth.example.com
+```
+
+Three details are MCP-specific:
+
+**`resource` (RFC 8707).** MCP clients MUST send it in both the authorization request and the token request, whether or not the authorization server advertises support. Its value is the server's *canonical URI*: lowercase scheme and host, no fragment, and the most specific URI the client knows. `https://mcp.example.com/mcp` and `https://mcp.example.com:8443` are valid; `mcp.example.com` (no scheme) and `https://mcp.example.com#frag` are not. Prefer the form without a trailing slash.
+
+**Scope selection.** Clients SHOULD follow least privilege in this order: use the `scope` from the `WWW-Authenticate` challenge if present; otherwise use everything in `scopes_supported` from the resource metadata; if that is undefined too, omit `scope` entirely.
+
+**Record the issuer.** Before redirecting, the client MUST store the validated `issuer` alongside the PKCE verifier and `state`. The redirect check in step 6 is only as good as this recorded value.
+
+## Step 6: validate the redirect
+
+The authorization server redirects back with a code and, per RFC 9207, SHOULD include `iss`:
+
+```http
+HTTP/1.1 302 Found
+Location: http://127.0.0.1:3000/callback?code=SplxlOBeZQQYbYS6WxSbIA&state=af0ifjsldkj&iss=https%3A%2F%2Fauth.example.com
+```
+
+Before sending the code anywhere, the client MUST apply this table:
+
+| `authorization_response_iss_parameter_supported` | `iss` in response | Client action |
+|---|---|---|
+| `true` | present | Compare to the recorded issuer with simple string comparison |
+| `true` | absent | Reject the response |
+| `false` or absent | present | Compare to the recorded issuer anyway |
+| `false` or absent | absent | Proceed |
+
+"Simple string comparison" means exactly that: no case folding, no default-port removal, no trailing-slash or percent-encoding normalisation. The same rule applies to error responses, so a mismatched `iss` means the client must not even display the `error_description`.
+
+This is the mitigation for **mix-up attacks**, where an attacker-controlled authorization server tries to receive a code minted by an honest one. PKCE alone does not stop it, because the client would send its `code_verifier` to the attacker's token endpoint.
+
+## Step 7: exchange the code
+
+```http
+POST /token HTTP/1.1
+Host: auth.example.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=SplxlOBeZQQYbYS6WxSbIA
+&redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback
+&client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
+&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+&resource=https%3A%2F%2Fmcp.example.com%2Fmcp
+```
+
+The response carries the access token and, at the authorization server's discretion, a refresh token. Clients that want refresh tokens SHOULD list `refresh_token` in their `grant_types` metadata, MAY add `offline_access` to `scope` when the AS advertises it, MUST store refresh tokens confidentially, and MUST NOT assume one will be issued. Servers, in turn, SHOULD NOT put `offline_access` in `WWW-Authenticate` or `scopes_supported`, because a refresh token is a client convenience, not a resource requirement.
+
+## Step 8: use the token
+
+Every MCP request from now on carries the token in the header defined by OAuth 2.1 section 5.1.1:
+
+```http
+POST /mcp HTTP/1.1
+Host: mcp.example.com
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: list_files
+```
+
+Tokens MUST NOT go in the URI query string. On the server side, the token is validated on every request (signature, expiry, audience, scopes), and an invalid or expired token gets a fresh `401`, which restarts the flow.
+
+## Error responses and step-up
+
+Servers MUST use these statuses:
+
+| Status | Meaning | Usage |
+|--------|---------|-------|
+| `401` | Unauthorized | No token, or the token is invalid or expired |
+| `403` | Forbidden | Token is valid but lacks the scopes for this operation |
+| `400` | Bad Request | Malformed authorization request |
+
+The interesting one is `403`. When a client already holds a token but calls a tool that needs more, the server SHOULD challenge with the *full* set of scopes the operation needs, in one round:
+
+```http
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope",
+                         scope="files:write",
+                         resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource",
+                         error_description="File write permission required for this operation"
+```
+
+The client then runs a **step-up authorization flow**:
+
+1. Parse the challenge.
+2. Compute the **union** of the scopes it previously requested and the scopes in the challenge. Scope accumulation is a client responsibility; the server does not have to repeat already-granted scopes, and hierarchical scopes need not be deduplicated because the AS normalises them.
+3. Re-run the authorization flow with that set.
+4. Retry the original request, but only a bounded number of times, and treat persistent failure as a permanent authorization error.
+
+Clients acting for a user SHOULD attempt step-up; `client_credentials` clients MAY simply abort. Servers MUST account for scope hierarchies (a broader scope implies narrower ones) when deciding whether a token is sufficient.
+
+<Callout title="The one-line takeaway">
+The flow is 401 → resource metadata → AS metadata (validate `issuer`) → PKCE authorize with `resource=` → validate `iss` on the redirect → token → `Authorization: Bearer` forever after; a `403 insufficient_scope` restarts it with the union of old and new scopes.
+</Callout>
+
+export const quizFlow = [
+  {
+    q: 'What does the `resource_metadata` parameter in a 401 `WWW-Authenticate` header point to?',
+    options: [
+      'The authorization server metadata document',
+      'The Protected Resource Metadata document that lists the authorization servers for this MCP server',
+      'The tool list',
+      'The OAuth token endpoint',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why must an MCP client send the `resource` parameter in authorization and token requests?',
+    options: [
+      'To choose which scopes it wants',
+      'To bind the issued token to this specific MCP server so it cannot be replayed elsewhere',
+      'To tell the AS which transport is in use',
+      'Only when the AS advertises support for it',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'The AS metadata says `authorization_response_iss_parameter_supported: true` but the redirect has no `iss`. What must the client do?',
+    options: [
+      'Proceed, the parameter is optional',
+      'Normalise the URL and compare',
+      'Reject the response',
+      'Retry the token request without PKCE',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A client holding a valid token gets `403` with `error="insufficient_scope", scope="files:write"`. What scope set should it request next?',
+    options: [
+      'Exactly `files:write`',
+      'The union of its previously requested scopes and `files:write`',
+      'Everything in `scopes_supported`',
+      'No scopes, and let the AS decide',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/oauth-flow" questions={quizFlow} />
+
+<ProgressTracker client:visible id="security-and-auth/oauth-flow" />

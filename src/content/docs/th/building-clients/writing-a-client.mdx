@@ -1,0 +1,333 @@
+---
+title: 'Writing a Client'
+description: 'เชื่อมต่อ server ผ่าน stdio หรือ Streamable HTTP ด้วย SDK ของ TypeScript และ Python, list และ call tool, อ่าน resource, ทดสอบแบบ in-process และตอบ elicitation request'
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## client คือ connection บวกกับ call ที่มี type
+
+SDK ทางการทั้งสองตัวให้รูปแบบเดียวกัน: สร้าง client พร้อมชื่อและเวอร์ชัน, เลือก transport, connect แล้วเรียก method ที่ map ตรงกับ request ของ protocol แบบหนึ่งต่อหนึ่ง (`tools/list`, `tools/call`, `resources/read`, `prompts/get`) SDK จะเติม `_meta` ให้เอง ทั้ง protocol version, capability ที่คุณประกาศ และตัวตนของคุณ ในทุก request
+
+<Mermaid title="client หนึ่งตัวทำอะไรบ้าง" code={clientDiagram} />
+
+export const clientDiagram = `sequenceDiagram
+  participant H as Host code
+  participant C as Client (SDK)
+  participant S as Server
+  H->>C: connect(transport)
+  C->>S: server/discover
+  S-->>C: supportedVersions, capabilities
+  H->>C: listTools()
+  C->>S: tools/list (+ _meta)
+  S-->>C: tools[], ttlMs
+  H->>C: callTool(name, args)
+  C->>S: tools/call (+ _meta)
+  S-->>C: content[], isError`;
+
+## ติดตั้ง
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```bash
+    npm install @modelcontextprotocol/client
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```bash
+    uv add mcp
+    ```
+  </TabItem>
+</Tabs>
+
+## เชื่อมต่อผ่าน stdio
+
+สำหรับ server ที่รันในเครื่อง client จะเป็นคนเปิด process เองแล้วคุยผ่าน standard stream ของมัน
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Client } from '@modelcontextprotocol/client';
+    import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
+
+    const client = new Client({ name: 'my-first-client', version: '1.0.0' });
+
+    const transport = new StdioClientTransport({
+      command: 'npx',
+      args: ['tsx', 'src/index.ts'],
+    });
+
+    await client.connect(transport);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+    from mcp.client.stdio import stdio_client
+
+    async def main() -> None:
+        transport = stdio_client(command="uv", args=["run", "server.py"])
+        async with Client(transport) as client:
+            result = await client.list_tools()
+            print([t.name for t in result.tools])
+    ```
+  </TabItem>
+</Tabs>
+
+client เป็นเจ้าของ subprocess: ตอน shutdown มันจะปิด stdin ของ server และถ้า process ตายกะทันหันมันจะ restart ให้ (request ที่ค้างอยู่แค่ retry ใหม่ เพราะ protocol เป็น stateless)
+
+## เชื่อมต่อผ่าน Streamable HTTP
+
+สำหรับ remote server คุณแค่ส่ง URL ของ MCP endpoint ให้ client แต่ละ request จะกลายเป็น HTTP POST ของตัวเองพร้อม header ที่ต้องมี ส่วนเรื่อง response จะเป็น JSON หรือ SSE นั้น SDK จัดการให้
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+
+    const client = new Client({ name: 'my-client', version: '1.0.0' });
+    const transport = new StreamableHTTPClientTransport(new URL('http://localhost:3000/mcp'));
+
+    await client.connect(transport);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+
+    async def main() -> None:
+        # ส่ง URL เป็น string คือทางลัดของ Streamable HTTP transport
+        async with Client("http://127.0.0.1:8000/mcp") as client:
+            result = await client.list_tools()
+            print([t.name for t in result.tools])
+    ```
+  </TabItem>
+</Tabs>
+
+ถ้า server ต้องการ bearer token ให้ส่ง provider ที่คืน token ปัจจุบันให้ transport (TypeScript ใช้ `authProvider: { token: async () => ... }` ส่วน Python ส่ง `httpx2.AsyncClient(auth=...)` เข้าไปใน `streamable_http_client(url, http_client=...)`) OAuth flow แบบเต็มอยู่ใน[โมดูล security](/mcp/th/security-and-auth/)
+
+## list และ call tool
+
+`listTools` คืน tool definition ตามที่ server อธิบายไว้เป๊ะ ๆ: `name`, `title` (ถ้ามี), `description`, `inputSchema` และ `outputSchema` กับ `annotations` ถ้ามี ส่วน `callTool` ส่ง argument ไปแล้วคืนผลลัพธ์กลับมา
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const { tools } = await client.listTools();
+    for (const tool of tools) console.log(tool.name, tool.description);
+
+    const result = await client.callTool({
+      name: 'calculate-bmi',
+      arguments: { weightKg: 70, heightM: 1.75 },
+    });
+
+    // error ระดับ tool ถูกคืนมาใน result ไม่ได้ throw
+    if (result.isError) {
+      console.error('Tool error:', result.content);
+      return;
+    }
+    console.log(result.content);           // content block
+    console.log(result.structuredContent); // มีเมื่อ tool มี outputSchema
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.types import TextContent
+
+    result = await client.call_tool("lookup_book", {"title": "Dune"})
+
+    for block in result.content:
+        if isinstance(block, TextContent):
+            print(block.text)
+
+    print(result.structured_content)
+    print(result.is_error)
+    ```
+  </TabItem>
+</Tabs>
+
+ความต่างระหว่างช่องทาง error สองแบบเป็นเรื่องการออกแบบที่ host ต้องเคารพ:
+
+- **protocol error** (ไม่รู้จัก tool, request ผิดรูปแบบ) กลับมาเป็น JSON-RPC error SDK จะ raise ให้ model แทบไม่มีทางแก้เรื่องพวกนี้ได้ ให้ log แล้วบอกผู้ใช้
+- **tool execution error** ("date must be in the future") กลับมาเป็น result ปกติที่มี `isError: true` อย่าทิ้งมัน ให้ส่งข้อความนั้นกลับไปให้ model เพื่อให้มันแก้แล้วลองใหม่
+
+## อ่าน resource และดึง prompt
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const { resources } = await client.listResources();
+    const read = await client.readResource({ uri: 'file:///project/README.md' });
+    for (const c of read.contents) {
+      if ('text' in c) console.log(c.text);
+    }
+
+    const prompt = await client.getPrompt({
+      name: 'review-code',
+      arguments: { language: 'typescript' },
+    });
+    console.log(prompt.messages);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    listing = await client.list_resources()
+    read = await client.read_resource("file:///project/README.md")
+    for c in read.contents:
+        if hasattr(c, "text"):
+            print(c.text)
+
+    prompt = await client.get_prompt("review_code", {"language": "python"})
+    print(prompt.messages)
+    ```
+  </TabItem>
+</Tabs>
+
+อย่าลืม interaction model จาก[โมดูล server primitives](/mcp/th/server-primitives/): tool มีไว้ให้ model เรียก, resource มีไว้ให้ application แนบเป็น context, prompt มีไว้ให้ผู้ใช้เลือก client เปิดให้ครบทั้งสามอย่าง ส่วน host เป็นคนตัดสินว่าแต่ละอย่างจะโผล่ใน UI ยังไง
+
+## ทดสอบแบบ in-process
+
+คุณไม่ต้องมี network หรือ subprocess เพื่อทดสอบ server SDK ทั้งสองตัวให้ client คุยกับ server object ได้โดยตรง ทำให้ unit test เร็วและได้ผลคงที่
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+
+    const handler = createMcpHandler(() => {
+      const server = new McpServer({ name: 'pricing', version: '1.0.0' });
+      // ...registerTool(...)
+      return server;
+    });
+
+    // ส่ง fetch ของ transport ตรงเข้า handler เลย ไม่ต้องเปิด port
+    const transport = new StreamableHTTPClientTransport(new URL('http://test.local/mcp'), {
+      fetch: (url, init) => handler.fetch(new Request(url, init)),
+    });
+
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await client.connect(transport);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("Bookshop")
+
+    @mcp.tool()
+    def search_books(query: str, limit: int = 10) -> str:
+        """Search the catalog by title or author."""
+        return f"Found 3 books matching {query!r}."
+
+    async def test_search() -> None:
+        # ส่ง server object เข้าไปตรง ๆ: in-memory transport
+        async with Client(mcp) as client:
+            result = await client.call_tool("search_books", {"query": "dune"})
+            assert not result.is_error
+    ```
+  </TabItem>
+</Tabs>
+
+## ตอบ input request จาก server (MRTR)
+
+ภายใต้ protocol 2026-07-28 server จะไม่ส่ง request ของตัวเองมาหา client เลย เมื่อ tool ต้องการ input จากผู้ใช้ มันจะคืน `InputRequiredResult` กลับมา SDK ฝั่ง client จะ resolve request `elicitation/create` ที่ฝังอยู่ผ่าน handler ที่คุณลงทะเบียนไว้ แล้ว retry call เดิมพร้อม `inputResponses` และ `requestState` ที่เป็น opaque ดูรายละเอียดบน wire ได้ที่[โมดูล client interaction](/mcp/th/client-interaction/)
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    client.setRequestHandler('elicitation/create', async (request) => {
+      if (request.params.mode === 'url') {
+        // แสดง URL เต็ม ขอ consent แล้วเปิดใน browser ของระบบ
+        return { action: 'accept' };
+      }
+      // render request.params.requestedSchema เป็น form แล้วคืนสิ่งที่ผู้ใช้กรอก
+      return { action: 'accept', content: { city: 'Lisbon' } };
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+    from mcp.client import ClientRequestContext
+    from mcp.types import ElicitRequestParams, ElicitResult
+
+    async def handle_elicitation(context: ClientRequestContext, params: ElicitRequestParams) -> ElicitResult:
+        # แสดง params.message และ params.requested_schema ให้ผู้ใช้
+        return ElicitResult(action="accept", content={"region": "eu-west-1"})
+
+    async def main() -> None:
+        async with Client("http://127.0.0.1:8000/mcp", elicitation_callback=handle_elicitation) as client:
+            result = await client.call_tool("provision", {"name": "orders"})
+            print(result.content)
+    ```
+  </TabItem>
+</Tabs>
+
+การประกาศ handler นี่แหละที่ทำให้ SDK ใส่ `elicitation` ลงใน `clientCapabilities` ของทุก request server ต้องไม่ส่ง input request สำหรับ capability ที่คุณไม่ได้ประกาศ
+
+## ข้อคิดด้านการออกแบบ
+
+- **ทำ client ให้บาง** เรื่อง routing, namespace, consent และ caching เป็นงานของ host ถ้า class client ของคุณเริ่มมี branch "ไป server ไหนดี" แปลว่าคุณเอา logic ของ host ไปไว้ผิดชั้น
+- **มองทุก result เป็น input ที่ไว้ใจไม่ได้** ข้อความจาก tool, เนื้อหา resource และ annotation ล้วนมาจาก server ตรวจสอบก่อนแสดงให้ผู้ใช้หรือส่งให้ model
+- **ตั้ง timeout** `tools/call` ค้างได้ ให้จำกัดเวลาแล้วแสดง error ที่ชัดเจน แทนที่จะปล่อยให้บทสนทนาแช่แข็ง
+- **cache ผลของ discovery** `server/discover` และ `tools/list` มี `ttlMs` มาด้วย ใช้ซ้ำจนกว่าจะหมดอายุหรือมี notification `list_changed` เข้ามา
+
+<Callout title="สรุปหนึ่งบรรทัด">
+client คือ `connect` บวกกับ call ที่มี type อีกไม่กี่ตัว: list tool, call tool, อ่าน resource, ดึง prompt tool error กลับมาเป็น result ที่มี `isError` (ส่งต่อให้ model), protocol error ถูก throw (log ไว้) และ elicitation ถูกตอบด้วย handler ที่คุณลงทะเบียนก่อน connect
+</Callout>
+
+export const quizClient = [
+  {
+    q: 'TypeScript client รายงาน tool execution error เช่น "invalid date" อย่างไร?',
+    options: [
+      'throw exception',
+      'คืน result ที่มี isError: true และข้อความ error อยู่ใน content',
+      'คืน null',
+      'ปิด transport',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Python Client ใช้ transport อะไรเมื่อคุณส่ง URL เป็น string ธรรมดาให้มัน?',
+    options: [
+      'stdio',
+      'HTTP+SSE transport ที่ deprecate แล้ว',
+      'Streamable HTTP',
+      'WebSocket',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'การส่ง MCPServer object ตรง ๆ ให้ Client(mcp) ใน Python มีไว้เพื่ออะไร?',
+    options: [
+      'เปิดใช้ OAuth',
+      'รัน server แบบ in-process เพื่อให้ test เร็วและได้ผลคงที่ โดยไม่ต้องมี subprocess หรือ port',
+      'ทำให้ server เป็น stateful',
+      'ปิด elicitation',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ภายใต้ protocol 2026-07-28 server ขอ input จากผู้ใช้ระหว่าง tool call ได้อย่างไร?',
+    options: [
+      'ส่ง JSON-RPC request ของตัวเองไปหา client บน SSE stream',
+      'คืน InputRequiredResult แล้ว client retry call เดิมพร้อม inputResponses',
+      'เปิด WebSocket กลับไปหา client',
+      'ทำไม่ได้ มีแต่ client เท่านั้นที่ถามคำถามได้',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/writing-a-client" questions={quizClient} />
+
+<ProgressTracker client:visible id="building-clients/writing-a-client" />

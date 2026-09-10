@@ -1,0 +1,304 @@
+---
+title: 'Tools'
+description: 'Tool definitions, naming rules, tools/list and tools/call on the wire, result content types, and the two error channels — with the same tool in TypeScript and Python.'
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## An action the model may take
+
+A **tool** is a function the language model can decide to call. The server describes it with a name, a description, and a JSON Schema for its input; the host passes that description to the model; the model emits a call; the host forwards it as `tools/call` and feeds the result back into the conversation.
+
+<Mermaid title="Discovery, selection, invocation" code={toolFlow} />
+
+export const toolFlow = `sequenceDiagram
+  participant M as LLM
+  participant C as Client / Host
+  participant S as Server
+  C->>S: tools/list
+  S-->>C: tool definitions (ttlMs, cacheScope)
+  C->>M: definitions become the model's tool list
+  M->>C: call search_catalog(query: "mug")
+  C->>S: tools/call name=search_catalog
+  S-->>C: content[] (+ structuredContent)
+  C->>M: result returned as context`;
+
+Because the *model* chooses, the description and schema are not documentation — they are the interface. A vague description or a loose schema produces wrong calls. Design them as carefully as a public API.
+
+## The tool definition
+
+```json
+{
+  "name": "search_catalog",
+  "title": "Search the product catalog",
+  "description": "Find products by a case-insensitive substring of their name. Returns at most `limit` matches (default 10, max 50).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string", "description": "Substring to match against product names" },
+      "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+    },
+    "required": ["query"]
+  }
+}
+```
+
+| Field | Required | Purpose |
+|-------|----------|---------|
+| `name` | yes | Unique identifier within this server; what the model calls |
+| `title` | no | Human-readable label for UIs |
+| `description` | no (but always write one) | What it does, when to use it, what it returns |
+| `inputSchema` | yes | JSON Schema (2020-12 by default) for `arguments`; MUST be a valid schema object, never `null` |
+| `outputSchema` | no | Schema for `structuredContent` — see the [next lesson](/mcp/en/server-primitives/structured-output-and-annotations/) |
+| `annotations` | no | Behavior hints (`readOnlyHint`, `destructiveHint`, …) |
+| `icons` | no | Visual identifiers for UIs |
+
+A tool with **no parameters** should still declare a schema. The recommended form only accepts an empty object:
+
+```json
+{ "name": "get_current_time", "inputSchema": { "type": "object", "additionalProperties": false } }
+```
+
+### Naming rules
+
+- 1–128 characters, case-sensitive, unique within the server.
+- Only ASCII letters, digits, `_`, `-`, and `.` — no spaces or commas. `getUser`, `DATA_EXPORT_v2`, and `admin.tools.list` are all valid.
+- Uniqueness is scoped to *one server*. A host that aggregates many servers may see two `search` tools; it is the host's job to disambiguate, typically by prefixing with a server identifier. Do not rely on `serverInfo.name` for that — it is self-reported and not unique.
+
+Pick names the model can read: `search_catalog` beats `sc`, and `create_issue` beats `issue` (which could be read or create).
+
+## `tools/list`
+
+Discovery is a plain request with an optional cursor:
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": { "cursor": "optional" } }
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "tools": [ { "name": "search_catalog", "...": "..." } ],
+    "nextCursor": "next-page-cursor",
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+```
+
+Three things to notice:
+
+- **Pagination.** If `nextCursor` is present, call again with it as `cursor`. Cursors are opaque.
+- **Caching.** `ttlMs` says how long the list may be cached; `cacheScope` says whether a shared intermediary may cache it (`public`) or only this caller (`private`). Both are required on list results in the 2026-07-28 revision.
+- **Deterministic order.** Servers SHOULD return tools in the same order every time the set is unchanged. Hosts put tool definitions into the model's prompt prefix, and a reshuffled list breaks LLM prompt caching.
+
+## `tools/call`
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": { "name": "search_catalog", "arguments": { "query": "mug", "limit": 5 } }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "content": [ { "type": "text", "text": "Travel mug\nEspresso cup" } ],
+    "isError": false
+  }
+}
+```
+
+(Both examples omit the per-request `_meta` fields for brevity; every real request carries them — see [Foundations](/mcp/en/mcp-foundations/json-rpc-and-meta/).)
+
+### Result content types
+
+`content` is an array, so a single result can mix types:
+
+| `type` | Fields | Use for |
+|--------|--------|---------|
+| `text` | `text` | The default; what the model reads |
+| `image` | `data` (base64), `mimeType` | Screenshots, charts |
+| `audio` | `data` (base64), `mimeType` | Recordings, TTS output |
+| `resource_link` | `uri`, `name`, `description`, `mimeType` | Point at a resource without embedding it (not guaranteed to appear in `resources/list`) |
+| `resource` | `resource: { uri, mimeType, text or blob }` | Embed a resource's contents inline |
+
+Every content block may carry `annotations` (`audience`, `priority`, `lastModified`) — the same shape resources use.
+
+## The same tool in two SDKs
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    const catalog = [
+      { name: 'Espresso cup', price: 12 },
+      { name: 'Travel mug', price: 24 },
+    ];
+
+    const server = new McpServer({ name: 'catalog', version: '1.0.0' });
+
+    server.registerTool(
+      'search_catalog',
+      {
+        title: 'Search the product catalog',
+        description: 'Find products by a case-insensitive substring of their name.',
+        inputSchema: z.object({
+          query: z.string().describe('Substring to match against product names'),
+          limit: z.number().int().min(1).max(50).optional(),
+        }),
+      },
+      async ({ query, limit }) => {
+        const hits = catalog.filter((p) => p.name.toLowerCase().includes(query.toLowerCase()));
+        if (hits.length === 0) {
+          // execution error: the model can read this and try again
+          return { content: [{ type: 'text', text: `No products match "${query}". Try a shorter substring.` }], isError: true };
+        }
+        const names = hits.slice(0, limit ?? 10).map((p) => p.name);
+        return { content: [{ type: 'text', text: names.join('\n') }] };
+      },
+    );
+    ```
+    The Zod schema is converted to JSON Schema for `tools/list` and used to validate `arguments` before your handler runs; a schema violation becomes a protocol error, not a call into your code.
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    CATALOG = [
+        {"name": "Espresso cup", "price": 12},
+        {"name": "Travel mug", "price": 24},
+    ]
+
+    mcp = MCPServer("catalog")
+
+
+    @mcp.tool(title="Search the product catalog")
+    def search_catalog(query: str, limit: int = 10) -> str:
+        """Find products by a case-insensitive substring of their name."""
+        hits = [p for p in CATALOG if query.lower() in p["name"].lower()]
+        if not hits:
+            # ToolError becomes isError: true with this message as text
+            raise ToolError(f"No products match {query!r}. Try a shorter substring.")
+        return "\n".join(p["name"] for p in hits[:limit])
+    ```
+    The function signature becomes `inputSchema` (type hints, defaults, `required`) and the docstring becomes `description`. Raising `ToolError` produces a tool execution error; any other exception is reported as an error too, but `ToolError` lets you control the message the model sees.
+  </TabItem>
+</Tabs>
+
+## Two error channels
+
+Tools have **two** distinct ways to fail, and choosing the right one matters because they reach the model differently.
+
+**Protocol errors** are JSON-RPC errors: the request itself was wrong. Unknown tool name, arguments that fail `inputSchema`, an internal crash. The model is unlikely to fix these by rephrasing, and clients MAY hide them from it.
+
+```json
+{ "jsonrpc": "2.0", "id": 3, "error": { "code": -32602, "message": "Unknown tool: search_catalogue" } }
+```
+
+**Tool execution errors** are *successful* responses with `isError: true`. The call was well-formed; the operation failed for a reason the model can act on — a date in the past, a missing record, an upstream API refusing. Clients SHOULD show these to the model so it can self-correct.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "result": {
+    "resultType": "complete",
+    "content": [ { "type": "text", "text": "Invalid departure date: must be in the future. Current date is 2026-09-10." } ],
+    "isError": true
+  }
+}
+```
+
+The design rule: **make execution errors actionable.** "Error 500" teaches the model nothing; "limit must be between 1 and 50, you sent 200" lets it retry correctly on the next turn. Include the constraint, the offending value, and, when useful, the current state (like the date above).
+
+## State without sessions
+
+MCP has no protocol-level session, so a tool cannot rely on "what this client did earlier". If you need state across calls — a shopping basket, a browser tab, a transaction — mint an explicit **handle** and pass it back and forth as ordinary arguments:
+
+```json
+{ "name": "create_basket", "arguments": {} }
+```
+
+```json
+{ "content": [ { "type": "text", "text": "Created basket bsk_a1b2c3" } ], "structuredContent": { "basket_id": "bsk_a1b2c3" } }
+```
+
+```json
+{ "name": "add_item", "arguments": { "basket_id": "bsk_a1b2c3", "sku": "MUG-24" } }
+```
+
+The model carries `basket_id` forward. When designing handles: make them opaque and high-entropy, bind them server-side to the authenticated user (a handle is a *name*, not a credential), state their lifetime in the creation tool's description ("baskets expire after 24 hours"), and return a clear execution error on an expired handle so the model can create a new one.
+
+## Security checklist for tool servers
+
+The spec makes these **MUST**s for servers: validate all inputs, implement access controls, rate-limit invocations, sanitize outputs. And it reminds hosts that there should always be a human able to deny a tool call — which is why your [annotations](/mcp/en/server-primitives/structured-output-and-annotations/) matter.
+
+<Callout title="The one-line takeaway">
+A tool is a model-callable function described by a name, a description, and a JSON Schema; `tools/list` discovers it (paginated, cacheable, deterministically ordered) and `tools/call` runs it. Fail with a protocol error when the request is malformed, and with `isError: true` plus an actionable message when the operation fails — and carry cross-call state in explicit handles, never in the connection.
+</Callout>
+
+export const quizTools = [
+  {
+    q: 'Which tool name is INVALID under the spec\'s naming rules?',
+    options: [
+      'DATA_EXPORT_v2',
+      'admin.tools.list',
+      'search catalog',
+      'getUser',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A tool is called with a well-formed request, but the requested record does not exist. How should the server report it?',
+    options: [
+      'A JSON-RPC error with code -32602',
+      'A successful result with isError: true and a message the model can act on',
+      'An HTTP 404',
+      'An empty content array',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why should tools/list return tools in a deterministic order?',
+    options: [
+      'JSON-RPC requires sorted arrays',
+      'Hosts place definitions in the model prompt prefix, and a reshuffled list breaks LLM prompt caching',
+      'Otherwise pagination cursors are invalid',
+      'The Inspector refuses unordered lists',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How should a server keep a shopping cart across several tool calls?',
+    options: [
+      'Store it against the connection and look it up on later calls',
+      'Return an explicit basket handle from a creation tool and accept it as an argument on later calls',
+      'Use the Mcp-Session-Id header',
+      'Encode it in the tool name',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/tools" questions={quizTools} />
+
+<ProgressTracker client:visible id="server-primitives/tools" />

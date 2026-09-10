@@ -1,0 +1,90 @@
+---
+title: 'Production and Ecosystem'
+description: 'จาก server ที่ "ใช้งานได้" ไปสู่ server ที่ agent ใช้ได้ดีและ operator รันได้จริง — การออกแบบ tool สำหรับ model, การทดสอบและ debug, การ deploy แบบ remote, การเผยแพร่ลง registry และระบบนิเวศของ extension'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## "ใช้งานได้" คือแค่ครึ่งทาง
+
+ถึงตอนนี้คุณสร้าง server ที่ list tool ได้, serve resource ได้, พูดได้ทั้งสอง transport และถามข้อมูลจาก user ได้แล้ว server ตัวนั้น *ใช้งานได้* แต่ยังไม่ถึงขั้น *ดี*
+
+คนที่ตัดสินว่า MCP server ตัวหนึ่งดีหรือไม่มีอยู่สองกลุ่ม และไม่มีกลุ่มไหนเป็นคุณเลย:
+
+- **Model** มันอ่านชื่อ tool กับ description ของคุณแบบไม่มีบริบท ไม่มี README แล้วตัดสินใจในรอบเดียวว่าจะเรียก tool ไหนและเรียกอย่างไร tool ที่คนต้องใช้เวลาสิบนาทีถึงจะเข้าใจ คือ tool ที่ model จะใช้ผิดภายในสิบมิลลิวินาที
+- **Operator** คนที่ deploy server ของคุณไว้หลัง load balancer เฝ้าดูมันตอนตีสาม และอัปเกรดมันโดยไม่ทำให้ client ที่ต่ออยู่พัง ถ้า server ซ่อน state ไว้ใน process, log ลง stdout หรือส่ง breaking change ของ tool ออกไปเงียบ ๆ คนที่จะถูกปลุกตอนตีสามคือ *คุณ*
+
+module นี้ว่าด้วยการรับใช้คนทั้งสองกลุ่ม แล้วต่อด้วยระบบนิเวศที่ server ของคุณอยู่: คนจะหาเจอได้อย่างไร ติดตั้งอย่างไร และ protocol กำลังเติบโตไปทางไหน
+
+<Mermaid title="เส้นทางจาก 'ใช้งานได้' ไปสู่ production" code={roadDiagram} />
+
+export const roadDiagram = `flowchart LR
+  a["Works locally"] --> b["Tools a model uses well"]
+  b --> c["Tested and debuggable"]
+  c --> d["Deployed stateless behind HTTPS"]
+  d --> e["Published and discoverable"]
+  e --> f["Extensions: Tasks, Apps"]`;
+
+## module นี้ครอบคลุมอะไรบ้าง
+
+| บทเรียน | คำถามที่ตอบ |
+|--------|---------------------|
+| [Designing Tools for Agents](/mcp/th/production-and-ecosystem/designing-tools-for-agents/) | ทำไม model ถึงเลือก tool ผิดอยู่เรื่อย และจะแก้ที่ *definition* แทนที่จะแก้ prompt ได้อย่างไร |
+| [Testing and Debugging](/mcp/th/production-and-ecosystem/testing-and-debugging/) | จะลองยิง server โดยไม่ต้องมี LLM ใน loop, เขียน test ที่รันใน CI และอ่าน wire ตอนที่มันพังได้อย่างไร |
+| [Deploying Remote Servers](/mcp/th/production-and-ecosystem/deploying-remote-servers/) | Streamable HTTP server แบบ stateless ต้องการอะไรจาก proxy, runtime และ operator |
+| [Publishing and the MCP Registry](/mcp/th/production-and-ecosystem/publishing-and-registry/) | จะทำให้คนติดตั้ง server ของเราได้ในบรรทัดเดียว และลงทะเบียนใน registry ทางการได้อย่างไร |
+| [Extensions and the Road Ahead](/mcp/th/production-and-ecosystem/extensions-and-the-road-ahead/) | Tasks กับ MCP Apps คืออะไร อะไรถูก deprecate ไปแล้ว และ spec วิวัฒนาการอย่างไร |
+
+## สามนิสัยที่ module นี้จะปลูกฝัง
+
+**ออกแบบให้ผู้อ่านที่เป็น model** description ของ tool ทุกตัวคือ prompt ชื่อ parameter ทุกตัวคือ hint และ error message ทุกข้อความคือโอกาสให้ model แก้ตัวเองแทนที่จะยอมแพ้ คุณจะได้เรียนวิธีเขียนสามอย่างนี้อย่างตั้งใจ
+
+**เชื่อ wire ไม่ใช่ SDK** เวลามีอะไรพัง JSON-RPC message บน wire คือความจริงเพียงหนึ่งเดียว Inspector แสดงมันให้คุณเห็น และ in-process test ให้คุณ assert กับมันได้ abstraction ของ SDK ที่คุณมองทะลุไม่ได้ คือภาระตอนตีสาม
+
+**stateless เข้าไว้ น่าเบื่อเข้าไว้** protocol version `2026-07-28` ถอด session ออกไปอย่างตั้งใจ server ที่รักษาสัญญาว่า "ทุก request อยู่ได้ด้วยตัวเอง" จะ scale แนวนอนได้ฟรี รอดจากการ restart และไม่ต้องใช้ sticky load balancing การตัดสินใจเรื่อง deployment ทุกข้อใน module นี้ตามมาจากคุณสมบัติข้อเดียวนี้
+
+<Callout title="สรุปหนึ่งบรรทัด">
+MCP ระดับ production คือโจทย์ออกแบบสองข้อ — interface ที่ model ใช้ถูกตั้งแต่ครั้งแรก และ service แบบ stateless ที่ operator รันได้โดยไม่มีเซอร์ไพรส์ — บวกกับงานด้านระบบนิเวศที่ทำให้ผลลัพธ์นั้นหาเจอและติดตั้งได้
+</Callout>
+
+export const quizProdIndex = [
+  {
+    q: 'ตาม module นี้ ใครคือสองกลุ่มที่ตัดสินว่า MCP server "ดี" หรือไม่?',
+    options: [
+      'คนเขียน spec กับคนดูแล SDK',
+      'model ที่อ่าน tool definition กับ operator ที่รัน server',
+      'end user กับ database',
+      'npm กับ PyPI',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม protocol version 2026-07-28 ถึงทำให้การ deploy ง่ายขึ้น?',
+    options: [
+      'มันบังคับให้ใช้ sticky session บน load balancer',
+      'มันถอด session ระดับ protocol ออก ทุก request จึงอยู่ได้ด้วยตัวเองและ server scale แนวนอนได้',
+      'มันย้าย server ทั้งหมดไปใช้ stdio',
+      'มันบังคับให้มีหนึ่ง process ต่อหนึ่ง client',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'เมื่อ server ทำงานผิดปกติ module นี้ถือว่าอะไรคือความจริงเพียงหนึ่งเดียว?',
+    options: [
+      'TypeScript type ของ SDK',
+      'คำอธิบายของ model ว่าเกิดอะไรขึ้น',
+      'JSON-RPC message ที่แลกเปลี่ยนกันจริงบน wire',
+      'README',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/index" questions={quizProdIndex} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/index" />

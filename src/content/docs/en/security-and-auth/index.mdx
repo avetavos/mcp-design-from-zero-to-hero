@@ -1,0 +1,147 @@
+---
+title: 'Security and Authorization'
+description: 'The trust boundaries in an MCP deployment, why stdio and HTTP servers authenticate differently, the OAuth 2.1 roles each participant plays, and the standards the authorization spec is built from.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Five parties, four boundaries
+
+An MCP deployment is never just "a client and a server". A real request crosses several trust boundaries, and each one is a place where credentials can leak, be reused, or be forged:
+
+<Mermaid title="The trust boundaries a single tool call crosses" code={boundariesDiagram} />
+
+export const boundariesDiagram = `flowchart LR
+  U["User"] -->|"approves actions"| H["Host (AI app)"]
+  H -->|"one client per server"| C["MCP Client"]
+  C -->|"MCP over stdio or HTTP"| S["MCP Server"]
+  S -->|"its own credentials"| T["Third-party API"]
+  A["Authorization Server"] -.->|"issues tokens for S"| C`;
+
+| Boundary | What crosses it | The question to ask |
+|----------|-----------------|---------------------|
+| User ↔ Host | Consent to run tools, see elicitation forms, open URLs | Does the user know which server is asking, and for what? |
+| Host ↔ Client | Tool definitions and results going into the model | Are tool descriptions and results treated as untrusted input? |
+| Client ↔ Server | Requests, plus a bearer token on HTTP | Was this token issued *for this server*? |
+| Server ↔ Third-party API | The server's *own* credentials for an upstream service | Is the server reusing the client's token instead of its own? |
+
+This module is about the last three boundaries. The first one is a UX obligation covered in [Server Primitives](/mcp/en/server-primitives/) and [Client Interaction](/mcp/en/client-interaction/).
+
+## stdio and HTTP authenticate differently
+
+The authorization spec is **transport-scoped**. It is OPTIONAL overall, and when a server supports it:
+
+- **Streamable HTTP servers SHOULD** implement the OAuth 2.1 flow described in this module.
+- **stdio servers SHOULD NOT** implement it. A stdio server is a subprocess the host launched on the user's own machine; it takes credentials from the environment (`env` in the host's config, a keychain, a config file) exactly as any local CLI would.
+- Custom transports MUST follow the established security practices for their protocol.
+
+The reasoning is simple: a stdio server has no network endpoint to protect, and the host already decided to trust it enough to execute it. A remote HTTP server, by contrast, is reachable by anyone who can send a POST, so it needs a way to know *who* is asking and *what they were granted*.
+
+```json
+// Host config for a stdio server: credentials come from the environment
+{
+  "mcpServers": {
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@example/github-mcp"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    }
+  }
+}
+```
+
+## The OAuth 2.1 roles
+
+MCP does not invent an authentication protocol. It assigns OAuth 2.1 roles to the participants it already has:
+
+| MCP participant | OAuth 2.1 role | Responsibility |
+|-----------------|----------------|----------------|
+| MCP server (HTTP) | **Resource server** | Accepts bearer tokens, validates them (signature, expiry, *audience*, scopes), answers `401`/`403` when they fail |
+| MCP client | **OAuth client** | Discovers the authorization server, registers or identifies itself, runs the authorization-code flow with PKCE on the user's behalf, sends the token on every request |
+| Authorization server | **Authorization server** | Authenticates the user, shows consent, issues access (and optionally refresh) tokens *for a specific resource* |
+| User | **Resource owner** | Grants or denies the client access to the server |
+
+The authorization server may be hosted next to the MCP server or be a separate identity provider. The spec deliberately says nothing about how it is implemented; it only requires that the MCP server *point to it* through Protected Resource Metadata, covered in the [next lesson](/mcp/en/security-and-auth/oauth-flow/).
+
+## Three things the spec is strict about
+
+Most of OAuth is "SHOULD". Three rules are "MUST", and they are the ones that keep tokens from wandering across boundaries:
+
+1. **Audience binding.** The client requests a token *for this server* (`resource=` parameter), and the server MUST verify the token was issued to it. A token for `https://mail.example.com` is worthless at `https://mcp.example.com`, even if the same authorization server signed both.
+2. **No token passthrough.** A server MUST NOT accept tokens that were not issued for it, and MUST NOT forward a client's token to any downstream API. Upstream calls use the server's own credentials.
+3. **Bearer header only.** Tokens travel in `Authorization: Bearer …` on every request, never in the URL query string where they end up in logs and browser history.
+
+Everything else in this module follows from those three.
+
+## The standards you will meet
+
+The MCP authorization spec composes a *subset* of existing IETF and OpenID work rather than defining new crypto. You do not need to read them all, but you should recognise the names:
+
+| Standard | What MCP uses it for |
+|----------|----------------------|
+| OAuth 2.1 (draft-ietf-oauth-v2-1) | The base flow: authorization code + PKCE, no implicit grant |
+| RFC 6750 | Bearer token usage and the `WWW-Authenticate` challenge format |
+| RFC 9728 | Protected Resource Metadata: how a server advertises its authorization server(s) |
+| RFC 8414 | Authorization Server Metadata discovery (`/.well-known/oauth-authorization-server`) |
+| OpenID Connect Discovery 1.0 | The alternative discovery document (`/.well-known/openid-configuration`) |
+| RFC 8707 | Resource indicators: the `resource=` parameter that binds a token to one server |
+| RFC 9207 | The `iss` parameter on the redirect, which defeats mix-up attacks |
+| Client ID Metadata Documents (draft) | HTTPS URLs as client identifiers, replacing dynamic registration |
+| RFC 7591 | Dynamic Client Registration, now deprecated but kept for compatibility |
+
+## What this module covers
+
+| Lesson | You will learn |
+|--------|----------------|
+| [The Authorization Flow](/mcp/en/security-and-auth/oauth-flow/) | The full sequence from a `401` to a working bearer token, with exact headers and documents |
+| [Client Registration](/mcp/en/security-and-auth/client-registration/) | Pre-registration, Client ID Metadata Documents, and why dynamic registration was deprecated |
+| [Protecting Your Server](/mcp/en/security-and-auth/protecting-your-server/) | Verifying tokens in the TypeScript and Python SDKs, scopes, and step-up challenges |
+| [Threats and Mitigations](/mcp/en/security-and-auth/threats-and-mitigations/) | Token passthrough, confused deputy, SSRF, handle hijacking, prompt injection, and what stops each |
+| [Third-Party Authorization](/mcp/en/security-and-auth/third-party-auth-and-url-elicitation/) | When your server needs its *own* access to another API, and how URL elicitation keeps that safe |
+
+<Callout title="The one-line takeaway">
+MCP borrows OAuth 2.1 wholesale: the HTTP server is a resource server, the client is an OAuth client, and the three non-negotiables are audience-bound tokens, no passthrough, and bearer headers only. stdio servers skip all of it and read credentials from the environment.
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'Which transport is the MCP authorization spec written for?',
+    options: [
+      'stdio only',
+      'HTTP-based transports; stdio servers take credentials from the environment instead',
+      'Both equally',
+      'Neither, it is a separate protocol',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In OAuth 2.1 terms, what role does an HTTP MCP server play?',
+    options: [
+      'Authorization server',
+      'OAuth client',
+      'Resource server',
+      'Resource owner',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A server receives a valid, unexpired token that was issued for a different service by the same authorization server. What must it do?',
+    options: [
+      'Accept it, the signature is valid',
+      'Forward it upstream so the other service can validate it',
+      'Reject it, because tokens must be audience-bound to this server',
+      'Accept it only for read-only tools',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="security-and-auth/index" />

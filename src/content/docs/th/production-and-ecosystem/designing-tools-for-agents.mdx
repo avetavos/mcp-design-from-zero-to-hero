@@ -1,0 +1,246 @@
+---
+title: 'Designing Tools for Agents'
+description: 'tool คือ interface สำหรับ model ไม่ใช่กระจกสะท้อน REST API — วิธีตั้งชื่อ เขียน description กำหนดรูปร่าง และออกแบบ error ให้ LLM เลือก tool ถูกและใช้ถูกตั้งแต่ครั้งแรก'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ผู้อ่านคือ model
+
+REST API ถูกอ่านโดย developer ที่เปิด docs ไว้ มีเวลาทดลอง และมี debugger แต่ MCP tool ถูกอ่านโดย language model ใน forward pass เดียว โดยที่รายการ tool ต้องแย่ง context กับข้อความของ user และทุกอย่างที่เหลือ มันมองดู `name`, `description` และ `inputSchema` แค่ครั้งเดียว แล้วตัดสินใจเลย
+
+สิ่งนี้เปลี่ยนความหมายของคำว่า "ออกแบบดี" MCP server ที่ดีที่สุดไม่ใช่ตัวที่ expose endpoint เยอะที่สุด แต่เป็นตัวที่รายการ tool อ่านแล้วเหมือนเมนู *งาน* สั้น ๆ ที่ไม่กำกวม
+
+<Mermaid title="สิ่งที่ model เห็นจริง ๆ" code={readerDiagram} />
+
+export const readerDiagram = `flowchart LR
+  l["tools/list"] --> n["name"]
+  l --> d["description"]
+  l --> s["inputSchema"]
+  n --> m["model picks a tool and fills arguments"]
+  d --> m
+  s --> m
+  m --> c["tools/call"]
+  c --> r["result text + structuredContent"]
+  r --> m`;
+
+## tool น้อยตัว แต่เป็นรูปร่างของงาน
+
+ความผิดพลาดที่พบบ่อยที่สุดคือการสะท้อน CRUD ตรง ๆ server ที่ expose `list_users`, `get_user`, `create_user`, `update_user`, `delete_user`, `list_orders`, `get_order`, ... บังคับให้ model ต้องวางแผน workflow หลายขั้นทุกครั้ง และทุกขั้นคือโอกาสเลือกผิด
+
+ให้ถามแทนว่า *user ขออะไรจริง ๆ* แล้วสร้าง tool หนึ่งตัวต่อหนึ่งคำตอบ
+
+| สะท้อน CRUD (ควรเลี่ยง) | รูปร่างของงาน (ควรใช้) |
+|---------------------|----------------------|
+| `get_user`, `list_orders`, `get_order` | `find_recent_orders_for_customer` |
+| `create_ticket`, `add_ticket_comment`, `set_ticket_priority` | `file_bug_report` |
+| `list_files`, `read_file` (×N) | `search_docs` ที่คืน excerpt |
+
+tool ไม่กี่ตัวที่แต่ละตัวทำงานหนึ่งหน่วยที่มีความหมายให้เสร็จ ดีกว่า primitive สามสิบตัว spec ไม่ได้จำกัดคุณ แต่ context และ attention ของ model จำกัด ถ้าจำเป็นต้องมี primitive สำหรับ edge case ก็เก็บไว้ได้ แต่ให้ common path อยู่ใน tool เดียว
+
+## ชื่อ
+
+ชื่อ tool **ควร** ยาว 1–128 ตัวอักษรจากชุด `A-Z a-z 0-9 _ - .` เป็น case-sensitive และไม่ซ้ำกันภายใน server นอกเหนือจากตัวอักษรของ spec:
+
+- **ขึ้นต้นด้วยกริยาแล้วตามด้วยคำนาม**: `search_issues`, `create_invoice`, `get_weather_forecast` model จะกวาดตาหา action ที่มันต้องการ
+- **ใช้ prefix หรือสไตล์เดียวกันทั้ง server** host ที่รวม server หลายตัวอาจเติมชื่อ server นำหน้าเพื่อกันชื่อชนกัน (สอง server ที่ต่างก็มี `search`) ดังนั้นอย่าพึ่ง `name` ของ server ในการแยกแยะ และอย่าผสม `camelCase` กับ `snake_case`
+- **บอกว่าทำอะไร ไม่ใช่ทำอย่างไร**: `send_email` ไม่ใช่ `smtp_post_message`
+- **เลี่ยงตัวย่อ** ที่ model ต้องเดา: `list_repositories` ไม่ใช่ `ls_repos`
+
+## description ที่ทำให้ตัดสินใจง่าย
+
+description คือ string ที่สำคัญที่สุดของ tool เขียนเป็นสามส่วน:
+
+1. **ทำอะไรและใช้เมื่อไร** หนึ่งประโยค
+2. **เมื่อไร *ไม่ควร* ใช้** และควรใช้อะไรแทน model ต้องการข้อนี้เพื่อเลือกระหว่าง tool ข้างเคียง
+3. **จะได้อะไรกลับมา** รูปร่าง ขีดจำกัด และ pagination ถ้ามี
+
+แบบแย่:
+
+```json
+{
+  "name": "query",
+  "description": "Runs a query."
+}
+```
+
+แบบดี:
+
+```json
+{
+  "name": "search_issues",
+  "description": "Search open and closed issues in the project tracker by free text, label, or assignee. Use this to find existing issues before filing a new one. Do not use it to read a single known issue — use get_issue with its id instead. Returns up to 20 matches per page with id, title, state, and a one-line summary; pass the returned nextCursor to fetch more."
+}
+```
+
+แบบดีบอก model ว่าเมื่อไรควรเลือก tool นี้ เมื่อไรควรเลือกตัวข้างเคียง และจะได้อะไรกลับมา ไม่มีคำไหนเป็นของประดับเลย
+
+## parameter
+
+property ทุกตัวใน `inputSchema` ควรมี `description` นอกจากนั้น:
+
+- **ใช้ `enum` สำหรับชุดค่าปิด** `"unit": { "enum": ["metric", "imperial"] }` สะกดผิดไม่ได้ แต่ string อิสระสะกดผิดได้
+- **ใส่ค่า `default`** เพื่อให้ parameter ที่ optional เป็น optional จริง ๆ และ model ไม่ต้องคิดค่าขึ้นมาเอง
+- **เลี่ยง boolean ที่กำกวม** `"verbose": true` หมายความว่าอะไร ใช้ enum ที่มีชื่อระดับแทน หรือแยกเป็นสอง tool ถ้าพฤติกรรมต่างกันจริง
+- **ซ้อนให้ตื้น** object ที่ซ้อนลึกและ `oneOf` composition ทำได้ตาม spec (อนุญาต keyword ของ JSON Schema 2020-12 ทุกตัว) แต่ทุกชั้นที่ซ้อนคือชั้นที่ model ทำผิดได้ แบนแล้วเร็ว
+- **ระบุชุด `required` ตามจริง** ถ้าจำเป็น model ต้องใส่ ถ้า optional ให้มี default
+- **ห้าม mark ความลับด้วย `x-mcp-header`** — ค่าใน header มองเห็นได้โดย intermediary ทุกตัว
+
+เป้าหมายคือ schema ที่ validator เข้มงวดยอมรับและ model กรอกถูกตั้งแต่ครั้งแรก ทดสอบด้วย Inspector: ถ้า *คุณ* ยังต้องอ่าน schema ซ้ำเพื่อจะเรียก tool model ก็ต้องเหมือนกัน
+
+## การออกแบบ response
+
+ผลลัพธ์ของ tool call จะไปอยู่ใน context ของ model ทุก byte ที่คุณคืนคือ byte ที่ model ต้องอ่าน และเป็น byte ที่ user ต้องจ่าย
+
+- **คุม budget token** คืนสรุป ไม่ใช่ dump ทั้งก้อน tool `search` ที่คืน 20 แถวแถวละห้า field ถือว่าโอเค แต่คืน 2,000 record เต็ม ๆ ไม่โอเค ต่อให้ API ทำได้
+- **จับคู่ text กับ `structuredContent`** text ใน `content` คือสิ่งที่ model อ่าน ส่วน `structuredContent` (validate กับ `outputSchema`) คือสิ่งที่ code mode และ typed client อ่าน คืนทั้งคู่สำหรับข้อมูลชุดเดียวกัน
+- **ใช้ `resource_link` สำหรับ payload ขนาดใหญ่** log file 4 MB ควรกลับมาเป็น link ที่ host ไป fetch ได้เมื่อต้องการ ไม่ใช่ text inline
+- **แบ่งหน้าด้วย cursor** คืน `nextCursor` ใน structured output และอธิบายไว้ใน description ของ tool เหมือนตัวอย่างแบบดีข้างบน
+- **เรียงผลลัพธ์แบบ deterministic** และระบุหน่วยกับ timestamp ให้ชัด (`"temperature_c": 22.5`, `"as_of": "2026-09-10T08:00:00Z"`) `22.5` โดด ๆ ชวนให้เดาผิด
+
+## error ที่สอนได้
+
+MCP มี error สองช่องทาง และการเลือกช่องทางที่ถูกจะเปลี่ยนสิ่งที่ model ทำต่อได้:
+
+- **Protocol error** (JSON-RPC `error` เช่น `-32602` สำหรับ tool ที่ไม่รู้จักหรือ argument ผิดรูป) หมายถึง *request* ผิดในแบบที่ model น่าจะแก้ไม่ได้
+- **Tool execution error** (`isError: true` ใน result) หมายถึง tool รันแล้วล้มเหลวด้วยเหตุผลที่ model *แก้ได้*
+
+เขียน execution error ให้เป็นคำสั่ง:
+
+```json
+{
+  "resultType": "complete",
+  "isError": true,
+  "content": [
+    {
+      "type": "text",
+      "text": "Invalid departure date: must be in the future. Current date is 2026-09-10. Retry with a date on or after 2026-09-11 in YYYY-MM-DD format."
+    }
+  ]
+}
+```
+
+ตอนนี้ model รู้แล้วว่าอะไรผิด วันนี้วันที่เท่าไร และการ retry ที่ถูกต้องหน้าตาเป็นอย่างไร เทียบกับ `"error: bad input"` ที่ทำให้บทสนทนาจบลงตรงนั้น
+
+client **ควร** ส่ง execution error กลับไปให้ model อย่างแม่นยำเพื่อให้มันแก้ตัวเองได้ ทำให้ loop นี้คุ้มค่าที่จะมี
+
+## idempotency และ annotation
+
+`annotations` คือ hint ที่ client อาจใช้ตัดสินใจว่าจะถาม user ยืนยันหรือไม่ จากมุมของ client มันเป็นข้อมูลที่ไม่น่าเชื่อถือ แต่ annotation ที่ซื่อสัตย์ทำให้ server ของคุณใช้แล้วสบายใจ:
+
+```json
+{
+  "name": "delete_branch",
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}
+```
+
+ออกแบบ tool ให้ idempotent เท่าที่ทำได้: การลบ branch ที่ถูกลบไปแล้วควรสำเร็จ (หรือคืนผล "already gone" ที่ชัดเจน) ไม่ใช่ throw tool ที่ idempotent รอดจากการ retry ที่ MRTR และ network ไม่เสถียรสร้างขึ้นมา
+
+## state ต้องมี handle
+
+ไม่มี session ระดับ protocol ถ้า workflow กินหลาย call — ตะกร้าสินค้า, browser tab ที่เปิดอยู่, database transaction — ให้คืน handle ที่ชัดเจนจาก tool ที่สร้าง แล้วรับมันกลับใน call ถัด ๆ ไป:
+
+```json
+{ "name": "create_basket", "arguments": {} }
+```
+
+```json
+{
+  "content": [{ "type": "text", "text": "Created basket bsk_a1b2c3 (expires after 24h idle)" }],
+  "structuredContent": { "basket_id": "bsk_a1b2c3" }
+}
+```
+
+จากนั้น `add_item` รับ `basket_id` กฎง่าย ๆ: handle ต้อง opaque และมี entropy สูง ผูกกับ user ที่ authenticate แล้วฝั่ง server มีอายุที่ระบุไว้ *ใน description ของ tool ที่สร้าง* และการเรียกด้วย handle ที่หมดอายุต้องคืน execution error ที่บอกว่า "create a new basket"
+
+## สุขอนามัยของ listing
+
+สองเรื่องเล็ก ๆ ที่ให้ผลตอบแทนในทุกบทสนทนา:
+
+- **คืน tool ในลำดับ deterministic** client cache รายการไว้ และ LLM provider cache prompt prefix ไว้ `tools/list` ที่สลับลำดับทำลาย cache ทั้งคู่
+- **ตั้ง `ttlMs` และ `cacheScope` ให้เหมาะ** ชุด tool แบบ static ประกาศ `"ttlMs": 3600000, `"cacheScope": "public"` ได้ ส่วนรายการแบบ per-tenant เป็น `"private"` ใช้ร่วมกับ `listChanged` สำหรับการอัปเดตที่นาน ๆ ครั้ง
+
+และใช้ field `instructions` ของ `server/discover` มันคือช่อง system prompt ฟรีสำหรับบอก *วิธี* ใช้ server ของคุณให้ดี — ลำดับ workflow, หน่วย, ขีดจำกัด เขียนแค่หนึ่งย่อหน้า
+
+## ก่อนและหลัง
+
+<Mermaid title="การ refactor พื้นผิวของ tool" code={refactorDiagram} />
+
+export const refactorDiagram = `flowchart TB
+  subgraph before["Before: 6 CRUD tools"]
+    b1["list_customers"]
+    b2["get_customer"]
+    b3["list_orders"]
+    b4["get_order"]
+    b5["list_shipments"]
+    b6["get_shipment"]
+  end
+  subgraph after["After: 2 task tools"]
+    a1["find_customer_orders"]
+    a2["get_order_status"]
+  end
+  before --> after`;
+
+server แบบ "หลัง" ตอบคำถาม "order ล่าสุดของ Ana อยู่ไหน" ได้ใน call เดียวแทนที่จะเป็นสี่ มี description ที่ต้องเขียนให้ถูกสองอันแทนที่จะเป็นหก และไม่เหลือที่ให้ model หลงทาง
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ออกแบบ tool ให้ผู้อ่านที่เป็น model: tool น้อยตัวแต่เป็นรูปร่างของงาน ชื่อขึ้นต้นด้วยกริยา description ที่บอกว่าใช้เมื่อไรและไม่ใช้เมื่อไร schema แบนที่มี enum และ default ผลลัพธ์ที่คุม budget token พร้อม `structuredContent` error ที่บอก model ว่าจะ retry อย่างไร annotation ที่ซื่อสัตย์ handle ที่ชัดเจนสำหรับ state และ `tools/list` ที่ deterministic และ cache ได้
+</Callout>
+
+export const quizDesignTools = [
+  {
+    q: 'ทำไมถึงควรมี tool รูปร่างของงานไม่กี่ตัว มากกว่าสะท้อน CRUD ครบชุด?',
+    options: [
+      'spec จำกัดให้ server มี tool ได้สิบตัว',
+      'primitive ที่เพิ่มมาทุกตัวคือโอกาสที่ model จะวางแผนผิด และกิน context ส่วน tool รูปร่างของงานตอบคำถาม user ได้ใน call เดียว',
+      'tool แบบ CRUD มี description ไม่ได้',
+      'tool รูปร่างของงานไม่ต้องมี input schema',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'tool ควรใช้ error ช่องทางไหนสำหรับ "date must be in the future"?',
+    options: [
+      'JSON-RPC protocol error ด้วย code -32602',
+      'HTTP 500',
+      'result ที่มี isError: true และ text อธิบายวิธีแก้ เพื่อให้ model แก้ตัวเองได้',
+      'คืน result ว่างเงียบ ๆ',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'server ควรพา state ข้าม tool call อย่างไร?',
+    options: [
+      'พึ่ง header Mcp-Session-Id',
+      'คืน handle ที่ชัดเจนและ opaque จาก tool ที่สร้าง แล้วรับมันเป็น argument ใน call ถัดไป พร้อมระบุอายุไว้',
+      'เก็บ state ผูกกับ TCP connection',
+      'ให้ client ส่ง result ก่อนหน้าทั้งก้อนกลับมา',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมต้องคืน tool ในลำดับ deterministic จาก tools/list?',
+    options: [
+      'spec กำหนดเป็น MUST',
+      'เพื่อให้ client cache รายการได้ และ prompt-prefix cache ของ LLM ยังอุ่นอยู่',
+      'เพราะเรียงตามตัวอักษรทำให้แม่นยำขึ้น',
+      'เพื่อให้ไม่ต้องมี pagination',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/designing-tools-for-agents" questions={quizDesignTools} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/designing-tools-for-agents" />

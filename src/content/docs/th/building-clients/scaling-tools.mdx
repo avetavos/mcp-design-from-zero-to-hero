@@ -1,0 +1,199 @@
+---
+title: 'Scaling to Many Servers and Tools'
+description: 'progressive tool discovery, การเชื่อมต่อ server ตามต้องการ, caching ด้วย ttlMs, การรักษา prompt cache และ programmatic tool calling สำหรับ host ที่เชื่อมต่อ tool หลายร้อยตัว'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## host แบบตรงไปตรงมาพังเมื่อ scale
+
+host ที่ง่ายที่สุดจะ list tool ทุกตัวจาก server ทุกตัว แล้วยัดทั้งหมดให้ model ในทุก turn ถ้ามีห้า tool ก็ไม่เป็นไร แต่ถ้ามีสี่สิบ server กับหกร้อย tool แค่ definition ก็กิน context window ไปเกือบหมดก่อนที่ model จะได้อ่านข้อความของผู้ใช้ และความแม่นยำในการเลือก tool จะตกลงเมื่อ model ต้องกวาดสายตาผ่าน schema ที่ไม่เกี่ยวข้องหลายร้อยตัว
+
+มีสองรูปแบบที่แก้ปัญหานี้ **progressive discovery** ควบคุมว่า tool definition จะเข้าสู่ context ของ model *เมื่อไร* ส่วน **programmatic tool calling** ควบคุมว่า tool จะถูกเรียก *อย่างไร* เพื่อให้ข้อมูลระหว่างทางไม่ต้องผ่าน model เลย
+
+## progressive tool discovery
+
+host ยังคงดึง `tools/list` จาก server ทุกตัว แต่เก็บ definition ไว้ใน registry ของตัวเองแทนที่จะยัดเข้า context model จะได้ meta-tool ชุดเล็ก ๆ แทน:
+
+<Mermaid title="catalog, inspect, execute" code={discoveryDiagram} />
+
+export const discoveryDiagram = `sequenceDiagram
+  participant M as Model
+  participant H as Host
+  participant S as MCP servers
+  M->>H: search_tools(query)
+  H-->>M: names + one-line descriptions
+  M->>H: get_tool_details(name)
+  H-->>M: full inputSchema for one tool
+  M->>H: call tool
+  H->>S: tools/call
+  S-->>H: result
+  H-->>M: tool_result`;
+
+**ชั้นที่ 1: catalog** `search_tools({ query })` คืนชื่อที่ตรงกับคำค้นพร้อมคำอธิบายสั้น ๆ เท่านั้น
+
+```json
+[
+  { "name": "salesforce_updateRecord", "description": "Update fields on a Salesforce object" },
+  { "name": "salesforce_upsertRecord", "description": "Insert or update based on external ID" }
+]
+```
+
+**ชั้นที่ 2: inspect** `get_tool_details({ name })` คืน definition ฉบับเต็มของ tool ตัวเดียวนั้น
+
+**ชั้นที่ 3: execute** model เรียก tool โดยโหลดมาแค่ schema ที่ต้องใช้
+
+### เมื่อไรควรเปิดใช้
+
+การโหลดทุกอย่างเหมาะเมื่อ definition มีขนาดเล็ก ตั้ง threshold ไว้ (คำแนะนำคือราว 1 ถึง 5 เปอร์เซ็นต์ของ context window) แล้วสลับไปใช้ progressive discovery เมื่อ tool definition เกินเส้นนั้น
+
+### เลือกกลยุทธ์การค้นหา
+
+| กลยุทธ์ | trade-off |
+|----------|-----------|
+| keyword (BM25, regex) | ง่าย ถูก ใช้ได้ดีกับชื่อที่บรรยายชัด |
+| embedding similarity | รับมือคำพ้องความหมายได้ แต่ต้องมี index |
+| subagent (model เล็กที่เร็วช่วยเลือก tool) | แม่นมาก แต่เสียค่า model call |
+| hybrid | รวมคะแนนจากหลายวิธี หรือเลือกตามแต่ละ query |
+
+provider บางรายมี tool search มาให้ในตัว (Claude API มี tool search tool ที่ทำงานร่วมกับ `defer_loading` บน tool definition) เลือกใช้ feature ของ platform เมื่อมี และสร้างเองเมื่อต้องการ ranking เฉพาะโดเมนหรือการกรองตาม access control
+
+### แนวทางการ implement
+
+- **มีระดับรายละเอียดให้เลือก:** ชื่ออย่างเดียว, ชื่อกับคำอธิบาย, schema เต็ม
+- **memoize definition ฝั่ง host** เมื่อดึงมาแล้ว การใส่กลับเข้า context ทีหลังจะได้ไม่ต้อง round trip อีก
+- **index ใหม่เมื่อได้ `notifications/tools/list_changed`**
+- **จัดกลุ่มตาม server** เพื่อให้ model คิดเรื่อง capability ที่เกี่ยวข้องกันได้
+
+## การจัดการ server แบบ dynamic
+
+discovery ขยายไปถึงระดับทั้ง server ได้ เก็บ registry ของ server ที่มีพร้อมคำอธิบายระดับสูง, เชื่อมต่อเฉพาะเมื่อ model ต้องการ และ disconnect เมื่องานจบเพื่อคืน context
+
+```text
+search_available_servers("CRM")  → Salesforce server (not connected)
+enable_server("salesforce")      → server/discover, tools/list, tools indexed
+...task...
+disable_server("salesforce")     → connection closed, context freed
+```
+
+มองการ disconnect เป็นงานที่ทำตรงรอยต่อของบทสนทนา ไม่ใช่ทำทุก turn เพราะการเชื่อมต่อมีต้นทุน และการถอด tool กลางบทสนทนามีต้นทุนกับ prompt cache (ด้านล่าง)
+
+## cache ผลของ discovery
+
+ผลลัพธ์แบบ list ทุกอย่าง รวมถึง `server/discover` และ `resources/read` มี hint สองตัวมาด้วย: `ttlMs` (response ยังสดอยู่นานแค่ไหน) และ `cacheScope` (`public` ถ้าตัวกลางที่ใช้ร่วมกัน cache ได้, `private` ถ้าเป็นของผู้เรียกคนนั้นโดยเฉพาะ) เคารพมัน: cache `tools/list` ตาม `ttlMs` และมอง cache ว่าเก่าทันทีที่ notification `list_changed` มาถึง แม้ TTL จะยังไม่หมด
+
+```json
+{
+  "tools": [ ... ],
+  "ttlMs": 300000,
+  "cacheScope": "public"
+}
+```
+
+## รักษา prompt cache
+
+provider ส่วนใหญ่ cache prompt prefix และ array `tools` เป็นส่วนหนึ่งของมัน การเพิ่ม, ถอด หรือสลับลำดับ tool definition กลางบทสนวนาทำให้ cache หลุด และ cache miss ที่ตามมาอาจแพงกว่า token ที่ประหยัดได้ ทางที่ปลอดภัยมีสองทาง:
+
+1. **ต่อ definition ที่เพิ่งค้นพบไว้หลัง cache breakpoint** แทนที่จะเรียง array ใหม่
+2. **route ทุก call ผ่าน meta-tool ตัวเดียวที่คงที่** เช่น `call_tool({ name, args })` เพื่อให้ array `tools` ไม่เปลี่ยนเลย
+
+ไม่ว่าทางไหน ให้ส่วนที่คงที่อยู่ก่อน ส่วนที่เปลี่ยนบ่อยอยู่ท้าย
+
+## programmatic tool calling (code mode)
+
+กับการเรียกแบบตรง ผลลัพธ์ระหว่างทางทุกอย่างไหลผ่าน model การต่อ chain แบบ "อ่าน log → กรอง → เปิด ticket" หมายความว่า log หลายพันบรรทัดเข้าสู่ context ทั้งที่ model ต้องการแค่จำนวน code mode พลิกเรื่องนี้: model เขียน script สั้น ๆ กับ stub ที่มี type, script รันใน sandbox และมีแค่ output ของมันที่กลับมา
+
+**ขั้นที่ 1: generate stub จาก schema** host แปลง `inputSchema` และ `outputSchema` ของแต่ละ tool เป็น function ที่มี type
+
+```ts
+// generate อัตโนมัติจาก tool schema ของ Logging server
+function logging_getLogs(input: { level: 'error' | 'warn' | 'info'; since: number }):
+  Promise<{ entries: LogEntry[] }> {
+  return mcp.callTool('logging_getLogs', input);
+}
+```
+
+`outputSchema` ให้ return type ที่แม่นยำ ถ้าไม่มี ให้ถอยไปใช้ type แบบกว้าง ๆ และชวนคนเขียน server ให้เพิ่มมัน
+
+**ขั้นที่ 2: model เขียนโค้ด**
+
+```ts
+const logs = await logging_getLogs({ level: 'error', since: Date.now() - 3600000 });
+const unique = new Map<string, LogEntry>();
+for (const log of logs.entries) if (!unique.has(log.message)) unique.set(log.message, log);
+for (const [message, log] of unique) {
+  await ticketing_createIssue({ title: `Error: ${message}`, body: `First seen: ${log.timestamp}`, priority: 'high' });
+}
+console.log(`Filed ${unique.size} tickets from ${logs.entries.length} error logs`);
+```
+
+**ขั้นที่ 3: sandbox รัน** function call ถูกดักแล้วส่งผ่าน broker กลับไปยัง MCP server ที่ถูกต้อง มีแค่บรรทัด `console.log` ที่กลับไปถึง model
+
+### สิ่งที่ต่อรองไม่ได้สำหรับ code mode
+
+- **ไม่มี network ใน sandbox** I/O ทั้งหมดผ่าน broker ของ host
+- **authorization ต่อ call** การอนุมัติ script ไม่ใช่การอนุมัติทุก tool call ที่มันทำ broker ประเมินแต่ละ call เทียบกับสิทธิ์ที่ผู้ใช้ให้ ด้วย policy human-in-the-loop แบบเดียวกับการเรียกตรง
+- **credential อยู่ใน host** โค้ดที่ generate ไม่มีวันเห็น token
+- **ข้อมูลข้าม server ไว้ใจไม่ได้** output ของ server หนึ่งคือ input ที่ไว้ใจไม่ได้สำหรับอีก server
+- **จำกัด resource และกรอง output** timeout, จำกัด memory และตัดทอนก่อนผลลัพธ์ไปถึง model
+- **แปลง `isError` เป็น exception** ใน wrapper ที่ generate เพื่อให้โค้ดที่ model เขียนใช้ `try` และ `catch` ได้ และแสดง error ที่ไม่ได้จับเป็นผลลัพธ์ของ script เพื่อให้ model แก้ตัวเองได้
+
+## ใช้ทั้งสองอย่างร่วมกัน
+
+discovery หา tool ที่ถูกต้อง code mode เรียกมันอย่างมีประสิทธิภาพ model สามารถค้นหา, inspect schema สองตัว แล้วเขียน script เดียวที่ต่อ chain ทั้งสอง ลดทั้ง token ของ definition และ token ของผลลัพธ์
+
+<Callout title="สรุปหนึ่งบรรทัด">
+เมื่อ scale ให้เลิกยัด tool ทุกตัว: ให้ model ค้น catalog แล้วโหลด schema ทีละตัว, เชื่อมต่อ server ตามต้องการ, cache list ตาม `ttlMs`, รักษา array `tools` ให้คงที่เพื่อ prompt cache และย้าย chain ที่ข้อมูลหนักไปไว้ใน sandbox เพื่อให้มีแค่บทสรุปที่ไปถึง model
+</Callout>
+
+export const quizScaling = [
+  {
+    q: 'ชั้นแรกของ progressive tool discovery คืออะไร?',
+    options: [
+      'รัน tool',
+      'meta-tool search_tools ที่คืนชื่อพร้อมคำอธิบายบรรทัดเดียว',
+      'โหลด schema เต็มทุกตัวเข้า context',
+      'disconnect server ที่ไม่ได้ใช้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'response ของ tools/list มี ttlMs: 300000 แล้ว 30 วินาทีต่อมามี notifications/tools/list_changed เข้ามา host ควรทำอย่างไร?',
+    options: [
+      'ใช้ cache ต่อไปจนกว่า TTL จะหมด',
+      'มอง list ที่ cache ไว้ว่าเก่าแล้ว และดึง tools/list ใหม่',
+      'ละเลย notification',
+      'disconnect จาก server',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไมการถอด tool definition กลางบทสนทนาอาจเสีย token มากกว่าที่ประหยัดได้?',
+    options: [
+      'server คิดเงินต่อการถอด',
+      'array tools เป็นส่วนหนึ่งของ prompt prefix ที่ cache ไว้ การเปลี่ยนมันทำให้ cache หลุด',
+      'model ต้องอ่านข้อความผู้ใช้ใหม่',
+      'มันทำให้เกิด server/discover ใหม่',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ใน programmatic tool calling ใครเป็นคนถือ API token ที่ใช้เรียก MCP server?',
+    options: [
+      'script ที่รันใน sandbox',
+      'model',
+      'broker ของ host ซึ่งเป็นคนใส่ authentication ตอนส่งต่อ call',
+      'MCP server',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="building-clients/scaling-tools" questions={quizScaling} />
+
+<ProgressTracker client:visible id="building-clients/scaling-tools" />

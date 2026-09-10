@@ -1,0 +1,242 @@
+---
+title: 'Using Servers in Real Hosts'
+description: 'Plug an MCP server into Claude Code, Claude Desktop, and the Claude API MCP connector, and use the Inspector as a throwaway host while you develop.'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## You usually do not write the host
+
+Most servers are used from hosts someone else built. Knowing how those hosts are configured tells you what your server must look like from the outside: what command launches it, what URL it lives at, which environment variables it reads, and how a user authorizes it.
+
+<Mermaid title="Four hosts, one server" code={hostsDiagram} />
+
+export const hostsDiagram = `flowchart LR
+  cc["Claude Code"]
+  cd["Claude Desktop"]
+  api["Claude API MCP connector"]
+  insp["MCP Inspector"]
+  s["Your MCP server"]
+  cc --> s
+  cd --> s
+  api --> s
+  insp --> s`;
+
+## Claude Code
+
+Claude Code adds servers with `claude mcp add`. The transport flag chooses how it connects.
+
+```bash
+# Remote server over Streamable HTTP
+claude mcp add --transport http notion https://mcp.notion.com/mcp
+
+# Remote server with a static bearer token
+claude mcp add --transport http secure-api https://api.example.com/mcp \
+  --header "Authorization: Bearer your-token"
+
+# Local server over stdio — everything after -- is the launch command
+claude mcp add --transport stdio airtable --env AIRTABLE_API_KEY=YOUR_KEY \
+  -- npx -y airtable-mcp-server
+```
+
+The `--` separator is not optional for stdio servers: it tells the CLI where its own options end and the server command begins.
+
+### Scopes
+
+| Scope | Where it is stored | Shared? | Use for |
+|-------|--------------------|---------|---------|
+| `local` (default) | `~/.claude.json`, per project | No | Personal experiments |
+| `project` | `.mcp.json` at the repo root | Yes, via git | Team-wide servers |
+| `user` | `~/.claude.json` | No | Tools you want in every project |
+
+```bash
+claude mcp add --transport http stripe --scope project https://mcp.stripe.com
+claude mcp add --transport stdio db --scope user -- npx -y @bytebase/dbhub
+```
+
+### The project file
+
+A project-scoped server is just an entry in `.mcp.json`. Commit it so teammates get the same servers. Values support `${VAR}` and `${VAR:-default}` expansion in `command`, `args`, `env`, and `headers`, so secrets stay out of the repo.
+
+```json
+{
+  "mcpServers": {
+    "shared-server": {
+      "type": "http",
+      "url": "https://example.com/mcp"
+    },
+    "local-db": {
+      "type": "stdio",
+      "command": "/path/to/server",
+      "args": ["--config", "${CLAUDE_PROJECT_DIR}/config.json"],
+      "env": {
+        "DB_URL": "${DB_URL:-postgresql://localhost}"
+      },
+      "timeout": 600000
+    }
+  }
+}
+```
+
+### Authorization and housekeeping
+
+Remote servers that require OAuth are authorized interactively: run `/mcp` inside a session and follow the browser flow, or `claude mcp login <name>` from the shell. Pre-registered client credentials can be supplied with `--client-id` and `--client-secret` (read from `MCP_CLIENT_SECRET` in CI).
+
+```bash
+claude mcp list            # every configured server and its status
+claude mcp get notion      # details for one server
+claude mcp remove notion   # drop it
+```
+
+Useful knobs: `MCP_TIMEOUT=10000 claude` bounds server startup in milliseconds; a per-server `timeout` in `.mcp.json` bounds tool execution; `MAX_MCP_OUTPUT_TOKENS` caps how much tool output is fed to the model. Inside Claude Code your tools appear as `mcp__<server>__<tool>` — the same namespacing idea from the [previous lesson](/mcp/en/building-clients/wiring-tools-to-an-llm/), which is what you use in permission rules and hooks.
+
+## Claude Desktop
+
+Claude Desktop reads `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`). The shape is the same `mcpServers` map.
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Desktop"]
+    }
+  }
+}
+```
+
+Restart the app after editing. Because Desktop launches stdio servers itself, the `command` must be on the app's `PATH` — a common failure is a server that works in your shell but not from the app because `node` lives in a version-manager directory.
+
+## The Claude API MCP connector
+
+If you are calling the Messages API directly, you can let Anthropic make the MCP connection server-side instead of running a client yourself. Two request parts are required **together**: `mcp_servers` declares the connection, and an `mcp_toolset` entry in `tools` exposes it to the model. Omitting either half is a validation error, and every server must be referenced by exactly one toolset.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import Anthropic from '@anthropic-ai/sdk';
+
+    const anthropic = new Anthropic();
+
+    const response = await anthropic.beta.messages.create({
+      model: 'claude-opus-5',
+      max_tokens: 16000,
+      betas: ['mcp-client-2025-11-20'],
+      mcp_servers: [
+        { type: 'url', url: 'https://mcp.example.com/mcp', name: 'example-mcp', authorization_token: process.env.EXAMPLE_TOKEN },
+      ],
+      tools: [
+        {
+          type: 'mcp_toolset',
+          mcp_server_name: 'example-mcp',
+          default_config: { enabled: false },          // allowlist mode
+          configs: { get_weather: { enabled: true } }, // only this tool is exposed
+        },
+      ],
+      messages: [{ role: 'user', content: 'What is the weather in Bangkok?' }],
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+    import anthropic
+
+    client = anthropic.Anthropic()
+
+    response = client.beta.messages.create(
+        model="claude-opus-5",
+        max_tokens=16000,
+        betas=["mcp-client-2025-11-20"],
+        mcp_servers=[
+            {"type": "url", "url": "https://mcp.example.com/mcp",
+             "name": "example-mcp", "authorization_token": os.environ.get("EXAMPLE_TOKEN")},
+        ],
+        tools=[
+            {"type": "mcp_toolset", "mcp_server_name": "example-mcp",
+             "default_config": {"enabled": False},
+             "configs": {"get_weather": {"enabled": True}}},
+        ],
+        messages=[{"role": "user", "content": "What is the weather in Bangkok?"}],
+    )
+    ```
+  </TabItem>
+</Tabs>
+
+The connector only reaches servers that are publicly routable over HTTPS, and the loop runs on Anthropic's side — you get the final message, not per-call hooks. Use it when you want the least code; run your own client when you need consent prompts, local stdio servers, or custom routing.
+
+## The Inspector as a host
+
+While developing, the MCP Inspector is the fastest host to point at your server. It runs your server, shows every tool, resource, and prompt, and logs the raw protocol traffic.
+
+```bash
+# Web UI against a local stdio server
+npx @modelcontextprotocol/inspector node build/index.js
+
+# Web UI against a remote server
+npx @modelcontextprotocol/inspector --server-url https://api.example.com/mcp --transport http
+
+# CLI mode for scripts and CI
+npx @modelcontextprotocol/inspector --cli node build/index.js --method tools/list
+```
+
+It negotiates both protocol eras, so it is also how you check that a legacy-only client would still work against your server. The [testing lesson](/mcp/en/production-and-ecosystem/testing-and-debugging/) goes deeper.
+
+## Design notes for server authors
+
+- **Publish the launch command.** Hosts need a one-liner; `npx -y your-package` or `uvx your-package` is the convention.
+- **Read secrets from the environment** on stdio; never ask for them as tool arguments.
+- **Expose a stable HTTPS URL** for remote use and implement the OAuth resource-server side so `/mcp` in Claude Code can authorize it.
+- **Keep tool names header-safe and unique**, because hosts will prefix them and may mirror them into HTTP headers.
+
+<Callout title="The one-line takeaway">
+Claude Code and Claude Desktop launch or connect to your server from a small `mcpServers` config; the Claude API connector needs `mcp_servers` plus a matching `mcp_toolset`; and the Inspector is the throwaway host you use while building. Design your server so each of those can reach it with one line.
+</Callout>
+
+export const quizHosts = [
+  {
+    q: 'In "claude mcp add --transport stdio db -- npx -y @bytebase/dbhub", what does the -- do?',
+    options: [
+      'Marks the server as read-only',
+      'Separates Claude Code options from the command that launches the server',
+      'Enables debug logging',
+      'Sets the scope to project',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which scope stores the server in .mcp.json so it can be committed and shared with a team?',
+    options: ['local', 'user', 'project', 'global'],
+    answer: 2,
+  },
+  {
+    q: 'What happens if you pass mcp_servers to the Claude API without a matching mcp_toolset in tools?',
+    options: [
+      'The server is connected but hidden from the model',
+      'The request is rejected as a validation error',
+      'All tools are enabled by default',
+      'The beta header is ignored',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the default_config: { enabled: false } pattern in an mcp_toolset for?',
+    options: [
+      'Disabling the server entirely',
+      'Allowlist mode: hide every tool and re-enable only the ones listed in configs',
+      'Turning off OAuth',
+      'Making the tools read-only',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/using-servers-in-hosts" questions={quizHosts} />
+
+<ProgressTracker client:visible id="building-clients/using-servers-in-hosts" />

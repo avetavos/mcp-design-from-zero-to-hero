@@ -1,0 +1,207 @@
+---
+title: 'Client Registration'
+description: 'MCP client จะได้ client_id มาอย่างไรทั้งที่ไม่เคยรู้จัก server มาก่อน: pre-registration, Client ID Metadata Documents และ Dynamic Client Registration ที่ deprecated แล้ว พร้อมกฎเรื่องการผูก credential และการปลอมตัวที่มากับแต่ละแบบ'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ปัญหาที่ OAuth แบบเดิมไม่เคยต้องแก้
+
+OAuth แบบคลาสสิกสมมติว่านักพัฒนา client เข้าไปที่ developer console ของ provider แล้วลงทะเบียนแอปด้วยมือ MCP ทำลายสมมติฐานนั้น: host อเนกประสงค์อย่าง Claude Code หรือ IDE จะเชื่อมต่อกับ server ที่ผู้สร้าง host ไม่เคยได้ยินชื่อ ซึ่งรันโดยองค์กรที่มี authorization server ของตัวเอง ทั้งสองฝ่ายไม่มีทางตกลง `client_id` กันล่วงหน้าได้
+
+MCP จึงรองรับกลไกลงทะเบียนสามแบบ และบอก client ว่าควรเลือกแบบไหนก่อน:
+
+1. **Pre-registered credential** ถ้า client มีสำหรับ server นี้อยู่แล้ว
+2. **Client ID Metadata Documents (CIMD)** ถ้า authorization server ประกาศ `client_id_metadata_document_supported: true`
+3. **Dynamic Client Registration (DCR)** เป็นทางสำรอง ถ้า AS เปิด `registration_endpoint` ไว้ วิธีนี้ deprecated แล้ว
+4. **ถาม user** ให้วางรายละเอียด client เองถ้าไม่มีทางอื่น
+
+## Client ID Metadata Documents
+
+CIMD คือกลไกที่ spec แนะนำ (SHOULD) ตอนนี้ทั้งสำหรับ client และ authorization server ไอเดียคือ identifier ของ client *เป็น* HTTPS URL และ URL นั้น serve JSON document ที่บรรยาย client:
+
+```json
+{
+  "client_id": "https://app.example.com/oauth/client-metadata.json",
+  "client_name": "Example MCP Client",
+  "client_uri": "https://app.example.com",
+  "logo_uri": "https://app.example.com/logo.png",
+  "redirect_uris": [
+    "http://127.0.0.1:3000/callback",
+    "http://localhost:3000/callback"
+  ],
+  "grant_types": ["authorization_code"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
+```
+
+ข้อกำหนดฝั่ง **client**:
+
+- URL ของ `client_id` MUST ใช้ `https` และ MUST มี path (`https://example.com/client.json` ไม่ใช่แค่ origin เปล่า ๆ)
+- document MUST มีอย่างน้อย `client_id`, `client_name` และ `redirect_uris`
+- ค่า `client_id` *ใน* document MUST ตรงกับ URL ของ document เป๊ะ ๆ
+- public client (แอป desktop, CLI) ใช้ `token_endpoint_auth_method: "none"` ส่วน client ที่ถือ key ได้ MAY ใช้ `private_key_jwt` พร้อม JWKS ที่อ้างอิงจาก document
+
+ข้อกำหนดฝั่ง **authorization server**:
+
+- SHOULD ดึง document เมื่อเจอ `client_id` ที่เป็น URL
+- MUST ตรวจว่า `client_id` ที่ดึงมาเท่ากับ URL, MUST ตรวจว่า document เป็น JSON ที่ถูกต้องและมี field ที่จำเป็นครบ และ MUST ตรวจ `redirect_uri` ในทุก authorization request เทียบกับ `redirect_uris` ใน document
+- SHOULD cache document ตาม HTTP cache header
+
+<Mermaid title="flow ของ Client ID Metadata Document" code={cimdDiagram} />
+
+export const cimdDiagram = `sequenceDiagram
+  participant U as User
+  participant C as MCP Client
+  participant A as Authorization Server
+  participant D as Metadata URL (HTTPS host ของ client)
+  C->>A: authorize (client_id = https://app.example.com/oauth/client.json)
+  A->>U: authenticate
+  A->>D: GET client metadata document
+  D-->>A: JSON (client_id, client_name, redirect_uris)
+  Note over A: ตรวจว่า client_id เท่ากับ URL, redirect_uri อยู่ในรายการ
+  A->>U: หน้า consent แสดง client_name
+  U-->>A: อนุมัติ
+  A-->>C: code ผ่าน redirect_uri`;
+
+ทำไมดีไซน์นี้ถึงเหมาะกับ MCP:
+
+- **ไม่ต้องรู้จักกันมาก่อน** AS ไหนก็ตรวจสอบ client ไหนก็ได้ด้วยการดึง document จาก domain ที่ client ควบคุม
+- **พกพาได้** เพราะ identifier เป็น URL ที่ host เอง `client_id` เดียวกันใช้ได้กับทุก authorization server ถ้า server ย้ายไปใช้ AS อื่น client ก็ไม่ต้องลงทะเบียนใหม่
+- **ตรวจสอบย้อนกลับได้** AS ใช้ trust policy ตาม domain ได้ (allowlist, reputation, ตรวจ certificate) และแสดง domain ให้เห็นชัด ๆ บนหน้า consent
+
+AS ประกาศว่ารองรับใน metadata ของตัวเอง:
+
+```json
+{ "client_id_metadata_document_supported": true }
+```
+
+client SHOULD ตรวจ flag นี้ และ MAY ถอยไปใช้ DCR หรือ pre-registration เมื่อไม่มี
+
+## Pre-registration
+
+client SHOULD ยังรองรับ credential แบบ static ในรูปแบบใดรูปแบบหนึ่ง:
+
+1. `client_id` (และ secret ถ้าเป็น confidential client) ที่ hard-code ไว้สำหรับ authorization server ตัวหนึ่ง แบบเดียวกับที่แอป first-party ทำ
+2. หน้า settings ให้ user วาง `client_id` ที่ได้จากการลงทะเบียน client ใน console ของ provider ด้วยตัวเอง
+
+Claude Code เปิดแบบที่สองไว้บน command line:
+
+```bash
+claude mcp add --transport http \
+  --client-id your-client-id --client-secret --callback-port 8080 \
+  my-server https://mcp.example.com/mcp
+```
+
+pre-registered credential ผูกกับ issuer เดียว ถ้า Protected Resource Metadata ของ server เริ่มชี้ไปที่ AS ตัวอื่น client SHOULD แสดง error แทนที่จะเอา credential เก่าไปลองใช้ที่นั่น
+
+## Dynamic Client Registration (deprecated)
+
+RFC 7591 ให้ client POST metadata ของตัวเองไปที่ `registration_endpoint` แล้วรับ `client_id` กลับมาโดยไม่ต้องมี user มาเกี่ยว MCP ยุคแรกพึ่งพามันมาก ตอนนี้มัน **deprecated** แล้วโดยให้ CIMD มาแทน และคงไว้เฉพาะสำหรับ authorization server ที่ไม่รองรับ metadata document
+
+ถ้าจำเป็นต้องถอยไปใช้ DCR มี field หนึ่งที่บังคับแล้ว:
+
+```json
+{
+  "client_name": "Example MCP Client",
+  "redirect_uris": ["http://127.0.0.1:3000/callback"],
+  "grant_types": ["authorization_code"],
+  "token_endpoint_auth_method": "none",
+  "application_type": "native"
+}
+```
+
+`application_type` MUST ถูกกำหนด ภายใต้ OpenID Connect Dynamic Client Registration ถ้าไม่ใส่จะ default เป็น `"web"` แล้ว OIDC server จะปฏิเสธ redirect URI ที่เป็น `localhost` และ custom scheme ให้ใช้:
+
+- `"native"` สำหรับแอป desktop, แอปมือถือ, CLI และ web app ที่ host ในเครื่องแล้วเข้าผ่าน `localhost`
+- `"web"` สำหรับแอปบน browser ที่ serve จาก host จริง ๆ
+
+server ที่ไม่ใช่ OIDC จะไม่สนใจพารามิเตอร์นี้ ดังนั้นส่งไปเสมอไม่มีข้อเสีย client MUST เตรียมรับมือกับการลงทะเบียนที่ล้มเหลวเพราะข้อจำกัดของ redirect URI, SHOULD แสดง error ที่มีความหมาย และ MAY ลองใหม่ด้วย `application_type` ที่ปรับแล้วหรือ redirect URI ที่ตรงตามข้อกำหนด
+
+ทำไม DCR ถึงแพ้: AS ทุกตัวจะลงเอยด้วยตารางการลงทะเบียนนิรนามที่โตไม่จำกัด client แต่ละตัวได้ `client_id` *คนละค่า* ต่อหนึ่ง AS และการผสมกันระหว่าง client ID แบบ static ฝั่ง upstream กับการลงทะเบียนแบบ dynamic ฝั่ง downstream คือสิ่งที่เปิดทางให้ confused-deputy attack ตามที่อธิบายใน [Threats and Mitigations](/mcp/th/security-and-auth/threats-and-mitigations/)
+
+## credential ผูกกับ issuer ของมัน
+
+ไม่ว่า client จะได้ credential มาด้วยวิธีไหน มันเป็นของ authorization server ที่ออกให้:
+
+- client MUST เก็บ credential ที่ persist ไว้ (client ID, secret, token) โดยใช้ `issuer` identifier ของ AS เป็น key
+- client MUST NOT เอา credential ไปใช้ซ้ำกับ authorization server ตัวอื่น
+- เมื่อ Protected Resource Metadata ของ server ระบุ AS ตัวใหม่ client MUST ลงทะเบียนใหม่ที่นั่น (หรือถ้าใช้ CIMD ก็แค่ยื่น URL เดิม ซึ่ง AS ใหม่จะ resolve เองตอนใช้)
+
+ผลในทางปฏิบัติ: token store ต้องเป็น map จาก issuer ไปยัง credential ไม่ใช่ "token สำหรับ server นี้" แบบแบน ๆ
+
+## localhost redirect URI กับความน่าเชื่อถือ
+
+native client redirect ไปที่ `http://127.0.0.1:PORT/callback` CIMD พิสูจน์ได้ว่าผู้สร้าง client ควบคุม `app.example.com` แต่พิสูจน์ไม่ได้ว่า process ไหนในเครื่องกำลัง listen ที่ port นั้น ผู้โจมตีจึงทำแบบนี้ได้:
+
+1. ใช้ metadata URL ของ client ตัวจริงเป็น `client_id` ของตัวเอง
+2. bind port localhost ไหนก็ได้แล้วส่งเป็น `redirect_uri` (มันอยู่ในรายการที่อนุญาต)
+3. รับ authorization code เมื่อ user อนุมัติสิ่งที่ดูเหมือน client ตัวจริง
+
+มาตรการรับมือของ spec อยู่ที่ authorization server: แสดงคำเตือนเพิ่มเมื่อ metadata ของ client มีแต่ redirect URI แบบ `localhost`, แสดง hostname ของ redirect ให้ชัดตอน consent และใช้ **trust policy** กับ client ID ที่เป็น URL server ที่ป้องกันเข้มอาจ allowlist domain ส่วน server แบบเปิดอาจรับ HTTPS `client_id` ไหนก็ได้แต่ยังตรวจ reputation, อายุของ domain หรือ certificate และต้องแสดง hostname ของ client เสมอเพื่อให้ phishing เด่นออกมา
+
+## เลือกอย่างไร ในฐานะคนเขียน client
+
+| สถานการณ์ | ใช้ |
+|-----------|-----|
+| คุณ ship client แบบ first-party สำหรับ AS ของตัวเอง | `client_id` แบบ pre-registered |
+| host อเนกประสงค์ที่เชื่อมต่อ server ไหนก็ได้ | CIMD ที่ host บน domain ของผลิตภัณฑ์คุณ |
+| AS เก่าและมีแค่ `registration_endpoint` | DCR พร้อมกำหนด `application_type` และ log ไว้ว่าถอยมาใช้วิธีนี้ |
+| ไม่มีอะไรใช้ได้เลย | ถาม user ให้กรอกรายละเอียด client |
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ใช้ pre-registered credential ก่อนถ้ามี ไม่งั้นระบุตัวเองด้วย Client ID Metadata Document ที่ HTTPS URL ซึ่งคุณควบคุม ถอยไปใช้ dynamic registration (ที่ deprecated แล้ว) เฉพาะเมื่อ AS ไม่รองรับอย่างอื่น ส่ง `application_type` เสมอ และเก็บทุก credential โดยใช้ issuer ที่ออกให้เป็น key
+</Callout>
+
+export const quizRegistration = [
+  {
+    q: '`client_id` ใน Client ID Metadata Document คืออะไร?',
+    options: [
+      'string สุ่มที่ AS ออกให้',
+      'HTTPS URL ที่มี path ซึ่ง serve JSON metadata ของ client และ document นั้นต้องมีค่าเดียวกันอยู่ข้างใน',
+      'ชื่อแอปพลิเคชันของ client',
+      'hash ของ redirect URI',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'กลไกลงทะเบียนแบบไหนที่ deprecated ใน spec ปัจจุบัน?',
+    options: [
+      'Pre-registration',
+      'Client ID Metadata Documents',
+      'Dynamic Client Registration (RFC 7591)',
+      'การถาม user',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'CLI client ถอยไปใช้ Dynamic Client Registration มันต้องใส่ field อะไร?',
+    options: [
+      '`application_type: "native"`',
+      '`token_endpoint_auth_method: "client_secret_basic"`',
+      '`logo_uri`',
+      '`scope: "*"`',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'server เปลี่ยน authorization server จะเกิดอะไรขึ้นกับ client ที่เคยลงทะเบียนผ่าน DCR ไว้กับตัวเก่า?',
+    options: [
+      'credential ยังใช้ได้ต่อเพราะ resource ยังเป็นตัวเดิม',
+      'ต้องลงทะเบียนใหม่กับ AS ตัวใหม่ เพราะ credential ผูกกับ issuer ที่สร้างมัน',
+      'AS ตัวเก่าส่งต่อ token ให้',
+      'ต้องเปลี่ยนไปใช้ stdio',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/client-registration" questions={quizRegistration} />
+
+<ProgressTracker client:visible id="security-and-auth/client-registration" />

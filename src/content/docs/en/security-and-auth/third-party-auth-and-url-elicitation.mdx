@@ -1,0 +1,222 @@
+---
+title: 'Third-Party Authorization with URL Elicitation'
+description: 'When your server needs its own access to another API: the difference between MCP authorization and external authorization, the URL-mode elicitation flow through a server-owned connect page, the phishing attack it must defeat, and the safe-URL rules on both sides.'
+sidebar:
+  order: 6
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Two different authorizations
+
+Everything earlier in this module was about the client proving itself to the server. Many real servers have a second problem: to do their job they must call *another* API on the user's behalf, and that API has its own login.
+
+| | MCP authorization | External (third-party) authorization |
+|---|---|---|
+| Who authorizes whom | MCP client → MCP server | MCP server → third-party API |
+| Specified by | The MCP authorization spec | The third party's OAuth, plus MCP's URL-mode elicitation |
+| The server's role | OAuth **resource server** | OAuth **client** of the third party |
+| Token used | Issued by the MCP server's AS, audience = MCP server | Issued by the third-party AS, audience = third-party API |
+| Passes through the MCP client? | Yes, that is its purpose | Never |
+
+The temptation is to collapse the two: take the token the client sent and forward it to the third party. That is token passthrough, and it is forbidden. The MCP server MUST obtain its own credentials for the third party, and the mechanism the spec provides is **URL-mode elicitation**.
+
+## What URL-mode elicitation is for
+
+Form-mode elicitation collects structured data *through* the client; the client sees every field. That is fine for a reservation date and unacceptable for a password. Servers MUST NOT use form mode for secrets, API keys, tokens, or payment details, and MUST use URL mode for them.
+
+URL mode sends the user to a page the server controls. Whatever happens on that page (typing an API key, completing an OAuth flow with a third party, paying) is invisible to the MCP client and to the LLM. The client's only jobs are to show the user which server is asking and the full URL, obtain consent, and open it safely.
+
+Under MRTR, the request arrives inside an `InputRequiredResult`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "input_required",
+    "inputRequests": {
+      "connect_calendar": {
+        "method": "elicitation/create",
+        "params": {
+          "mode": "url",
+          "url": "https://mcp.example.com/connect?flow=calendar",
+          "message": "Connect your calendar account so I can read your events."
+        }
+      }
+    },
+    "requestState": "v1.AEAD-protected-blob"
+  }
+}
+```
+
+The client answers by retrying the original request with `inputResponses` and the untouched `requestState`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "list_events",
+    "arguments": { "day": "2026-09-10" },
+    "inputResponses": { "connect_calendar": { "action": "accept" } },
+    "requestState": "v1.AEAD-protected-blob"
+  }
+}
+```
+
+Note what `accept` means here: the user *consented to open the URL*. It says nothing about whether the out-of-band interaction has finished. The server decides that from its own stored state (or the echoed `requestState`) and either returns the final result or another `InputRequiredResult`. Clients SHOULD give the user manual retry and cancel controls for exactly this case.
+
+## The full flow
+
+<Mermaid title="Server as OAuth client of a third party, via URL elicitation" code={thirdPartyDiagram} />
+
+export const thirdPartyDiagram = `sequenceDiagram
+  participant U as User
+  participant B as Browser
+  participant C as MCP Client
+  participant S as MCP Server
+  participant TA as Third-party AS
+  participant TR as Third-party API
+  C->>S: tools/call list_events (Bearer MCP token)
+  Note over S: no calendar token for this user
+  S-->>C: InputRequiredResult (mode url, /connect, requestState)
+  C->>U: show server name and full URL, ask consent
+  U-->>C: consent
+  C->>B: open https://mcp.example.com/connect
+  C->>S: tools/call retry (accept, requestState)
+  B->>S: GET /connect
+  Note over S: verify session user equals MCP user (sub)
+  S-->>B: redirect to third-party authorize
+  B->>TA: user consents to calendar access for S
+  TA-->>B: redirect to S callback with code
+  B->>S: GET /callback
+  S->>TA: exchange code (S's own client_id)
+  TA-->>S: third-party tokens, stored bound to user
+  S->>TR: read events with third-party token
+  S-->>C: final tools/call result`;
+
+The implementation pattern, step by step:
+
+1. The server (acting as an OAuth client of the third party) prepares an authorization request, but does **not** hand that third-party URL to the MCP client directly.
+2. The server stores state binding this elicitation to the authenticated MCP user, and builds a `requestState` that encodes the original request and, if needed, the user.
+3. The server returns a URL-mode elicitation pointing at its *own* connect page (`https://mcp.example.com/connect?…`).
+4. The user consents in the client, which opens the URL in a secure browser context.
+5. The connect page verifies the person who opened it is the same user who triggered the elicitation (next section), then redirects to the third-party authorization endpoint.
+6. The third-party AS redirects back to the server's registered `redirect_uri`; the server confirms that URI belongs to it and exchanges the code using its own static `client_id`.
+7. The server stores the third-party tokens bound to the MCP user's identity. It is now necessarily **stateful** for this purpose.
+8. Later MCP requests from that user use the stored tokens. The MCP client's own token was never involved.
+
+Three rules the spec makes absolute:
+
+- Third-party credentials MUST NOT transit through the MCP client.
+- The server MUST NOT use the client's MCP token to call the third party (token passthrough).
+- The server MUST NOT transmit credentials obtained via URL elicitation back to the MCP client.
+
+And one more that trips people up: URL-mode elicitation is *not* for authorizing the MCP client to the MCP server. That is the ordinary flow from earlier in this module. Servers MUST NOT rely on URL elicitation to authenticate their own callers.
+
+## The phishing attack you must defeat
+
+A URL is just a string; whoever receives it can forward it. Without a same-user check, the following works against a perfectly benign server:
+
+1. Alice, connected to the benign server, triggers a calendar elicitation.
+2. The server generates the connect URL for Alice's pending request.
+3. Alice's client shows her the URL. Instead of opening it, she sends it to Bob, another user of the same server, dressed up as "click to connect your calendar".
+4. Bob opens it and completes the third-party authorization, believing he is connecting his own account.
+5. The third-party AS calls back; the server matches the callback to *Alice's* pending request.
+6. Bob's calendar tokens are stored under Alice's identity. Alice now reads Bob's calendar.
+
+**Mitigation.** The server MUST ensure the user who *started* the elicitation is the user who *completes* the authorization. The spec's non-normative recipe for a web-reachable server:
+
+- Elicit to a server-owned connect page, not straight to the third party's authorize endpoint.
+- On that page, require a session with the MCP server (or its AS), for instance a login cookie.
+- Compare the authoritative subject (`sub`) from the MCP access token that created the elicitation with the subject of the browser session. Mismatch means stop.
+- Only then redirect onward to the third-party AS, and bind the eventual tokens to that verified subject.
+
+Servers that cannot use a browser session must find another way to establish that the same person is on both ends, and whatever the mechanism, it MUST be resilient to an attacker who can edit the elicitation URL.
+
+The same identity principle applies everywhere in elicitation: servers MUST NOT trust client-provided identity claims. "I am joe@example.com" typed into a form is not authentication; the verified MCP token is.
+
+## Safe URL rules
+
+Because URL elicitation is a legitimate channel for sending users to links, both sides carry obligations that keep it from becoming a phishing primitive.
+
+Servers requesting elicitation:
+
+- MUST NOT put sensitive user information (credentials, PII) in the URL.
+- MUST NOT hand out a URL that is pre-authenticated to a protected resource; a malicious client could use it to impersonate the user.
+- SHOULD NOT include clickable-looking URLs in any field of a *form*-mode request.
+- SHOULD use HTTPS outside development.
+
+Clients handling URL-mode requests:
+
+- MUST NOT prefetch the URL or its metadata.
+- MUST NOT open it without explicit user consent, and MUST show the full URL for inspection first.
+- MUST open it in a way the client and the LLM cannot inspect (a system browser or an out-of-process web view such as SFSafariViewController; not an embedded WKWebView the app can read).
+- SHOULD highlight the domain to expose subdomain tricks, and warn on suspicious or Punycode hosts.
+- SHOULD NOT render URLs as clickable anywhere except the `url` field of a URL-mode request.
+
+## State and storage obligations
+
+Elicitations do not *require* server state thanks to MRTR, but third-party authorization does, because someone has to hold the upstream tokens. When you store that state:
+
+- Protect it against unauthorized access.
+- Derive the user identity from the MCP authorization credentials (the `sub` claim), never from anything the client typed.
+- Bind every stored third-party token to that identity and look it up only for requests carrying a token with the same subject.
+
+Read together with [Threats and Mitigations](/mcp/en/security-and-auth/threats-and-mitigations/), this is the confused-deputy story from the server's side: your server is the deputy, the third-party API is what it acts on, and per-user binding plus the same-user check are what keep it from being confused.
+
+<Callout title="The one-line takeaway">
+When your server needs a third-party API, it becomes an OAuth client of that API and gets consent through URL-mode elicitation to a connect page it owns; that page must prove the same user is on both ends, the resulting tokens are bound to that user and never shown to the MCP client, and the client's own token is never forwarded.
+</Callout>
+
+export const quizThirdParty = [
+  {
+    q: 'A server needs a user\'s API key for an upstream service. Which elicitation mode may it use?',
+    options: [
+      'Form mode, with a password-type field',
+      'URL mode only, so the secret never passes through the MCP client',
+      'Either, as long as the message explains why',
+      'Neither, secrets must be tool arguments',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does `action: "accept"` mean in the response to a URL-mode elicitation?',
+    options: [
+      'The out-of-band interaction completed successfully',
+      'The user consented to open the URL; completion is determined by the server from its own state',
+      'The user typed credentials into the client',
+      'The third-party token is attached in `content`',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why should the elicitation URL point at a server-owned connect page rather than the third-party authorize endpoint?',
+    options: [
+      'Third-party endpoints are slower',
+      'So the server can verify the user opening the link is the same user who triggered the elicitation before redirecting',
+      'Because clients block external domains',
+      'To cache the authorization code',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which of these is token passthrough?',
+    options: [
+      'The server storing third-party tokens keyed by the MCP user\'s `sub`',
+      'The server using its own static client_id with the third-party AS',
+      'The server calling the third-party API with the bearer token the MCP client sent it',
+      'The client sending its MCP token on every request',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/third-party-auth-and-url-elicitation" questions={quizThirdParty} />
+
+<ProgressTracker client:visible id="security-and-auth/third-party-auth-and-url-elicitation" />

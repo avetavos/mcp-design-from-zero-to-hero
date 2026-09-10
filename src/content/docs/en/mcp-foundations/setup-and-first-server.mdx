@@ -1,0 +1,250 @@
+---
+title: 'Setup and Your First Server'
+description: 'Install the TypeScript and Python SDKs, write a one-tool stdio server in each, run it in the MCP Inspector, and learn the one rule that breaks more stdio servers than anything else.'
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Prerequisites
+
+| Tool | Version | Why |
+|------|---------|-----|
+| Node.js | 22.19 or newer | Runs the TypeScript SDK and the MCP Inspector (the Inspector requires ≥ 22.19) |
+| Python | 3.10 or newer | Runs the Python SDK |
+| `uv` | any recent | Fast Python project and dependency manager; `uvx` runs published servers without installing them |
+
+Check with `node --version`, `python3 --version`, and `uv --version`. Everything else is fetched by the package managers.
+
+## Create the project
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```bash
+    mkdir hello-mcp && cd hello-mcp
+    npm init -y
+    npm install @modelcontextprotocol/server zod
+    npm install -D tsx typescript
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```bash
+    uv init hello-mcp && cd hello-mcp
+    uv add mcp
+    ```
+  </TabItem>
+</Tabs>
+
+`@modelcontextprotocol/server` is the server half of the TypeScript SDK (the client half is a separate package). The Python package `mcp` contains both halves.
+
+## Write a one-tool server
+
+The server below exposes a single tool, `get-forecast`, and speaks stdio — the transport a host uses to run a server as a subprocess.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // server.ts
+    import { McpServer } from '@modelcontextprotocol/server';
+    import { serveStdio } from '@modelcontextprotocol/server/stdio';
+    import * as z from 'zod/v4';
+
+    serveStdio(() => {
+      const server = new McpServer({ name: 'weather', version: '1.0.0' });
+
+      server.registerTool(
+        'get-forecast',
+        {
+          description: 'Get the weather forecast for a city',
+          inputSchema: z.object({ city: z.string() }),
+        },
+        async ({ city }) => ({
+          content: [{ type: 'text', text: `Sunny in ${city} all week.` }],
+        }),
+      );
+
+      return server;
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    # server.py
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("weather")
+
+
+    @mcp.tool()
+    def get_forecast(city: str) -> str:
+        """Get the weather forecast for a city."""
+        return f"Sunny in {city} all week."
+
+
+    if __name__ == "__main__":
+        mcp.run()  # stdio is the default transport
+    ```
+  </TabItem>
+</Tabs>
+
+What each piece does:
+
+- **`McpServer` / `MCPServer`** — the server object. `name` and `version` become `io.modelcontextprotocol/serverInfo` in results and the `server/discover` response.
+- **`registerTool` / `@mcp.tool()`** — registers a tool. TypeScript takes an explicit Zod `inputSchema` (imported from `zod/v4`) and hands you typed arguments. Python derives the JSON Schema from the function's type hints and the description from its docstring.
+- **The handler's return** — TypeScript returns a result object with a `content` array. Python lets you return a plain string, which the SDK wraps as a text content block.
+- **`serveStdio` / `mcp.run()`** — wires the server to stdin/stdout. `serveStdio` takes a *factory* so the SDK can build a fresh server per connection; the same factory shape is used later for HTTP.
+
+On the wire, this server answers `tools/list` with:
+
+```json
+{
+  "resultType": "complete",
+  "tools": [
+    {
+      "name": "get-forecast",
+      "description": "Get the weather forecast for a city",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "city": { "type": "string" } },
+        "required": ["city"]
+      }
+    }
+  ]
+}
+```
+
+That is the whole contract a host needs.
+
+## Run it in the Inspector
+
+The **MCP Inspector** is the reference developer tool: one `npx` package with a web UI, a CLI, and a terminal UI, all sharing the same connection code. Point it at your server's launch command:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```bash
+    npx @modelcontextprotocol/inspector npx tsx server.ts
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```bash
+    npx @modelcontextprotocol/inspector uv run server.py
+    # or the SDK's shortcut, which launches the Inspector for you:
+    uv run mcp dev server.py
+    ```
+  </TabItem>
+</Tabs>
+
+The command prints a URL with a one-time session token. Open it, and you get a **Tools** tab listing `get-forecast`, a form generated from its `inputSchema`, and a **monitoring** sidebar that shows every JSON-RPC message as it crosses — the `server/discover`, the `tools/list`, and your `tools/call`. Reading that pane against the previous lesson is the fastest way to make the wire format real.
+
+<Mermaid title="What the Inspector does when you connect" code={inspectorDiagram} />
+
+export const inspectorDiagram = `sequenceDiagram
+  participant You as Browser
+  participant I as Inspector
+  participant S as server.ts (subprocess)
+  You->>I: open session URL
+  I->>S: spawn, write JSON-RPC to stdin
+  I->>S: server/discover
+  S-->>I: capabilities (tools)
+  I->>S: tools/list
+  S-->>I: get-forecast
+  You->>I: fill city, click Run
+  I->>S: tools/call get-forecast
+  S-->>I: content: Sunny in Lisbon all week.`;
+
+### Scriptable check from the CLI
+
+For CI, shell pipelines, or a quick sanity check, the same package has a CLI mode that runs one method and exits:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```bash
+    npx @modelcontextprotocol/inspector --cli npx tsx server.ts --method tools/list
+    npx @modelcontextprotocol/inspector --cli npx tsx server.ts \
+      --method tools/call --tool-name get-forecast --tool-arg city=Lisbon
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```bash
+    npx @modelcontextprotocol/inspector --cli uv run server.py --method tools/list
+    npx @modelcontextprotocol/inspector --cli uv run server.py \
+      --method tools/call --tool-name get_forecast --tool-arg city=Lisbon
+    ```
+  </TabItem>
+</Tabs>
+
+Add `--format json` and pipe to `jq` when you want to assert on the output.
+
+## The stdio golden rule
+
+Over stdio, **stdout is the protocol channel**. The client reads it one line at a time and parses each line as JSON-RPC. The server **must not** write anything else there. One stray `console.log("starting…")` or `print("debug")` and the client sees a line that is not JSON, and the connection breaks in a way that looks like the server hung.
+
+Log to **stderr** instead. The transport spec explicitly allows the server to write UTF-8 to stderr for informational, debug, and error output, and tells clients not to treat stderr as an error signal.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    console.error('starting weather server');   // fine: stderr
+    // console.log(...)                          // never in a stdio server
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import sys
+    print("starting weather server", file=sys.stderr)   # fine: stderr
+    # print("...")                                       # never in a stdio server
+    ```
+  </TabItem>
+</Tabs>
+
+The same rule applies to any library your server imports: if a dependency prints a banner to stdout on import, it will break your server before the first message.
+
+## What you have
+
+A working MCP server, a way to exercise it, and the wire traffic to prove what it is doing. From here the course builds outward: the [Server Primitives](/mcp/en/server-primitives/) module fills the server with tools, resources, and prompts; the [Transports](/mcp/en/transports/) module moves it from a subprocess to an HTTPS endpoint.
+
+<Callout title="The one-line takeaway">
+Install `@modelcontextprotocol/server` or `mcp`, register one tool, serve it over stdio, and point the Inspector at the launch command to see the real `tools/list` and `tools/call` traffic — and never write anything but MCP messages to stdout, because on stdio that is the wire.
+</Callout>
+
+export const quizSetup = [
+  {
+    q: 'In a stdio server, why is a stray print to stdout a fatal bug?',
+    options: [
+      'It slows the server down',
+      'stdout is the protocol channel; a non-JSON line breaks the client’s message parsing',
+      'The Inspector refuses to start',
+      'It leaks environment variables',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Where should a stdio server write its logs?',
+    options: [
+      'stdout',
+      'stderr',
+      'A file named mcp.log in the current directory',
+      'It must not log at all',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which command runs a one-off tools/list against a TypeScript server and exits?',
+    options: [
+      'npx @modelcontextprotocol/inspector --cli npx tsx server.ts --method tools/list',
+      'npm run mcp --list',
+      'npx tsx server.ts --tools',
+      'curl localhost:3000/tools',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/setup-and-first-server" questions={quizSetup} />
+
+<ProgressTracker client:visible id="mcp-foundations/setup-and-first-server" />

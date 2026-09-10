@@ -1,0 +1,241 @@
+---
+title: 'JSON-RPC Messages and _meta'
+description: 'รูปร่าง message ทั้งสี่แบบและกฎของมัน, resultType, ตาราง error code, field _meta พร้อม reserved key และ field ที่บังคับต่อ request และวิธีที่ SDK เติมให้คุณเอง'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## สี่รูปร่าง
+
+MCP message ทุกตัวคือ JSON-RPC 2.0 message มีแค่สี่รูปร่าง และเมื่ออ่านออกแล้ว คุณจะอ่าน MCP traffic อะไรก็ได้
+
+<Mermaid title="request ได้ response ส่วน notification ไม่ได้" code={shapesDiagram} />
+
+export const shapesDiagram = `flowchart LR
+  R["Request (id, method, params)"] --> OK["Result response (id, result)"]
+  R --> ERR["Error response (id, error)"]
+  N["Notification (method, params) - no id"]`;
+
+### Request
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "get_weather", "arguments": { "location": "Seattle" } } }
+```
+
+- `id` **ต้อง** เป็น string หรือ integer ห้ามเป็น `null`
+- `id` **ห้าม** ใช้ซ้ำขณะที่ request ที่มี id เดียวกันยังค้างอยู่
+- ใน revision ปัจจุบัน request ไหลจาก client ไป server เท่านั้น server ไม่ส่ง request ของตัวเองอีกแล้ว เมื่อมันต้องการอะไรจาก client มันจะบอก *ในผลลัพธ์* (ดู `resultType` ด้านล่าง)
+
+### Result response
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "result": { "resultType": "complete", "content": [ { "type": "text", "text": "Sunny" } ] } }
+```
+
+- `id` เดียวกับ request
+- `result` เป็น object อะไรก็ได้ แต่ **ต้อง** มี `resultType`
+
+### Error response
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "error": { "code": -32602, "message": "Unknown tool: get_wether" } }
+```
+
+- `id` เดียวกัน เว้นแต่ request พังจนอ่าน id ไม่ได้
+- `code` เป็น integer; `message` เป็น string; `data` เป็น optional และเป็นอะไรก็ได้
+
+### Notification
+
+```json
+{ "jsonrpc": "2.0", "method": "notifications/progress", "params": { "progressToken": "abc", "progress": 3, "total": 10 } }
+```
+
+- ไม่มี `id` และผู้รับ **ห้าม** ตอบกลับ
+
+## `resultType`: result แบบ polymorphic
+
+field `resultType` บอก client ว่ากำลังถือ result ประเภทไหนอยู่:
+
+| ค่า | ความหมาย |
+|-------|---------|
+| `"complete"` | request เสร็จแล้ว นี่คือเนื้อหาสุดท้าย |
+| `"input_required"` | server ต้องการอะไรเพิ่มจาก client ก่อนจะทำเสร็จ (เช่น elicitation) result เป็น `InputRequiredResult` และ client จะ retry request เดิมพร้อมคำตอบ |
+| ที่ extension กำหนด | extension เพิ่มค่าได้ (Tasks extension เพิ่ม `"task"`) แต่ต้องเป็นค่าที่ทั้งสองฝั่ง negotiate ผ่าน capability แล้วเท่านั้น |
+
+มีกฎสองข้อที่ทำให้เรื่องนี้ปลอดภัย `resultType` ที่ไม่รู้จัก **ต้อง** ถือว่า invalid และ result ที่ *ไม่มี* field นี้ — ซึ่งเกิดกับ server บน revision ยุค legacy (2025-11-25 และก่อนหน้า) — **ต้อง** ถือว่าเป็น `"complete"`
+
+## Error code
+
+MCP ใช้ code มาตรฐานของ JSON-RPC ซ้ำ และแบ่งช่วง implementation-defined ออกเป็นส่วน ๆ:
+
+| Code | ชื่อ | เมื่อไร |
+|------|------|------|
+| `-32700` | Parse error | body ไม่ใช่ JSON ที่ถูกต้อง |
+| `-32600` | Invalid request | ไม่ใช่ JSON-RPC request object ที่ถูกต้อง |
+| `-32601` | Method not found | method ที่ไม่รู้จัก (บน HTTP จับคู่กับ status 404) |
+| `-32602` | Invalid params | param ผิดหรือขาด — รวมถึง **tool ที่ไม่รู้จัก**, **prompt ที่ไม่รู้จัก**, **หา resource ไม่เจอ** และ request ที่ขาด field บังคับใน `_meta` |
+| `-32603` | Internal error | มีอะไรพังภายใน server |
+| `-32020` | `HeaderMismatch` | Streamable HTTP: header ที่ mirror มาไม่ตรงกับ body หรือ header บังคับหายไป |
+| `-32021` | `MissingRequiredClientCapability` | request ต้องใช้ capability ที่ client ไม่ได้ประกาศ; `data.requiredCapabilities` ระบุรายการ |
+| `-32022` | `UnsupportedProtocolVersion` | server ไม่รองรับ version ที่ขอ; `data.supported` ระบุที่รองรับ |
+
+ช่วง `-32000` ถึง `-32019` เป็น *legacy*: SDK เคยใช้ก่อนจะมีนโยบายนี้ และโค้ดใหม่ห้ามจัดสรร code ในช่วงนี้ มี code หนึ่งจากช่วงนี้ที่ยังสำคัญ: `-32002` เคยหมายถึง "resource not found" ใน 2025-11-25 และก่อนหน้า server ปัจจุบันต้องส่ง `-32602` แทน แต่ client ยังควร *ยอมรับ* `-32002` จาก server รุ่นเก่า ช่วง `-32020` ถึง `-32099` สงวนไว้สำหรับ specification ดังนั้นห้ามส่ง code ในช่วงนี้ที่ spec ไม่ได้นิยาม ถ้าต้องการ application error ให้ใช้ code นอกช่วง `-32768..-32000` ไปเลย
+
+ยังมีอีกหมวดที่ไม่ใช่ JSON-RPC error เลย: **tool execution error** tool ที่ล้มเหลวในแบบที่ model แก้ได้ (รูปแบบวันที่ผิด, หา record ไม่เจอ) จะ return result ปกติที่มี `isError: true` พร้อมข้อความอธิบาย ความแตกต่างนี้อยู่ใน [Server Primitives → Tools](/mcp/th/server-primitives/tools/)
+
+## field `_meta`
+
+`_meta` คือถุงใส่ key/value ที่ปรากฏได้ทั้งบน `params` ของ request และบน `result` object MCP ใช้มันสำหรับ metadata ระดับ protocol เพื่อให้ payload หลักสะอาด
+
+### การตั้งชื่อ key
+
+key ประกอบด้วย **prefix** ที่ไม่บังคับ (label คั่นด้วยจุด ลงท้ายด้วย `/` ในสไตล์ reverse-DNS: `com.example/`) ตามด้วย **name** (ขึ้นต้นและลงท้ายด้วยตัวอักษรหรือตัวเลข ข้างในมี hyphen/underscore/จุดได้) prefix ใดที่ label ตัวที่สองเป็น `modelcontextprotocol` หรือ `mcp` ถูกสงวนไว้สำหรับ protocol — `io.modelcontextprotocol/` คือตัวที่คุณจะเห็นทุกที่ ส่วน `com.example.mcp/` ใช้ได้ เพราะ label ตัวที่สองคือ `example`
+
+### Reserved key
+
+| Key | จุดประสงค์ |
+|-----|---------|
+| `progressToken` | opt-in ให้ request รับ progress notification |
+| `io.modelcontextprotocol/protocolVersion` | version ที่ request นี้พูด |
+| `io.modelcontextprotocol/clientInfo` | ชื่อและ version ของ client |
+| `io.modelcontextprotocol/clientCapabilities` | client capability ที่เกี่ยวกับ request นี้ |
+| `io.modelcontextprotocol/logLevel` | log level ขั้นต่ำที่ server ควรส่งสำหรับ request นี้ |
+| `io.modelcontextprotocol/subscriptionId` | ผูก notification เข้ากับ `subscriptions/listen` ที่เปิดมัน |
+| `io.modelcontextprotocol/serverInfo` | ชื่อและ version ของ server บน result |
+| `traceparent`, `tracestate`, `baggage` | OpenTelemetry trace context — ข้อยกเว้นเดียวของกฎ prefix เก็บไว้เพื่อเข้ากับ tracing convention ที่มีอยู่ |
+
+### field ที่บังคับต่อ request
+
+มีสอง key ที่ **บังคับบนทุก client request** request ที่ขาดตัวใดตัวหนึ่งถือว่า malformed และ server จะปฏิเสธด้วย `-32602` (HTTP status 400):
+
+| Key | บังคับ |
+|-----|----------|
+| `io.modelcontextprotocol/protocolVersion` | ใช่ |
+| `io.modelcontextprotocol/clientCapabilities` | ใช่ |
+| `io.modelcontextprotocol/clientInfo` | ไม่ แต่ client **ควร** ส่ง |
+| `io.modelcontextprotocol/logLevel` | ไม่ |
+
+เพราะ capability ติดมากับทุก request server จึงไม่ต้องจำว่า client เคยประกาศอะไรไว้ ถ้า request ต้องใช้ capability ที่ client ไม่ได้ใส่มา server จะตอบ `-32021` แทนที่จะเดา
+
+ส่วน server เอง **ควร** ใส่ `io.modelcontextprotocol/serverInfo` ใน `_meta` ของทุก result ทั้ง `clientInfo` และ `serverInfo` เป็นค่าที่แต่ละฝั่งรายงานเองและไม่ได้ถูก verify: ใช้สำหรับ log และ UI ห้ามใช้ตัดสินใจเรื่อง security
+
+### Trace context
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "New York" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"
+    }
+  }
+}
+```
+
+แนบ `traceparent` ตามมาตรฐาน W3C แล้ว tool call ของคุณจะโผล่เป็น span ใน trace เดียวกับ request ของ host เสียแค่บรรทัดเดียว แต่คุ้มทันทีครั้งแรกที่ต้อง debug tool ที่ช้า
+
+## JSON Schema ใน MCP
+
+input/output schema ของ tool, schema ของ elicitation และ structured content ล้วนใช้ JSON Schema มีกฎสามข้อ:
+
+1. **dialect เริ่มต้นคือ 2020-12** schema ที่ไม่มี `$schema` จะถูกอ่านเป็น JSON Schema 2020-12 implementation ต้องรองรับมัน และรองรับ dialect อื่นได้ถ้า schema ประกาศไว้
+2. **ไม่ดึง `$ref` ผ่าน network โดยค่าเริ่มต้น** `$ref` ที่ชี้ไป absolute URI ห้าม dereference อัตโนมัติ implementation อาจมีโหมด opt-in ให้ fetch ได้ แต่ต้องปิดไว้โดยค่าเริ่มต้นและควร block private กับ loopback address schema ที่ validate ไม่ได้เพราะ `$ref` ภายนอกไม่ resolve ควรถูกปฏิเสธ ไม่ใช่ปล่อยผ่านเงียบ ๆ
+3. **จำกัด composition** `anyOf`/`oneOf`/`allOf`/`if-then-else` และ `$defs` ใช้ได้ แต่ implementation ควรจำกัดความลึกและจำนวน subschema เพื่อไม่ให้ schema ที่ประสงค์ร้ายกลายเป็น denial-of-service ต่อ validator
+
+## คุณแทบไม่ต้องเขียน `_meta` เองเลย
+
+ทั้งหมดข้างบนคือสิ่งที่วิ่งบน wire ในทางปฏิบัติ SDK เป็นคนสร้างให้ นี่คือ tool call จาก client ในแต่ละภาษา สังเกตว่าไม่มีใครแตะ `_meta`, `id` หรือ `resultType` เลย:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+
+    const client = new Client({ name: 'my-client', version: '1.0.0' });
+    await client.connect(new StreamableHTTPClientTransport(new URL('http://localhost:3000/mcp')));
+
+    // The SDK adds protocolVersion, clientInfo, clientCapabilities and the id.
+    const result = await client.callTool({ name: 'get_weather', arguments: { location: 'Seattle' } });
+
+    if (result.isError) console.error('tool error:', result.content);
+    else console.log(result.content);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+
+    async def main() -> None:
+        # Client accepts a URL, a stdio spec, or an in-process MCPServer.
+        async with Client("http://127.0.0.1:8000/mcp") as client:
+            # _meta, id and resultType are handled by the SDK.
+            result = await client.call_tool("get_weather", {"location": "Seattle"})
+            print(result.content, result.is_error)
+    ```
+  </TabItem>
+</Tabs>
+
+การรู้ wire format ยังสำคัญอยู่: มันคือสิ่งที่คุณอ่านใน traffic pane ของ Inspector สิ่งที่ proxy ตรวจสอบ และสิ่งที่คุณต้องกลับไปพึ่งเมื่อ abstraction ของ SDK รั่ว
+
+<Callout title="สรุปหนึ่งบรรทัด">
+MCP message คือ JSON-RPC 2.0 ธรรมดา — request, result (มี `resultType` เสมอ), error, notification — โดย metadata ของ protocol อยู่ใน `_meta` ซึ่งทุก client request ต้องประกาศ protocol version และ capability; SDK เขียน field เหล่านั้นให้ แต่ตาราง error code กับ key ใน `_meta` คือสิ่งที่คุณต้องอ่านเมื่อมีอะไรผิดพลาด
+</Callout>
+
+export const quizJsonRpc = [
+  {
+    q: 'ข้อใดเป็น JSON-RPC request id ที่ถูกต้องใน MCP?',
+    options: [
+      'null',
+      'integer หรือ string ที่ไม่ได้กำลังค้างอยู่',
+      'boolean',
+      'object',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'result จาก legacy server ไม่มี resultType client ต้องถือว่าอย่างไร?',
+    options: [
+      'ถือว่า invalid',
+      'ถือว่าเป็น "input_required"',
+      'ถือว่าเป็น "complete"',
+      'ถือว่าเป็น error',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'key ใดใน _meta ที่บังคับบนทุก client request?',
+    options: [
+      'protocolVersion และ clientCapabilities (ภายใต้ io.modelcontextprotocol/)',
+      'clientInfo และ serverInfo',
+      'progressToken และ logLevel',
+      'traceparent และ baggage',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'server ปัจจุบันหา resource ที่ขอไม่เจอ มันส่ง error code อะไร?',
+    options: [
+      '-32002',
+      '-32602',
+      '-32022',
+      '-32020',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/json-rpc-and-meta" questions={quizJsonRpc} />
+
+<ProgressTracker client:visible id="mcp-foundations/json-rpc-and-meta" />

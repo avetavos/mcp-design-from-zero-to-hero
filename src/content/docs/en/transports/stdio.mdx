@@ -1,0 +1,240 @@
+---
+title: 'stdio'
+description: 'The local transport: the client spawns the server, one newline-delimited JSON-RPC message per line, stdout reserved for protocol, stderr for logs — plus shutdown, restart, cancellation and the legacy probe.'
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The client owns the process
+
+In the **stdio** transport the MCP client launches the server as a subprocess. The two ends talk over the child's standard streams:
+
+- The server reads JSON-RPC from `stdin` and writes JSON-RPC to `stdout`.
+- Each message is one JSON-RPC request, notification or response.
+- Messages are delimited by newlines and **must not** contain embedded newlines.
+
+There is no connection setup, no port, no TLS. The pipes exist because the process exists, and they go away when it does.
+
+<Mermaid title="stdio: one shared channel in each direction" code={stdioDiagram} />
+
+export const stdioDiagram = `sequenceDiagram
+  participant C as Client (host)
+  participant S as Server (child process)
+  C->>S: spawn (command, args, env)
+  C->>S: stdin: tools/call (id 1)
+  S-->>C: stdout: notifications/progress
+  S-->>C: stdout: response (id 1)
+  S-->>C: stderr: "cache warm" (log, ignored or captured)
+  C->>S: close stdin
+  S-->>C: exit 0`;
+
+## The stdout rule
+
+This is the rule people break most often, and it is absolute:
+
+- The server **must not** write anything to `stdout` that is not a valid MCP message.
+- The client **must not** write anything to the server's `stdin` that is not a valid MCP message.
+
+A stray `console.log("starting…")` or `print("debug")` lands in the middle of the JSON stream and the client fails to parse the next message. Send logs to **stderr** instead. The server **may** write UTF-8 to `stderr` for informational, debug and error output; the client **may** capture, forward or ignore it, and **should not** assume stderr output means an error occurred.
+
+```ts
+// TypeScript — never console.log in a stdio server
+console.error('cache warm');           // fine: stderr
+process.stdout.write('hello');         // corrupts the protocol stream
+```
+
+```python
+# Python — same rule
+import sys
+print("cache warm", file=sys.stderr)   # fine
+print("hello")                          # corrupts the protocol stream
+```
+
+## Who writes what
+
+Each side writes only certain message kinds:
+
+| Direction | Requests | Notifications | Responses |
+|-----------|----------|---------------|-----------|
+| Client → server (stdin) | Yes | Yes (e.g. `notifications/cancelled`) | **Never** |
+| Server → client (stdout) | **Never** | Yes (progress, log, subscription events) | Yes |
+
+The server never writes a JSON-RPC *request*. When it needs something from the client — user input, a completion, a roots list — it returns an `InputRequiredResult` and the client retries with the answers. That is the [Multi Round-Trip Requests](/mcp/en/client-interaction/multi-round-trip-requests/) pattern, and it is what lets stdio stay a plain request/response channel.
+
+Because all server messages share one `stdout`, the client correlates them by `id` (responses) or by `_meta["io.modelcontextprotocol/subscriptionId"]` (notifications from a `subscriptions/listen` request). There are no per-request streams.
+
+## Request metadata is inline
+
+stdio has no header layer. The protocol version, per-request capabilities and optional client identity live in `_meta.io.modelcontextprotocol/*` inside each request; the method and arguments live where JSON-RPC puts them. Nothing is mirrored anywhere else.
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_weather","arguments":{"city":"Bangkok"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ExampleClient","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}
+```
+
+One line, no pretty-printing.
+
+## Cancellation
+
+There is no per-request stream to close, so the client cancels by sending a notification that references the request's ID:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"user clicked stop"}}
+```
+
+The server **should** stop work as soon as practical and **must not** send any further messages for that request.
+
+## Shutdown
+
+The client **should** shut the server down in this order:
+
+1. Close the child's `stdin`.
+2. Wait for the process to exit.
+3. If it does not exit within a reasonable time, terminate it — on POSIX that escalates from `SIGTERM` to `SIGKILL`; on Windows, `TerminateProcess` or Job Objects.
+
+Servers **should** exit promptly when `stdin` reaches end-of-file. That is the only portable graceful-shutdown signal, so honouring it is what keeps your server from being killed. The server may also initiate shutdown by closing its `stdout` and exiting.
+
+## Unexpected termination
+
+If the server process dies, the client **should** restart it. Because the protocol is stateless, nothing is lost that cannot be recreated: in-flight requests are simply retried against the fresh process, and any `subscriptions/listen` streams must be re-sent because the server holds no subscription state across restarts. This is a direct benefit of the [stateless design](/mcp/en/mcp-foundations/discovery-and-versioning/) — a restart is a retry, not a recovery procedure.
+
+## Running a stdio server
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer } from '@modelcontextprotocol/server';
+    import { serveStdio } from '@modelcontextprotocol/server/stdio';
+    import * as z from 'zod/v4';
+
+    serveStdio(() => {
+      const server = new McpServer({ name: 'weather', version: '1.0.0' });
+      server.registerTool(
+        'get-forecast',
+        { description: 'Forecast for a city', inputSchema: z.object({ city: z.string() }) },
+        async ({ city }) => ({ content: [{ type: 'text', text: `Sunny in ${city}.` }] }),
+      );
+      return server;
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("weather")
+
+    @mcp.tool()
+    def get_forecast(city: str) -> str:
+        """Forecast for a city."""
+        return f"Sunny in {city}."
+
+    if __name__ == "__main__":
+        mcp.run()  # transport defaults to "stdio"
+    ```
+  </TabItem>
+</Tabs>
+
+## How hosts launch it
+
+A host stores a *command line* plus environment, and spawns it. The two idioms you will see everywhere are `npx -y <package>` for npm servers and `uvx <package>` for PyPI servers — both download on first run and need no global install.
+
+Claude Desktop reads `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Projects"]
+    },
+    "git": {
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "/Users/me/Projects/app"]
+    }
+  }
+}
+```
+
+Claude Code's project-level `.mcp.json` uses the same shape, with an explicit `type`, `env`, and variable expansion:
+
+```json
+{
+  "mcpServers": {
+    "local-db": {
+      "type": "stdio",
+      "command": "/path/to/server",
+      "args": ["--config", "${CLAUDE_PROJECT_DIR}/config.json"],
+      "env": { "DB_URL": "${DB_URL:-postgresql://localhost}" }
+    }
+  }
+}
+```
+
+Credentials for a stdio server come from `env` and local files, **not** from OAuth — the authorization framework is for HTTP transports only. Because the host executes whatever command is configured, hosts show the exact command and ask for consent before running a new one; see [threats and mitigations](/mcp/en/security-and-auth/threats-and-mitigations/).
+
+## The legacy probe
+
+Servers written against 2025-11-25 and earlier expect an `initialize` handshake before anything else. A client that supports both eras **should** send `server/discover` first, with its preferred modern version in `_meta`. Three outcomes:
+
+1. **A `DiscoverResult`** — the server is modern. Pick a version from `supportedVersions` and continue.
+2. **A recognized modern error** such as `UnsupportedProtocolVersionError` (-32022) — the server is modern but not on that version. Retry with one from its `supported` list. Do **not** fall back.
+3. **Any other error, or no reply within a reasonable timeout** — the server is legacy. Fall back to the `initialize` handshake.
+
+The fallback must not be keyed to one error code: legacy servers answer unknown pre-`initialize` requests with implementation-defined errors (often -32601 or -32602) or with silence. Even modern-only clients are encouraged to probe, because some legacy servers will happily process an era-ambiguous `tools/call` under legacy semantics instead of failing. The full era model is in [Backward Compatibility](/mcp/en/transports/backward-compatibility/).
+
+<Callout title="The one-line takeaway">
+stdio is a spawned child process speaking one JSON-RPC message per line: stdout is for protocol only, stderr is for logs, the client cancels with `notifications/cancelled`, shuts down by closing stdin, and restarts-and-retries on a crash — and it probes with `server/discover` before trusting the server to be modern.
+</Callout>
+
+export const quizStdio = [
+  {
+    q: 'A stdio server prints "server started" to stdout on launch. What happens?',
+    options: [
+      'Nothing — the client ignores non-JSON lines',
+      'The client fails to parse the protocol stream; logs must go to stderr',
+      'The client treats it as a notification',
+      'The message is forwarded to the LLM',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a client cancel an in-flight request on stdio?',
+    options: [
+      'By closing the per-request stream',
+      'By sending notifications/cancelled with the request ID',
+      'By sending SIGINT to the process',
+      'By re-sending the request with the same ID',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the correct graceful shutdown sequence for a stdio server?',
+    options: [
+      'Send SIGKILL immediately',
+      'Close stdin, wait for exit, then escalate to SIGTERM/SIGKILL only if needed',
+      'Send an initialize request with shutdown: true',
+      'Delete the config entry',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'The server/discover probe gets an UnsupportedProtocolVersionError. What should the client do?',
+    options: [
+      'Fall back to the legacy initialize handshake',
+      'Retry with a version from the error’s supported list — the server is modern',
+      'Kill and restart the server',
+      'Give up; the server is broken',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="transports/stdio" questions={quizStdio} />
+
+<ProgressTracker client:visible id="transports/stdio" />

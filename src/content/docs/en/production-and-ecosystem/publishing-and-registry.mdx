@@ -1,0 +1,287 @@
+---
+title: 'Publishing and the MCP Registry'
+description: 'Package a server so anyone can install it with one line — npx-friendly npm packages, uvx-friendly PyPI packages, README conventions, the official MCP Registry with server.json and mcp-publisher, and team distribution through .mcp.json.'
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The one-line test
+
+A local MCP server is installed by a *host config entry*, not by a person running `npm install`. Claude Code, Claude Desktop, and most editors will happily run whatever command you give them. So the bar for "installable" is:
+
+```bash
+npx -y @acme/mcp-weather
+# or
+uvx mcp-weather
+```
+
+If that command starts your server on stdio and nothing else prints to stdout, you are installable. Everything in this lesson serves that line, and then makes the line *findable*.
+
+<Mermaid title="From repo to a running server in a host" code={publishDiagram} />
+
+export const publishDiagram = `flowchart LR
+  r["your repo"] --> p["npm or PyPI package"]
+  p --> reg["MCP Registry: metadata only"]
+  reg --> h["host config: claude mcp add ..."]
+  p --> h
+  h --> run["npx -y or uvx starts the server"]`;
+
+## Packaging for npm
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```json
+    {
+      "name": "@acme/mcp-weather",
+      "version": "1.2.0",
+      "description": "An MCP server for weather information.",
+      "mcpName": "io.github.acme/weather",
+      "type": "module",
+      "bin": { "mcp-weather": "dist/index.js" },
+      "files": ["dist"],
+      "repository": { "type": "git", "url": "https://github.com/acme/mcp-weather.git" },
+      "engines": { "node": ">=22" },
+      "dependencies": {
+        "@modelcontextprotocol/server": "^2.0.0",
+        "zod": "^4.0.0"
+      }
+    }
+    ```
+
+    ```ts
+    #!/usr/bin/env node
+    // dist/index.js — the bin entry
+    import { McpServer } from '@modelcontextprotocol/server';
+    import { serveStdio } from '@modelcontextprotocol/server/stdio';
+    import * as z from 'zod/v4';
+
+    serveStdio(() => {
+      const server = new McpServer({ name: 'weather', version: '1.2.0' });
+      server.registerTool(
+        'get-forecast',
+        { description: 'Get the weather forecast for a city', inputSchema: z.object({ city: z.string() }) },
+        async ({ city }) => ({ content: [{ type: 'text', text: `Sunny in ${city} all week.` }] }),
+      );
+      return server;
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```toml
+    # pyproject.toml
+    [project]
+    name = "mcp-weather"
+    version = "1.2.0"
+    description = "An MCP server for weather information."
+    requires-python = ">=3.11"
+    dependencies = ["mcp>=2.0"]
+
+    [project.scripts]
+    mcp-weather = "mcp_weather.server:main"
+
+    [build-system]
+    requires = ["hatchling"]
+    build-backend = "hatchling.build"
+    ```
+
+    ```python
+    # src/mcp_weather/server.py
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("weather")
+
+
+    @mcp.tool()
+    def get_forecast(city: str) -> str:
+        """Get the weather forecast for a city."""
+        return f"Sunny in {city} all week."
+
+
+    def main() -> None:
+        mcp.run()  # stdio by default
+    ```
+  </TabItem>
+</Tabs>
+
+Checklist for both ecosystems:
+
+- The entry point runs on **stdio by default** with no flags, so `npx -y` / `uvx` just works.
+- The shebang line and executable bit are present (`bin` scripts on npm; `[project.scripts]` on PyPI).
+- **No stdout output** except protocol messages. Startup banners go to stderr or nowhere.
+- Configuration comes from **environment variables** (`WEATHER_API_KEY`), which every host can inject, not from interactive prompts.
+- `mcpName` in `package.json` is the registry name you will use later; the registry verifies that the published package carries it.
+
+Publish as usual: `npm publish --access public` or `uv build && uv publish`.
+
+## The README is the install UI
+
+Hosts do not read your README, but the person configuring the host does, and they will paste from it. Put a ready-to-run config block near the top for each major host:
+
+```bash
+# Claude Code
+claude mcp add --transport stdio weather \
+  --env WEATHER_API_KEY=your-key \
+  -- npx -y @acme/mcp-weather
+```
+
+```json
+{
+  "mcpServers": {
+    "weather": {
+      "command": "npx",
+      "args": ["-y", "@acme/mcp-weather"],
+      "env": { "WEATHER_API_KEY": "your-key" }
+    }
+  }
+}
+```
+
+Then list every environment variable with whether it is required and secret, the tools the server exposes (name and one line each), and the scopes or permissions a remote variant needs. A reader should be able to decide *whether to install* from the README alone.
+
+## The official MCP Registry
+
+The registry at `https://registry.modelcontextprotocol.io` is a **metadata catalogue**, currently in preview: it stores a `server.json` describing where a server lives, not the artifacts themselves. Your package still lives on npm, PyPI, or a container registry. Hosts and directories query the registry to discover servers.
+
+### 1. Install `mcp-publisher`
+
+```bash
+brew install mcp-publisher
+# or the release binary:
+curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" \
+  | tar xz mcp-publisher && sudo mv mcp-publisher /usr/local/bin/
+```
+
+### 2. Generate and edit `server.json`
+
+```bash
+mcp-publisher init
+```
+
+```json
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.acme/weather",
+  "description": "An MCP server for weather information.",
+  "repository": {
+    "url": "https://github.com/acme/mcp-weather",
+    "source": "github"
+  },
+  "version": "1.2.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@acme/mcp-weather",
+      "version": "1.2.0",
+      "transport": { "type": "stdio" },
+      "environmentVariables": [
+        {
+          "name": "WEATHER_API_KEY",
+          "description": "API key for the weather provider",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Rules that trip people up:
+
+- `name` is **reverse-DNS** and must match `mcpName` in `package.json`.
+- With GitHub authentication the name **must** start with `io.github.<your-username>/`.
+- `version` at the top and inside each package should track your release.
+- `registryType` can be `npm`, `pypi`, or `oci` (a container image). List more than one package if you ship both an npm and a PyPI build.
+- Hosted servers add a `remotes` array instead of (or alongside) `packages`, giving the Streamable HTTP URL so hosts can connect without installing anything.
+
+### 3. Log in and publish
+
+```bash
+mcp-publisher login github     # device-code flow in the browser
+mcp-publisher publish
+```
+
+### 4. Verify
+
+```bash
+curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.acme/weather"
+```
+
+The response is `{"servers":[{ ... "name":"io.github.acme/weather" ... }]}`.
+
+Common errors: *Registry validation failed for package* means `mcpName` is missing from the published package; *Invalid or expired Registry JWT token* means log in again; *You do not have permission to publish this server* means the namespace does not match your authentication method.
+
+### Custom namespaces
+
+GitHub auth gives you `io.github.<user>/`. To publish under your own domain (`com.acme/weather`) use **DNS authentication**: prove control of the domain with a TXT record, then the registry lets you publish any name under `com.acme/`. The registry docs also cover publishing from GitHub Actions for release automation.
+
+## Distributing inside a team
+
+Not every server belongs in a public registry. For an internal tool, commit a `.mcp.json` at the root of the repository that needs it; Claude Code picks it up with `--scope project` semantics and every teammate gets the same servers on checkout:
+
+```json
+{
+  "mcpServers": {
+    "shared-server": {
+      "type": "http",
+      "url": "https://mcp.internal.example.com/mcp"
+    },
+    "local-db": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@acme/mcp-db", "--config", "${CLAUDE_PROJECT_DIR}/db.json"],
+      "env": { "DB_URL": "${DB_URL:-postgresql://localhost/dev}" }
+    }
+  }
+}
+```
+
+`${VAR}` and `${VAR:-default}` expand in `command`, `args`, `env`, and `headers`, so secrets stay in each developer's environment while the file itself is safe to commit.
+
+<Callout title="The one-line takeaway">
+Package for `npx -y` or `uvx` (stdio by default, env-var config, silent stdout), put a paste-ready host config at the top of the README, describe the package in a reverse-DNS `server.json` and publish it with `mcp-publisher` to the metadata-only registry, and use a committed `.mcp.json` when the audience is your own team.
+</Callout>
+
+export const quizPublish = [
+  {
+    q: 'What does the official MCP Registry store?',
+    options: [
+      'The server binaries and Docker images',
+      'Metadata (server.json) pointing at packages on npm, PyPI, or OCI registries, or at remote URLs',
+      'Users\' OAuth tokens for servers',
+      'A cached copy of every tools/list response',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which package.json field must match the server.json name for npm verification?',
+    options: ['bin', 'mcpName', 'homepage', 'main'],
+    answer: 1,
+  },
+  {
+    q: 'With GitHub authentication, a registry name must start with…',
+    options: ['com.github/', 'io.github.<your-username>/', '@<your-username>/', 'mcp/'],
+    answer: 1,
+  },
+  {
+    q: 'How do you share a set of servers with everyone who clones a repository?',
+    options: [
+      'Publish them to npm under the repo name',
+      'Commit a .mcp.json at the repo root, using ${VAR} expansion for secrets',
+      'Email the claude mcp add commands',
+      'Hard-code API keys in the README',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/publishing-and-registry" questions={quizPublish} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/publishing-and-registry" />

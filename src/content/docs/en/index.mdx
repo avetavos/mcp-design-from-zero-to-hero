@@ -1,0 +1,60 @@
+---
+title: MCP Design — From Zero to Hero
+description: Design and build Model Context Protocol servers and clients from first principles — JSON-RPC messages and _meta, tools/resources/prompts, stdio and Streamable HTTP, multi round-trip requests and elicitation, OAuth 2.1 authorization, security threats, production deployment, and the registry — with TypeScript and Python side by side.
+template: splash
+hero:
+  tagline: A standalone, beginner→advanced course on designing with the Model Context Protocol (spec 2026-07-28). From the host/client/server model and the wire protocol to tools, resources, prompts, transports, elicitation, long-running tasks, OAuth 2.1, security, and shipping to production — every topic with the exact JSON on the wire and TypeScript + Python SDK code side by side.
+  actions:
+    - text: Start here
+      link: /mcp/en/mcp-foundations/
+      icon: right-arrow
+      variant: primary
+    - text: Jump to Server Primitives
+      link: /mcp/en/server-primitives/
+      icon: open-book
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## What you'll learn
+
+<CardGrid>
+  <Card title="MCP Foundations" icon="rocket">
+    What MCP is, hosts/clients/servers, the data and transport layers, JSON-RPC and `_meta`, discovery and versioning, and your first server in the Inspector. [Start →](/mcp/en/mcp-foundations/)
+  </Card>
+  <Card title="Server Primitives" icon="seti:json">
+    Tools, structured output and annotations, resources and URI templates, prompts, change notifications, and caching. [Build →](/mcp/en/server-primitives/)
+  </Card>
+  <Card title="Transports" icon="random">
+    stdio and Streamable HTTP — framing, headers, SSE streams, building an HTTP server, and backward compatibility with legacy protocol eras. [Connect →](/mcp/en/transports/)
+  </Card>
+  <Card title="Client Interaction" icon="seti:plan">
+    Multi round-trip requests, elicitation (form and URL), progress and cancellation, the Tasks extension, and the deprecated sampling/roots/logging. [Interact →](/mcp/en/client-interaction/)
+  </Card>
+  <Card title="Building Clients & Hosts" icon="seti:config">
+    Writing a client, wiring tools to an LLM agent loop, using servers in Claude Code and the Claude API, scaling to hundreds of tools. [Integrate →](/mcp/en/building-clients/)
+  </Card>
+  <Card title="Security & Authorization" icon="approve-check">
+    OAuth 2.1 for MCP — discovery, PKCE, resource indicators, client registration, protecting your server, threats and mitigations, third-party auth. [Secure →](/mcp/en/security-and-auth/)
+  </Card>
+  <Card title="Production & Ecosystem" icon="puzzle">
+    Designing tools agents love, testing and debugging, deploying remote servers, publishing to the registry, extensions and what changed. [Ship →](/mcp/en/production-and-ecosystem/)
+  </Card>
+</CardGrid>
+
+## How this course works
+
+<CardGrid>
+  <Card title="Wire-first, always" icon="seti:json">
+    Every concept starts from the JSON-RPC messages actually exchanged — then shows how the TypeScript and Python SDKs generate them, so nothing is magic.
+  </Card>
+  <Card title="Two SDKs side by side" icon="seti:config">
+    Server and client examples in TypeScript (`@modelcontextprotocol/server`, `@modelcontextprotocol/client`) and Python (`mcp`) through synced tabs — pick one and follow it everywhere.
+  </Card>
+  <Card title="Design, not just syntax" icon="approve-check">
+    Why the protocol is stateless, when a tool beats a resource, how to shape tools for agents, how to keep a remote server secure — trade-offs on every page.
+  </Card>
+  <Card title="Current spec, with history" icon="puzzle">
+    Written against protocol revision 2026-07-28, with clearly labelled notes on the legacy era (2025-11-25 and earlier) so older tutorials still make sense. Bilingual (English / ไทย) with saved quiz progress.
+  </Card>
+</CardGrid>

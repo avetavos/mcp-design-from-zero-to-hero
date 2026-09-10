@@ -1,0 +1,139 @@
+---
+title: 'Server Primitives'
+description: 'Tools, resources, and prompts — the three things a server can expose, who controls each one, and the list/get/call method families that drive them.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Three primitives, three controllers
+
+An MCP server can expose exactly three kinds of things. They look similar on the wire — each has a `*/list` method and a way to fetch one — but they differ in *who decides when they are used*. That single question is the most important design decision in this module.
+
+| Primitive | Controlled by | Typical UI | Method family |
+|-----------|---------------|------------|---------------|
+| **Tools** | The **model** — the LLM decides to call them based on the conversation | Tool-call confirmation, "running…" indicator | `tools/list`, `tools/call` |
+| **Resources** | The **application** — the host decides what context to attach | File picker, `@`-mention, tree view | `resources/list`, `resources/templates/list`, `resources/read` |
+| **Prompts** | The **user** — a person explicitly picks one | Slash command, template menu | `prompts/list`, `prompts/get` |
+
+<Mermaid title="Who drives each primitive" code={controlDiagram} />
+
+export const controlDiagram = `flowchart LR
+  LLM["Language model"] -- "decides to call" --> T["Tools"]
+  App["Host application"] -- "chooses context" --> R["Resources"]
+  User["Human user"] -- "picks explicitly" --> P["Prompts"]
+  T --> S["MCP server"]
+  R --> S
+  P --> S`;
+
+The protocol does not *enforce* these interaction models — a host is free to let the model pick resources or auto-run prompts. But the primitives are designed around them, and the best servers respect the intent: a tool is an *action the model may take*, a resource is *data the app can hand to the model*, a prompt is *a workflow a person invokes*.
+
+## Which primitive do I use?
+
+A quick decision table for the most common cases:
+
+| I want to expose… | Use | Why |
+|--------------------|-----|-----|
+| "Search the catalog", "create a ticket", "run this query" | **Tool** | The model needs to decide *when* to do it, based on the user's request |
+| A file, a database schema, a config document, a log | **Resource** | It is context, not an action. The host or user attaches it when relevant |
+| "All files matching `repo://{repo}/…`" | **Resource template** | A parameterized family of resources, discoverable and auto-completable |
+| "Review this PR the way our team does" | **Prompt** | A reusable, user-triggered workflow with arguments and few-shot structure |
+| A live dashboard the user should interact with | **Tool + MCP Apps extension** | Covered in [Extensions](/mcp/en/production-and-ecosystem/extensions-and-the-road-ahead/) |
+
+A useful test: if you would be uncomfortable with the model doing it *without asking*, it is a tool (and you should set its annotations carefully, see [Structured Output and Annotations](/mcp/en/server-primitives/structured-output-and-annotations/)). If it is inert data, it is a resource. If a human would say "run the X workflow", it is a prompt.
+
+## The method families
+
+Every primitive follows the same shape — discover, then act:
+
+| Step | Tools | Resources | Prompts |
+|------|-------|-----------|---------|
+| Discover | `tools/list` | `resources/list`, `resources/templates/list` | `prompts/list` |
+| Act | `tools/call` | `resources/read` | `prompts/get` |
+| Change notification | `notifications/tools/list_changed` | `notifications/resources/list_changed`, `notifications/resources/updated` | `notifications/prompts/list_changed` |
+
+All the `*/list` methods support cursor [pagination](/mcp/en/server-primitives/notifications-and-caching/) and carry the caching fields `ttlMs` and `cacheScope`. All the "act" methods — `tools/call`, `resources/read`, `prompts/get` — may return an `InputRequiredResult` when the server needs something from the user first (see [Client Interaction](/mcp/en/client-interaction/)).
+
+## Declaring capabilities
+
+A server advertises which primitives it supports in the `capabilities` object returned from `server/discover`. Each primitive has its own key, with optional sub-flags:
+
+```json
+{
+  "capabilities": {
+    "tools": { "listChanged": true },
+    "resources": { "listChanged": true, "subscribe": true },
+    "prompts": { "listChanged": false }
+  }
+}
+```
+
+- `listChanged` — the server will emit a `*/list_changed` notification when the set changes (to clients that opted in via `subscriptions/listen`).
+- `resources.subscribe` — the server can notify about updates to *specific* resource URIs.
+
+A server that declares a capability **MUST** answer that primitive's `*/list` request. The list may be empty and may change over time. If a server does not declare `prompts`, a client must not send `prompts/list`.
+
+## Lists are stable, not per-connection
+
+Because MCP is stateless (see [Foundations](/mcp/en/mcp-foundations/)), the spec is explicit about what a list may depend on:
+
+- The set of tools, resources, or prompts **MUST NOT** vary per connection, and **MUST NOT** change as a side effect of other requests on the same connection. Calling `tools/call` must not unlock a different `tools/list` for *that* client only.
+- The set **MAY** vary by the **authorization** presented on the request — a caller with `files:write` may see a `delete_file` tool that a read-only caller does not. Credentials are per-request input, not connection state.
+- The set **MAY** change over time for everyone (new deployment, feature flag), which is what `listChanged` is for.
+
+This rules out the "stateful wizard" server that reveals tool B only after tool A was called on this session. If you need that, return an explicit handle from tool A and have tool B accept it as an argument — the handle pattern is covered in [Tools](/mcp/en/server-primitives/tools/).
+
+## What this module covers
+
+| Lesson | You will learn |
+|--------|----------------|
+| [Tools](/mcp/en/server-primitives/tools/) | Definition, naming, `tools/list` and `tools/call`, content types, the two error channels |
+| [Structured Output and Annotations](/mcp/en/server-primitives/structured-output-and-annotations/) | `outputSchema`, `structuredContent`, behavior hints, titles and icons |
+| [Resources](/mcp/en/server-primitives/resources/) | URIs, text vs blob, templates, annotations, URI schemes |
+| [Prompts](/mcp/en/server-primitives/prompts/) | Arguments, messages, completion, designing reusable workflows |
+| [Notifications and Caching](/mcp/en/server-primitives/notifications-and-caching/) | `subscriptions/listen`, list-changed, `ttlMs` and `cacheScope`, pagination |
+
+<Callout title="The one-line takeaway">
+Tools are model-controlled actions, resources are application-controlled context, prompts are user-controlled workflows. Each has a `*/list` to discover and an act method to use; declare what you support in capabilities, and never let a list depend on connection history — only on time and the caller's authorization.
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'Which primitive is designed to be invoked by the language model on its own initiative?',
+    options: [
+      'Resources',
+      'Tools',
+      'Prompts',
+      'Subscriptions',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A server wants to reveal an extra tool only after a client has called a "login" tool earlier on the same connection. What does the spec say?',
+    options: [
+      'This is fine as long as listChanged is declared',
+      'The tool list MUST NOT vary per connection; return a handle from the first tool instead, or vary the list by authorization',
+      'It must be done through prompts, not tools',
+      'It requires the Tasks extension',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does the `subscribe` sub-capability under `resources` mean?',
+    options: [
+      'The server accepts payments',
+      'The server can notify about updates to specific resource URIs',
+      'Resources can be read without authorization',
+      'The resource list is paginated',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="server-primitives/index" />

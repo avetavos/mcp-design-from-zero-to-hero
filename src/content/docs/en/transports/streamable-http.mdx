@@ -1,0 +1,208 @@
+---
+title: 'Streamable HTTP'
+description: 'The remote transport: one POST endpoint, JSON or SSE per request, the mirrored headers intermediaries rely on, subscriptions/listen as a long-lived stream, and the security rules every HTTP server must follow.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## One endpoint, POST only
+
+In **Streamable HTTP** the server is an independent process that can serve many clients at once. It exposes a single HTTP endpoint path — the *MCP endpoint*, e.g. `https://example.com/mcp` — that accepts `POST`. At a glance:
+
+- The client sends **every** JSON-RPC request or notification as its own HTTP POST.
+- The server answers a request with either a single JSON object or a Server-Sent Events stream scoped to that one request.
+- Server-to-client interactions (elicitation, sampling, roots) are embedded in results as `InputRequiredResult`, never sent as separate requests.
+- Long-lived change notifications arrive on the response stream of a `subscriptions/listen` request.
+
+Streamable HTTP replaced the HTTP+SSE transport in 2025-03-26; revision 2026-07-28 removed the GET stream and protocol-level sessions. If you have seen `Mcp-Session-Id` or a GET endpoint, that is legacy (2025-11-25 and earlier) — see [Backward Compatibility](/mcp/en/transports/backward-compatibility/).
+
+<Mermaid title="Three flows on one endpoint" code={httpDiagram} />
+
+export const httpDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  Note over C,S: Simple response
+  C->>S: POST tools/call
+  S-->>C: 200 application/json (response)
+  Note over C,S: Streaming response
+  C->>S: POST tools/call
+  S-->>C: 200 text/event-stream: notifications/progress
+  S-->>C: SSE: notifications/progress
+  S-->>C: SSE: response, stream closes
+  Note over C,S: Change notifications
+  C->>S: POST subscriptions/listen
+  S-->>C: SSE: notifications/subscriptions/acknowledged
+  S-->>C: SSE: notifications/tools/list_changed (stream stays open)`;
+
+## Sending
+
+Rules for the client on every POST:
+
+1. Use `POST`.
+2. Send `Accept: application/json, text/event-stream` — the client must support both response shapes.
+3. Include the request metadata headers (below).
+4. The body is a **single** JSON-RPC request or notification. Clients never POST JSON-RPC responses.
+
+If the body is a **notification** and the server accepts it, it replies `202 Accepted` with no body; otherwise an HTTP error such as `400`. If the body is a **request**, the server replies with `Content-Type: application/json` (one object) or `Content-Type: text/event-stream` (an SSE stream). The server chooses per request; the client must handle either.
+
+## Receiving an SSE stream
+
+When the server picks SSE, the stream is scoped to the originating request:
+
+- It **may** carry notifications that relate to that request — `notifications/progress`, `notifications/message` — before the final response.
+- It **must not** carry independent JSON-RPC requests. (Legacy servers could push `sampling/createMessage` on SSE; modern ones cannot.)
+- The final JSON-RPC response **should** terminate the stream.
+
+Two operational rules for servers: send `X-Accel-Buffering: no` so reverse proxies like nginx do not buffer events, and on long streams emit an SSE comment line (`:` followed by a newline) periodically as a keep-alive — clients must ignore comment lines. Resumable streams via `Last-Event-ID` are **not** supported; a broken response stream loses the in-flight request and the client re-issues it with a new ID.
+
+## The request metadata headers
+
+Streamable HTTP mirrors selected body fields into headers so intermediaries can route without parsing JSON.
+
+| Header | Source | Required for |
+|--------|--------|--------------|
+| `MCP-Protocol-Version` | `_meta["io.modelcontextprotocol/protocolVersion"]` | All requests |
+| `Mcp-Method` | `method` | All requests |
+| `Mcp-Name` | `params.name` or `params.uri` | `tools/call`, `resources/read`, `prompts/get` |
+
+```http
+POST /mcp HTTP/1.1
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: get_weather
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "Seattle, WA" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "ExampleClient", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+For `resources/read`, `Mcp-Name` carries the URI, e.g. `Mcp-Name: file:///projects/myapp/config.json`.
+
+### Server validation
+
+A server that processes the body **must** check that the headers match it. Any mismatch, missing required header, or invalid character is rejected with `400 Bad Request` and JSON-RPC error `-32020` (`HeaderMismatch`):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "error": { "code": -32020, "message": "Header mismatch: Mcp-Name header value 'foo' does not match body value 'bar'" }
+}
+```
+
+Why so strict? A load balancer might route on the header while the server executes on the body. If they can disagree, an attacker can aim a request at one tenant's route and another tenant's data. Header names are case-insensitive; values are case-sensitive.
+
+Two more status codes to know: an unsupported protocol version → `400` with `UnsupportedProtocolVersionError` (-32022) listing supported versions; an unknown RPC method → `404 Not Found` with `-32601`. The JSON-RPC body is what distinguishes a modern `404` from a legacy server that simply has no `/mcp` route.
+
+## Custom headers from tool parameters
+
+A server may mark a tool parameter with `x-mcp-header` in its `inputSchema`; conforming HTTP clients then mirror that argument into `Mcp-Param-{Name}`:
+
+```json
+{
+  "name": "execute_sql",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "region": { "type": "string", "x-mcp-header": "Region" },
+      "query": { "type": "string" }
+    },
+    "required": ["region", "query"]
+  }
+}
+```
+
+A call with `"region": "us-west1"` carries `Mcp-Param-Region: us-west1`, so a gateway can route to the right region before the body is ever parsed. Constraints: only primitive `string`/`integer`/`boolean` parameters (not `number`), names must be valid HTTP tokens and unique, and the property must be reachable purely through `properties` keys — never through `items`, `oneOf`, `$ref` and so on. A client must drop a tool whose annotations break these rules rather than send it.
+
+Values that are not plain ASCII, or that have leading/trailing whitespace or newlines, are Base64-encoded with a sentinel, and the same rule covers an unusual `Mcp-Name`:
+
+```text
+Mcp-Param-Greeting: =?base64?SGVsbG8sIOS4lueVjA==?=
+```
+
+**Never** mark passwords, API keys, tokens or PII with `x-mcp-header`. Header values are visible to every intermediary on the path.
+
+## Long-lived notifications
+
+There is no GET stream. A client that wants change notifications sends a `subscriptions/listen` POST; the server's response is itself an SSE stream that stays open and carries only the types the client opted into (`toolsListChanged`, `promptsListChanged`, `resourcesListChanged`, `resourceSubscriptions`). Request-scoped notifications such as progress never travel on that stream — they stay on the response stream of the request they belong to. Details in [change notifications](/mcp/en/server-primitives/notifications-and-caching/).
+
+## Cancellation
+
+Closing the SSE response stream **must** be treated by the server as cancellation of that request. Each request has its own stream, so the disconnect is unambiguous; no `notifications/cancelled` message is expected over HTTP. The server should stop work promptly and must not send more messages for it.
+
+## Security requirements
+
+1. Servers **must** validate the `Origin` header on all incoming connections to prevent DNS rebinding. A present-but-invalid `Origin` gets `403 Forbidden`.
+2. When running locally, bind to `127.0.0.1`, not `0.0.0.0`.
+3. Implement proper authentication for all connections — for remote servers that means the OAuth 2.1 flow in [Security and Authorization](/mcp/en/security-and-auth/oauth-flow/).
+
+Without these, a web page in the user's browser could talk to a local MCP server as if it were the host.
+
+<Callout title="The one-line takeaway">
+Streamable HTTP is one POST endpoint: each message is its own request, the reply is JSON or a request-scoped SSE stream, the body's method/name/version are mirrored into `Mcp-Method`, `Mcp-Name` and `MCP-Protocol-Version` (and must match, else -32020), change notifications ride a `subscriptions/listen` stream, closing a stream cancels — and you must validate `Origin`, bind localhost, and authenticate.
+</Callout>
+
+export const quizHttp = [
+  {
+    q: 'A client POSTs a JSON-RPC notification. What is the correct success response?',
+    options: [
+      '200 with an empty JSON-RPC response',
+      '202 Accepted with no body',
+      '204 with a text/event-stream body',
+      '201 Created',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'The Mcp-Name header says "foo" but the body says "bar". What must the server do?',
+    options: [
+      'Trust the header and route on it',
+      'Reject with 400 and JSON-RPC error -32020 HeaderMismatch',
+      'Trust the body and ignore the header',
+      'Return 404',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a client cancel a request over Streamable HTTP?',
+    options: [
+      'Send notifications/cancelled in a new POST',
+      'Close the SSE response stream for that request',
+      'Send HTTP DELETE to the endpoint',
+      'Send the same request ID again',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which parameter is a valid target for x-mcp-header?',
+    options: [
+      'A number-typed latitude',
+      'A string region inside an items array',
+      'A top-level string region property',
+      'An API key string, so gateways can authenticate',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="transports/streamable-http" questions={quizHttp} />
+
+<ProgressTracker client:visible id="transports/streamable-http" />

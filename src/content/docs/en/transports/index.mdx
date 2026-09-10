@@ -1,0 +1,111 @@
+---
+title: 'Transports'
+description: 'One JSON-RPC message format, two ways to carry it — stdio for local subprocesses and Streamable HTTP for remote servers — and how to choose between them.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Same messages, different pipes
+
+Everything you learned in the previous modules — `server/discover`, `tools/list`, `tools/call`, `resources/read`, `subscriptions/listen` — is a JSON-RPC 2.0 message. MCP does not change those messages when it moves them across a machine boundary. What changes is the **transport**: the binding that says how bytes get from one process to another.
+
+MCP defines two transports:
+
+- **stdio** — the client launches the server as a child process and talks over its standard input and output.
+- **Streamable HTTP** — the server is an independent process behind a single HTTP endpoint that accepts POST.
+
+The data layer is the inner layer; the transport is the outer layer. An SDK lets you register a tool once and serve it over either transport without touching the handler.
+
+<Mermaid title="Two transports, one data layer" code={layersDiagram} />
+
+export const layersDiagram = `flowchart LR
+  subgraph host["Host (AI application)"]
+    c1["MCP client"]
+    c2["MCP client"]
+  end
+  c1 -- "stdio: stdin/stdout of a child process" --> s1["Local server (subprocess)"]
+  c2 -- "Streamable HTTP: POST /mcp" --> s2["Remote server (any host)"]
+  s1 --- d["JSON-RPC data layer: tools, resources, prompts"]
+  s2 --- d`;
+
+## Local or remote? A decision table
+
+| Concern | stdio | Streamable HTTP |
+|---------|-------|-----------------|
+| Who starts the server | The client spawns it | It runs on its own (a web service) |
+| Process lifetime | Tied to the client that spawned it | Independent; many clients share it |
+| Clients served | Typically one | Many, concurrently |
+| Credentials | Environment variables and local files | OAuth 2.1 bearer tokens on every request |
+| Network overhead | None — pipes on one machine | One HTTP round trip per message |
+| Access to the user's machine | Direct (filesystem, local tools) | None unless the user grants it |
+| Typical examples | Filesystem server, git server, a CLI wrapper | Sentry, a SaaS integration, an internal API gateway |
+
+The rule of thumb: if the server needs the **user's local machine** (files, local databases, dev tools), use stdio. If the server fronts a **service** that many users share, use Streamable HTTP.
+
+## How request metadata travels
+
+Every MCP request carries its protocol version and client capabilities in `_meta` (see [JSON-RPC and _meta](/mcp/en/mcp-foundations/json-rpc-and-meta/)). The two transports carry that metadata differently:
+
+- **stdio** has no header layer. Everything — the version, capabilities, client identity, method, arguments — lives inline in the JSON-RPC body. One message per line.
+- **Streamable HTTP** keeps the body identical but *mirrors* selected fields into HTTP headers (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) so load balancers, gateways and observability tools can route and inspect requests without parsing the JSON. The server validates that the headers and the body agree.
+
+That mirroring is the only place the two transports diverge at the message level, and it exists purely for intermediaries.
+
+## Custom transports
+
+The stdio framing — one newline-delimited JSON-RPC message per line over a reliable bidirectional byte stream — is not tied to standard streams. The spec says custom transports built on Unix domain sockets, TCP or similar channels **should** reuse that framing and the stdio message rules, replacing only the subprocess-specific parts (launch, `stderr`, shutdown-by-closing-the-stream, restart). So if you ever need a third binding, start from stdio's rules, not from scratch.
+
+## What this module covers
+
+| Lesson | What you learn |
+|--------|----------------|
+| [stdio](/mcp/en/transports/stdio/) | Framing, the stdout rule, shutdown, cancellation, host config files |
+| [Streamable HTTP](/mcp/en/transports/streamable-http/) | The single POST endpoint, JSON vs SSE responses, required headers, `subscriptions/listen` |
+| [Building an HTTP server](/mcp/en/transports/building-an-http-server/) | `createMcpHandler` and `mcp.run()` in practice, stateless design |
+| [Backward compatibility](/mcp/en/transports/backward-compatibility/) | Modern vs legacy eras, how clients detect which one they are talking to |
+
+<Callout title="The one-line takeaway">
+MCP's messages never change; only the pipe does. Use stdio when the server needs the user's machine and one client owns it, use Streamable HTTP when a service serves many clients over the network — and remember HTTP merely mirrors `_meta` into headers for the benefit of intermediaries.
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'What differs between the stdio and Streamable HTTP transports?',
+    options: [
+      'The set of JSON-RPC methods available',
+      'Only how the JSON-RPC messages are carried between processes',
+      'The tool input schema format',
+      'Whether resources are supported',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which situation calls for the stdio transport?',
+    options: [
+      'A SaaS integration shared by thousands of users',
+      'A server that must read files on the user’s own machine',
+      'A server behind a load balancer',
+      'A server that needs OAuth bearer tokens',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why does Streamable HTTP mirror fields like the method name into HTTP headers?',
+    options: [
+      'Because the JSON body is encrypted',
+      'So intermediaries can route and inspect requests without parsing the body',
+      'To replace the _meta field entirely',
+      'Because stdio requires it too',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="transports/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="transports/index" />

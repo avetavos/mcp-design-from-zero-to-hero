@@ -1,0 +1,105 @@
+---
+title: 'Client Interaction'
+description: 'ทำไม server ที่ stateless บางครั้งถึงต้องพึ่ง client — เพื่อถามผู้ใช้ หรือเพื่อทำงานที่ยาวกว่า request เดียว — และ pattern ที่ MCP เตรียมไว้ให้: MRTR, elicitation, progress, cancellation และ Tasks extension'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## server ไม่ได้มีคำตอบเสมอไป
+
+MCP ส่วนใหญ่ไหลทางเดียว: client ถาม server ตอบ `tools/list`, `tools/call`, `resources/read` — request เข้า result ออก แต่ tool ของจริงบางทีก็ไปเจอทางตันกลางทาง:
+
+- **ต้องให้คนตัดสินใจ** "จองโต๊ะ 4 หรือ 6 ที่?" "จะ deploy ไป region ไหน?" มีแค่ผู้ใช้เท่านั้นที่ตอบได้
+- **ต้องใช้ secret ที่ server ไม่ควรเห็นแบบ plain text** API key ของ service ภายนอก, การอนุมัติจ่ายเงิน, OAuth consent
+- **ใช้เวลานานเกินกว่าที่ HTTP request เดียวจะเปิดค้างไว้ได้** CI pipeline, bulk import, งานที่ต้องรอ approval
+
+ทุกกรณีข้างต้น *server* ต้องการอะไรบางอย่างจาก *client* — แต่ MCP เป็น protocol ที่ stateless และขับเคลื่อนโดย client การตัดสินใจออกแบบข้อเดียวนี้กำหนดรูปร่างของทุกอย่างใน module นี้
+
+## ข้อจำกัด: ไม่มี request ที่ server เป็นฝ่ายเริ่ม
+
+ใน revision 2026-07-28 MCP เป็น stateless: ทุก request แบกทุกอย่างที่ server ต้องใช้ไว้ใน `_meta` และ server ห้ามอนุมานอะไรจาก request ก่อนหน้าบน connection เดียวกัน ผลข้างเคียงที่ทำให้คนที่มาจากยุคเก่า (2025-11-25 และก่อนหน้า) แปลกใจคือ **server ส่ง JSON-RPC request ของตัวเองไปหา client ไม่ได้อีกแล้ว** ไม่มี channel เปิดค้างที่ `elicitation/create` หรือ `sampling/createMessage` จะวิ่งย้อนขึ้นไปได้
+
+<Mermaid title="server ต้องตอบ — ก็เลยตอบด้วยคำถาม" code={overviewDiagram} />
+
+export const overviewDiagram = `sequenceDiagram
+  participant U as User
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (id 1)
+  Note over S: ต้องให้ผู้ใช้เลือก region
+  S-->>C: InputRequiredResult (inputRequests, requestState)
+  C->>U: form: เลือก region
+  U-->>C: eu-west-1
+  C->>S: tools/call (id 2, args เดิม + inputResponses + requestState)
+  S-->>C: final result`;
+
+ดังนั้นแทนที่จะ *ส่ง request* server จะ *return result ที่ขอ input* client ไปรวบรวมคำตอบมาแล้ว **retry request เดิม** พร้อมแนบคำตอบไปด้วย นี่คือ pattern Multi Round-Trip Requests (MRTR) และเป็นกระดูกสันหลังของทุกอย่างด้านล่าง
+
+## module นี้ครอบคลุมอะไร
+
+| บทเรียน | กลไก | แก้ปัญหา |
+|--------|-----------|--------|
+| [MRTR](/mcp/th/client-interaction/multi-round-trip-requests/) | `InputRequiredResult` → retry พร้อม `inputResponses` | คำถามจาก server ไป client แบบใดก็ได้ โดยไม่ต้องมี state ฝั่ง server |
+| [Elicitation](/mcp/th/client-interaction/elicitation/) | `elicitation/create` แบบ form หรือ URL | ขอข้อมูลหรือ consent จากผู้ใช้ |
+| [Progress & cancellation](/mcp/th/client-interaction/progress-and-cancellation/) | `notifications/progress`, `notifications/cancelled`, ปิด stream | ให้ call ที่ยาวยังมีชีวิตอยู่และหยุดได้ |
+| [Tasks extension](/mcp/th/client-interaction/tasks-extension/) | `resultType: "task"`, `tasks/get`, `tasks/update` | งานที่อยู่นานกว่า request |
+| [Deprecated features](/mcp/th/client-interaction/deprecated-features/) | sampling, roots, logging | ควรใช้อะไรแทน |
+
+## "รอ" มีสองแบบ
+
+จะเข้าใจง่ายขึ้นถ้าแยกตาม *ใคร* ที่ server กำลังรอ:
+
+- **รอผู้ใช้** — elicitation คำตอบมาจากคน ผ่าน UI ของ client ภายใต้ MRTR server ไม่ได้รอเลย: มัน return ออกไป แล้ว retry จะพาคำตอบกลับมา
+- **รอเวลา** — operation ที่รันนาน ส่วนที่เปราะบางคือ connection progress notification ช่วยให้ request เดียวยังมีชีวิตและซื่อสัตย์ ส่วน Tasks extension เปลี่ยนงานให้เป็น handle ที่คงทน poll ได้แม้หลัง reconnect
+
+ทั้งสองแบบทำให้ server ไม่ต้องเก็บ state ต่อ connection state จะเดินทางไปกับ request (`requestState`) หรือไม่ก็เป็น identifier ชัด ๆ (`taskId`) ที่ client ส่งมาทุก call
+
+## อะไรถูกปลดระวาง
+
+feature ฝั่ง client สามตัวถูก deprecate ใน 2026-07-28 (SEP-2577): **sampling** (server ขอ completion จาก LLM ของ host), **roots** (server ถามว่าแตะ directory ไหนได้บ้าง) และ **logging** (server push log line) ยังใช้ได้ระหว่างช่วง deprecation แต่ server ใหม่ไม่ควรเอามาใช้ บทเรียนสุดท้ายอธิบายว่าทำไมและอะไรมาแทนแต่ละตัว
+
+<Callout title="สรุปหนึ่งบรรทัด">
+MCP server เรียก client ไม่ได้ — พอต้องการผู้ใช้ก็ *return* คำถามออกไป (`InputRequiredResult`) แล้ว client retry request เดิมพร้อมคำตอบ พอต้องการเวลาก็รายงาน progress หรือส่ง task handle กลับมา state เดินทางไปกับ request ไม่ใช่ connection
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'ทำไม MCP server ใน 2026-07-28 ถึงส่ง elicitation/create เป็น JSON-RPC request ของตัวเองไม่ได้?',
+    options: [
+      'elicitation ถูกถอดออกจาก protocol แล้ว',
+      'protocol เป็น stateless และขับเคลื่อนโดย client: ไม่มี channel สำหรับ request ที่ server เริ่มเอง',
+      'JSON-RPC ห้าม server ส่ง request',
+      'มีแค่ stdio server เท่านั้นที่ส่ง request ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ภายใต้ MRTR server ถามคำถามผู้ใช้อย่างไร?',
+    options: [
+      'เปิด WebSocket ย้อนกลับไปหา client',
+      'block HTTP request ไว้จนกว่าผู้ใช้จะตอบ',
+      'return InputRequiredResult แล้ว client retry request เดิมพร้อม inputResponses',
+      'เขียน prompt ลง stderr',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'feature คู่ไหนที่รับมือกับกรณี "งานอยู่นานกว่า request เดียว"?',
+    options: [
+      'roots และ sampling',
+      'progress notification และ Tasks extension',
+      'prompts และ resources',
+      'logging และ ping',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-interaction/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="client-interaction/index" />

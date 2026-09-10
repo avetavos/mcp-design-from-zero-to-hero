@@ -1,0 +1,111 @@
+---
+title: 'Transports'
+description: 'JSON-RPC message รูปแบบเดียว แต่มีสองวิธีขนส่ง — stdio สำหรับ subprocess ในเครื่อง และ Streamable HTTP สำหรับ remote server — และวิธีเลือกระหว่างสองแบบ'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## message เดียวกัน ท่อคนละท่อ
+
+ทุกอย่างที่คุณเรียนในโมดูลก่อน ๆ — `server/discover`, `tools/list`, `tools/call`, `resources/read`, `subscriptions/listen` — คือ JSON-RPC 2.0 message MCP ไม่เปลี่ยน message เหล่านั้นเมื่อย้ายมันข้ามขอบเขตของเครื่อง สิ่งที่เปลี่ยนคือ **transport**: binding ที่บอกว่า byte เดินทางจาก process หนึ่งไปอีก process หนึ่งอย่างไร
+
+MCP นิยาม transport ไว้สองแบบ:
+
+- **stdio** — client เปิด server เป็น child process แล้วคุยผ่าน standard input และ output ของมัน
+- **Streamable HTTP** — server เป็น process อิสระที่อยู่หลัง HTTP endpoint เดียวซึ่งรับ POST
+
+data layer คือชั้นใน; transport คือชั้นนอก SDK ให้คุณลงทะเบียน tool ครั้งเดียวแล้ว serve ผ่าน transport ไหนก็ได้โดยไม่ต้องแตะ handler
+
+<Mermaid title="สอง transport หนึ่ง data layer" code={layersDiagram} />
+
+export const layersDiagram = `flowchart LR
+  subgraph host["Host (AI application)"]
+    c1["MCP client"]
+    c2["MCP client"]
+  end
+  c1 -- "stdio: stdin/stdout of a child process" --> s1["Local server (subprocess)"]
+  c2 -- "Streamable HTTP: POST /mcp" --> s2["Remote server (any host)"]
+  s1 --- d["JSON-RPC data layer: tools, resources, prompts"]
+  s2 --- d`;
+
+## local หรือ remote? ตารางช่วยตัดสินใจ
+
+| ประเด็น | stdio | Streamable HTTP |
+|---------|-------|-----------------|
+| ใครเปิด server | client spawn มัน | รันเอง (เป็น web service) |
+| อายุของ process | ผูกกับ client ที่ spawn มัน | อิสระ; หลาย client ใช้ร่วมกัน |
+| client ที่ให้บริการ | ปกติหนึ่งตัว | หลายตัวพร้อมกัน |
+| Credential | environment variable และไฟล์ในเครื่อง | OAuth 2.1 bearer token บนทุก request |
+| overhead ของ network | ไม่มี — เป็น pipe บนเครื่องเดียว | HTTP round trip หนึ่งครั้งต่อ message |
+| เข้าถึงเครื่องของผู้ใช้ | ได้โดยตรง (filesystem, tool ในเครื่อง) | ไม่ได้ เว้นแต่ผู้ใช้อนุญาต |
+| ตัวอย่างทั่วไป | filesystem server, git server, ตัวครอบ CLI | Sentry, SaaS integration, internal API gateway |
+
+กฎง่าย ๆ: ถ้า server ต้องใช้ **เครื่องของผู้ใช้** (ไฟล์, local database, dev tool) ใช้ stdio ถ้า server อยู่หน้า **service** ที่ผู้ใช้หลายคนแชร์กัน ใช้ Streamable HTTP
+
+## request metadata เดินทางอย่างไร
+
+ทุก MCP request พก protocol version และ client capability มาใน `_meta` (ดู [JSON-RPC and _meta](/mcp/th/mcp-foundations/json-rpc-and-meta/)) สอง transport ขน metadata นั้นต่างกัน:
+
+- **stdio** ไม่มีชั้น header ทุกอย่าง — version, capability, ตัวตนของ client, method, argument — อยู่ inline ใน JSON-RPC body หนึ่ง message ต่อบรรทัด
+- **Streamable HTTP** body เหมือนเดิมเป๊ะ แต่ *mirror* บาง field ไปเป็น HTTP header (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) เพื่อให้ load balancer, gateway และเครื่องมือ observability route และตรวจสอบ request ได้โดยไม่ต้อง parse JSON server จะ validate ว่า header กับ body ตรงกัน
+
+การ mirror นั้นเป็นจุดเดียวที่สอง transport แตกต่างกันในระดับ message และมันมีไว้เพื่อ intermediary ล้วน ๆ
+
+## Custom transport
+
+framing ของ stdio — JSON-RPC message ที่คั่นด้วย newline หนึ่งตัวต่อบรรทัดบน byte stream สองทางที่เชื่อถือได้ — ไม่ได้ผูกกับ standard stream spec บอกว่า custom transport ที่สร้างบน Unix domain socket, TCP หรือช่องทางคล้ายกัน **ควร** ใช้ framing นั้นและกฎ message ของ stdio ซ้ำ โดยเปลี่ยนเฉพาะส่วนที่เจาะจงกับ subprocess (การเปิด, `stderr`, การ shutdown ด้วยการปิด stream, การ restart) ดังนั้นถ้าคุณต้องการ binding แบบที่สามเมื่อไร ให้เริ่มจากกฎของ stdio ไม่ใช่เริ่มจากศูนย์
+
+## โมดูลนี้ครอบคลุมอะไร
+
+| บทเรียน | สิ่งที่คุณจะได้เรียน |
+|--------|----------------|
+| [stdio](/mcp/th/transports/stdio/) | framing, กฎของ stdout, shutdown, cancellation, config file ของ host |
+| [Streamable HTTP](/mcp/th/transports/streamable-http/) | POST endpoint เดียว, response แบบ JSON กับ SSE, header ที่บังคับ, `subscriptions/listen` |
+| [Building an HTTP server](/mcp/th/transports/building-an-http-server/) | `createMcpHandler` และ `mcp.run()` ในทางปฏิบัติ, การออกแบบให้ stateless |
+| [Backward compatibility](/mcp/th/transports/backward-compatibility/) | ยุค modern กับ legacy, client ตรวจจับได้อย่างไรว่ากำลังคุยกับยุคไหน |
+
+<Callout title="สรุปหนึ่งบรรทัด">
+message ของ MCP ไม่เคยเปลี่ยน เปลี่ยนแค่ท่อ ใช้ stdio เมื่อ server ต้องใช้เครื่องของผู้ใช้และมี client เดียวเป็นเจ้าของ ใช้ Streamable HTTP เมื่อ service ให้บริการหลาย client ผ่าน network — และจำไว้ว่า HTTP แค่ mirror `_meta` ไปเป็น header เพื่อประโยชน์ของ intermediary เท่านั้น
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'อะไรต่างกันระหว่าง transport แบบ stdio กับ Streamable HTTP?',
+    options: [
+      'ชุด JSON-RPC method ที่ใช้ได้',
+      'แค่วิธีขนส่ง JSON-RPC message ระหว่าง process เท่านั้น',
+      'รูปแบบ input schema ของ tool',
+      'รองรับ resource หรือไม่',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'สถานการณ์ไหนที่ควรใช้ transport แบบ stdio?',
+    options: [
+      'SaaS integration ที่ผู้ใช้หลายพันคนแชร์กัน',
+      'server ที่ต้องอ่านไฟล์บนเครื่องของผู้ใช้เอง',
+      'server ที่อยู่หลัง load balancer',
+      'server ที่ต้องใช้ OAuth bearer token',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม Streamable HTTP ถึง mirror field อย่างชื่อ method ไปเป็น HTTP header?',
+    options: [
+      'เพราะ JSON body ถูกเข้ารหัส',
+      'เพื่อให้ intermediary route และตรวจสอบ request ได้โดยไม่ต้อง parse body',
+      'เพื่อแทนที่ field _meta ทั้งหมด',
+      'เพราะ stdio ก็บังคับเหมือนกัน',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="transports/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="transports/index" />

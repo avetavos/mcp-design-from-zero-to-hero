@@ -1,0 +1,199 @@
+---
+title: 'Scaling to Many Servers and Tools'
+description: 'Progressive tool discovery, on-demand server connections, caching with ttlMs, protecting the prompt cache, and programmatic tool calling for hosts that connect to hundreds of tools.'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The naive host breaks at scale
+
+The simplest host lists every tool from every server and hands all of them to the model on every turn. With five tools that is fine. With forty servers and six hundred tools, the definitions alone can consume most of the context window before the model reads the user's message, and tool selection accuracy drops as the model scans hundreds of irrelevant schemas.
+
+Two patterns fix this. **Progressive discovery** controls *when* a tool definition enters the model's context. **Programmatic tool calling** controls *how* tools are invoked so intermediate data never passes through the model at all.
+
+## Progressive tool discovery
+
+The host still fetches `tools/list` from every server, but it keeps the definitions in its own registry instead of injecting them. The model gets a small set of meta-tools:
+
+<Mermaid title="Catalog, inspect, execute" code={discoveryDiagram} />
+
+export const discoveryDiagram = `sequenceDiagram
+  participant M as Model
+  participant H as Host
+  participant S as MCP servers
+  M->>H: search_tools(query)
+  H-->>M: names + one-line descriptions
+  M->>H: get_tool_details(name)
+  H-->>M: full inputSchema for one tool
+  M->>H: call tool
+  H->>S: tools/call
+  S-->>H: result
+  H-->>M: tool_result`;
+
+**Layer 1: catalog.** `search_tools({ query })` returns matching names with brief descriptions only.
+
+```json
+[
+  { "name": "salesforce_updateRecord", "description": "Update fields on a Salesforce object" },
+  { "name": "salesforce_upsertRecord", "description": "Insert or update based on external ID" }
+]
+```
+
+**Layer 2: inspect.** `get_tool_details({ name })` returns the complete definition for that single tool.
+
+**Layer 3: execute.** The model calls the tool having loaded only the schema it needs.
+
+### When to switch it on
+
+Loading everything is right when definitions are small. Set a threshold — the guidance is around 1 to 5 percent of the context window — and switch to progressive discovery once tool definitions cross it.
+
+### Choosing a search strategy
+
+| Strategy | Trade-off |
+|----------|-----------|
+| Keyword (BM25, regex) | Simple, cheap, works well with descriptive names |
+| Embedding similarity | Handles synonyms; needs an index |
+| Subagent (a small fast model picks tools) | Very accurate; costs a model call |
+| Hybrid | Combine rankings or pick per query |
+
+Some providers ship tool search natively (the Claude API has a tool search tool that works with `defer_loading` on tool definitions). Prefer the platform feature when it exists; build your own for domain-specific ranking or access-control filtering.
+
+### Implementation guidelines
+
+- **Offer detail levels:** name-only, name-and-description, full schema.
+- **Memoize definitions host-side** once fetched so re-injecting later costs no round trip.
+- **Re-index on `notifications/tools/list_changed`.**
+- **Group by server** so the model can reason about related capabilities.
+
+## Dynamic server management
+
+Discovery scales up to whole servers. Keep a registry of available servers with high-level descriptions, connect only when the model needs one, and disconnect when the task is over to free context.
+
+```text
+search_available_servers("CRM")  → Salesforce server (not connected)
+enable_server("salesforce")      → server/discover, tools/list, tools indexed
+...task...
+disable_server("salesforce")     → connection closed, context freed
+```
+
+Treat disconnection as a conversation-boundary operation rather than something you do every turn — connecting has a cost, and removing tools mid-conversation has a prompt-cache cost (below).
+
+## Caching discovery results
+
+Every list result and every `server/discover` and `resources/read` result carries two hints: `ttlMs` (how long the response stays fresh) and `cacheScope` (`public` if a shared intermediary may cache it, `private` if it is caller-specific). Honor them: cache `tools/list` for `ttlMs`, and treat the cache as stale the moment a `list_changed` notification arrives, even before the TTL expires.
+
+```json
+{
+  "tools": [ ... ],
+  "ttlMs": 300000,
+  "cacheScope": "public"
+}
+```
+
+## Protecting the prompt cache
+
+Most providers cache the prompt prefix, and the `tools` array is part of it. Adding, removing, or reordering a tool definition mid-conversation invalidates the cache, and the resulting miss can cost more than the tokens you saved. Two safe options:
+
+1. **Append newly discovered definitions after the cache breakpoint** instead of re-sorting the array.
+2. **Route every call through one stable meta-tool** such as `call_tool({ name, args })` so the `tools` array never changes at all.
+
+Either way, keep the stable part first and the volatile part last.
+
+## Programmatic tool calling (code mode)
+
+With direct calling, every intermediate result flows through the model. Chaining "read logs → filter → file tickets" means thousands of log lines enter the context even though the model only needs the count. Code mode inverts this: the model writes a short script against typed stubs, the script runs in a sandbox, and only its output comes back.
+
+**Step 1: generate stubs from schemas.** The host turns each tool's `inputSchema` and `outputSchema` into a typed function.
+
+```ts
+// Auto-generated from the Logging server's tool schema
+function logging_getLogs(input: { level: 'error' | 'warn' | 'info'; since: number }):
+  Promise<{ entries: LogEntry[] }> {
+  return mcp.callTool('logging_getLogs', input);
+}
+```
+
+An `outputSchema` gives you precise return types; without one, fall back to a generic type and encourage the server author to add it.
+
+**Step 2: the model writes code.**
+
+```ts
+const logs = await logging_getLogs({ level: 'error', since: Date.now() - 3600000 });
+const unique = new Map<string, LogEntry>();
+for (const log of logs.entries) if (!unique.has(log.message)) unique.set(log.message, log);
+for (const [message, log] of unique) {
+  await ticketing_createIssue({ title: `Error: ${message}`, body: `First seen: ${log.timestamp}`, priority: 'high' });
+}
+console.log(`Filed ${unique.size} tickets from ${logs.entries.length} error logs`);
+```
+
+**Step 3: the sandbox executes.** Function calls are intercepted and brokered back to the right MCP server. Only the `console.log` line returns to the model.
+
+### Non-negotiables for code mode
+
+- **No network in the sandbox.** All I/O goes through the host broker.
+- **Per-call authorization.** Approving the script is not approving every tool call it makes; the broker evaluates each call against the user's grant, with the same human-in-the-loop policy as direct calls.
+- **Credentials stay in the host.** Generated code never sees tokens.
+- **Cross-server data is untrusted.** One server's output is untrusted input to another.
+- **Resource limits and output filtering.** Timeouts, memory caps, and truncation before results reach the model.
+- **Turn `isError` into exceptions** in the generated wrappers so model-written code can use `try` and `catch`; surface an uncaught error as the script result so the model can self-correct.
+
+## Combining both
+
+Discovery finds the right tools; code mode calls them efficiently. A model can search, inspect two schemas, and then write one script that chains them — minimizing both definition tokens and result tokens.
+
+<Callout title="The one-line takeaway">
+At scale, stop injecting every tool: let the model search a catalog and load one schema at a time, connect servers on demand, cache lists by `ttlMs`, keep the `tools` array stable for the prompt cache, and move data-heavy chains into a sandbox so only the summary reaches the model.
+</Callout>
+
+export const quizScaling = [
+  {
+    q: 'What is the first layer of progressive tool discovery?',
+    options: [
+      'Executing the tool',
+      'A search_tools meta-tool that returns names and one-line descriptions',
+      'Loading every full schema into context',
+      'Disconnecting unused servers',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A tools/list response has ttlMs: 300000, and 30 seconds later a notifications/tools/list_changed arrives. What should the host do?',
+    options: [
+      'Keep using the cache until the TTL expires',
+      'Treat the cached list as stale and refetch tools/list',
+      'Ignore the notification',
+      'Disconnect from the server',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Why can removing a tool definition mid-conversation cost more tokens than it saves?',
+    options: [
+      'The server bills per removal',
+      'The tools array is part of the cached prompt prefix; changing it invalidates the cache',
+      'The model re-reads the user message',
+      'It triggers a new server/discover',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'In programmatic tool calling, who holds the API tokens used to call MCP servers?',
+    options: [
+      'The sandboxed script',
+      'The model',
+      'The host broker, which adds authentication when forwarding calls',
+      'The MCP server',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="building-clients/scaling-tools" questions={quizScaling} />
+
+<ProgressTracker client:visible id="building-clients/scaling-tools" />

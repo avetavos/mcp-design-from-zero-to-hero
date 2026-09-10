@@ -1,0 +1,135 @@
+---
+title: 'MCP Foundations'
+description: 'ปัญหา N×M integration ที่ MCP แก้, ภาพรวม host/client/server, MCP อยู่ตรงไหนเมื่อเทียบกับ LLM API และโมดูลนี้สอนอะไรบ้าง'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ปัญหา: N แอป × M integration
+
+AI application ทุกตัวต้องการสิ่งเดียวกัน: อ่านไฟล์ของผู้ใช้, query database, ค้น issue tracker, เรียก internal API ก่อนมี MCP แต่ละแอปต้องสร้าง integration เหล่านี้เอง Claude Desktop เขียน GitHub connector ของตัวเอง, VS Code ก็เขียนของตัวเอง, agent ในบริษัทคุณก็เขียนอีกตัว สามแอป API เดียว แต่มี integration สามชุด — แล้วก็ต้องทำแบบนี้ซ้ำกับ data source อื่นทุกตัว
+
+นี่คือ **ปัญหา N×M**: N application คูณ M data source ได้ N×M adapter ที่เขียนขึ้นเฉพาะกิจ แต่ละตัวต่างกันนิดหน่อย และแต่ละตัวมีคนดูแลคนละคน
+
+<Mermaid title="ก่อนมี MCP: ทุกแอปต่อกับทุก source เอง" code={nxmDiagram} />
+
+export const nxmDiagram = `flowchart LR
+  A1["App 1"] --> S1["GitHub"]
+  A1 --> S2["Postgres"]
+  A1 --> S3["Files"]
+  A2["App 2"] --> S1
+  A2 --> S2
+  A2 --> S3
+  A3["App 3"] --> S1
+  A3 --> S2
+  A3 --> S3`;
+
+**Model Context Protocol (MCP)** เปลี่ยนตารางนี้ให้เป็นมาตรฐาน data source implement protocol ครั้งเดียวในฐานะ **MCP server** application implement protocol ครั้งเดียวในฐานะ **MCP host** จากนั้น host ไหนก็คุยกับ server ไหนก็ได้: เหลือ N + M implementation แทนที่จะเป็น N×M
+
+<Mermaid title="เมื่อมี MCP: implement protocol ครั้งเดียวในแต่ละฝั่ง" code={mcpDiagram} />
+
+export const mcpDiagram = `flowchart LR
+  A1["App 1 (host)"] --> P["MCP"]
+  A2["App 2 (host)"] --> P
+  A3["App 3 (host)"] --> P
+  P --> S1["GitHub server"]
+  P --> S2["Postgres server"]
+  P --> S3["Filesystem server"]`;
+
+## "USB-C สำหรับ AI application"
+
+คำเปรียบที่ใช้กันบ่อยคือ USB-C laptop ไม่ได้มีพอร์ตเฉพาะสำหรับจอ, drive และ keyboard แต่ละยี่ห้อ มันมีพอร์ตมาตรฐานพอร์ตเดียว แล้วอุปกรณ์ต่อพ่วงก็มีหัวเสียบที่เข้ากันได้ MCP คือพอร์ตนั้นสำหรับ AI application: host มี connector เดียว แล้ว context source ทุกอย่าง — database, SaaS API, ไฟล์ในเครื่องคุณ — เสียบเข้ามาได้หมด
+
+คำเปรียบนี้ใช้ได้อีกมุมหนึ่งด้วย USB-C กำหนดแค่หัวเสียบกับการ negotiate ไม่ได้กำหนดว่าอุปกรณ์ทำอะไร MCP ก็กำหนดแค่ message, discovery และ transport ไม่ได้กำหนดว่า tool ของคุณทำอะไรหรือ host ใช้ model อย่างไร ขอบเขตที่จงใจจำกัดแบบนี้เป็นจุดแข็ง: protocol เล็กอยู่เสมอ และทุกอย่างที่เป็น domain-specific ไปอยู่ใน server ของคุณ
+
+## MCP อยู่ตรงไหนเมื่อเทียบกับ LLM API
+
+MCP **ไม่ใช่** LLM API มันไม่ได้ส่ง prompt ไปหา model หรือ stream token กลับมา มันอยู่ข้าง ๆ model API เพื่อป้อน context ให้:
+
+| Layer | คุยกับ | ตัวอย่าง |
+|-------|----------|----------|
+| LLM API | model | Claude Messages API, tool-use loop |
+| MCP host | MCP server ผ่าน MCP client | Claude Desktop, Claude Code, VS Code, agent ของคุณ |
+| MCP server | โลกภายนอก | Filesystem, GitHub, Sentry, internal API ของคุณ |
+
+host ถาม MCP server ว่ามี tool อะไรบ้าง ส่ง tool definition เหล่านั้นให้ model และเมื่อ model ตัดสินใจเรียก tool ตัวไหน host ก็ route call ไปยัง server ที่ถูกต้องแล้วส่งผลลัพธ์กลับให้ model MCP ครอบคลุมครึ่ง host↔server ของ loop นี้ ส่วนครึ่ง host↔model เป็นเรื่องของ API ฝั่ง model provider
+
+## ใครเป็นใคร
+
+<Mermaid title="host รัน MCP client หนึ่งตัวต่อ server หนึ่งตัว" code={whoDiagram} />
+
+export const whoDiagram = `flowchart TB
+  subgraph H["MCP Host (the AI application)"]
+    C1["MCP Client 1"]
+    C2["MCP Client 2"]
+    C3["MCP Client 3"]
+  end
+  C1 --- S1["Local server: filesystem (stdio)"]
+  C2 --- S2["Local server: database (stdio)"]
+  C3 --- S3["Remote server: Sentry (Streamable HTTP)"]`;
+
+- **Host** — application ที่ผู้ใช้กำลังใช้อยู่จริง เป็นเจ้าของ model, UI และเป็นคนตัดสินใจว่าจะเปิดอะไรให้ model เห็น
+- **Client** — component ภายใน host ที่ถือ connection หนึ่งเส้นไปยัง server หนึ่งตัว host ที่มีสาม server ก็มีสาม client
+- **Server** — โปรแกรมที่เปิด context ให้ใช้: **tools** ไว้ลงมือทำ, **resources** ไว้อ่าน, **prompts** ไว้ใช้ซ้ำ รันเป็น subprocess บนเครื่องผู้ใช้ก็ได้ หรือเป็น service บนอินเทอร์เน็ตก็ได้
+
+## โมดูลนี้ครอบคลุมอะไร
+
+| บทเรียน | เรียนจบแล้วคุณจะ |
+|--------|-------------------|
+| [What Is MCP?](/mcp/th/mcp-foundations/what-is-mcp/) | บอกชื่อผู้เล่นทั้งสามฝ่ายและ primitive ที่แต่ละฝั่งมีให้ได้ |
+| [Architecture and Layers](/mcp/th/mcp-foundations/architecture-and-layers/) | ไล่ลำดับ discover → list → call → notify บน wire ได้ครบ |
+| [JSON-RPC and _meta](/mcp/th/mcp-foundations/json-rpc-and-meta/) | อ่าน MCP message ตัวไหนก็ได้ และรู้ว่า field ไหนบังคับเพราะอะไร |
+| [Discovery and Versioning](/mcp/th/mcp-foundations/discovery-and-versioning/) | อธิบายได้ว่าทำไม MCP ถึง stateless และ negotiate version รายรีเควสต์อย่างไร |
+| [Setup and Your First Server](/mcp/th/mcp-foundations/setup-and-first-server/) | รัน server ที่ใช้งานได้จริงทั้ง TypeScript และ Python แล้ว inspect มัน |
+
+## คอร์สนี้สร้างขึ้นอย่างไร
+
+ทุกบทเรียนเริ่มจาก **wire** — JSON ที่วิ่งข้ามไปมาระหว่าง client กับ server จริง ๆ — แล้วค่อยแสดง SDK call ที่สร้างมันขึ้นมา คุณจะเห็น server ตัวเดียวกันเขียนด้วย **TypeScript** (`@modelcontextprotocol/server`) และ **Python** (`mcp`) เทียบกันในแท็บที่ sync กัน เลือกภาษาครั้งเดียวแล้วมันจะตามคุณไปทุกบท
+
+คอร์สนี้อิง protocol revision **2026-07-28** ซึ่งเป็นเวอร์ชันปัจจุบัน ตรงไหนที่พฤติกรรมยุคเก่ายังสำคัญต่อ interoperability จะระบุชัดว่า *legacy (2025-11-25 และก่อนหน้า)* เพื่อไม่ให้คุณสับสน
+
+<Callout title="สรุปหนึ่งบรรทัด">
+MCP เปลี่ยนตาราง integration แบบ N×M ให้เป็น N + M ด้วยการทำให้วิธีที่ AI application ค้นหาและใช้ context เป็นมาตรฐาน: host รัน client หนึ่งตัวต่อ server หนึ่งตัว และทุก server implement protocol เล็ก ๆ ตัวเดียวกัน — ส่วนที่ว่า tool ทำอะไรและ host ใช้ model อย่างไร ปล่อยให้เป็นเรื่องของคุณทั้งหมด
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'MCP ถูกออกแบบมาเพื่อกำจัดปัญหาอะไร?',
+    options: [
+      'การ stream token จาก LLM API ที่ช้า',
+      'การที่ทุก application ต้องสร้าง integration ของตัวเองสำหรับทุก data source (adapter แบบ N×M)',
+      'ความจำเป็นต้องมี database อยู่หลัง AI app',
+      'prompt engineering',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'host สร้าง MCP client กี่ตัวเมื่อเชื่อมต่อกับ server สามตัว?',
+    options: [
+      'client ตัวเดียวที่ใช้ร่วมกัน',
+      'สามตัว — client เฉพาะหนึ่งตัวต่อ server หนึ่งตัว',
+      'ไม่มีเลย host คุยกับ server โดยตรง',
+      'หกตัว — ทิศทางละหนึ่งตัว',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อใดที่ MCP ไม่ได้กำหนด?',
+    options: [
+      'วิธีที่ server ประกาศ tool ของตัวเอง',
+      'รูปแบบ message ระหว่าง client กับ server',
+      'วิธีที่ host ส่ง prompt ไปหา language model',
+      'วิธีที่ client ค้นหา protocol version ที่ server รองรับ',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="mcp-foundations/index" />

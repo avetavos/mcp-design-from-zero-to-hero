@@ -1,0 +1,268 @@
+---
+title: 'The Authorization Flow'
+description: 'จาก 401 ที่ยังไม่ authenticate ไปจนถึง bearer token ที่ใช้ได้จริง: Protected Resource Metadata, การค้นหา authorization server, PKCE, resource indicator, การตรวจ issuer และ step-up authorization พร้อม header และ document ตัวจริง'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ภาพรวมของ flow ทั้งหมด
+
+client ที่ไม่เคยเจอ server ตัวนี้มาก่อน ต้องหาให้ได้ว่า *ใคร* เป็นคนออก token ให้ server นั้น ต้องแนะนำตัวกับผู้ออก token ต้องขอ consent จาก user แล้วกลับมาพร้อม token ที่ผูกกับ server ตัวนี้ตัวเดียว MCP กำหนดทุกขั้นตอนไว้เพื่อให้ client ไหนก็ทำได้กับ server ไหนก็ได้โดยไม่ต้องรู้จักกันมาก่อน:
+
+<Mermaid title="จาก request แรกจนถึง MCP traffic ที่ authenticate แล้ว" code={flowDiagram} />
+
+export const flowDiagram = `sequenceDiagram
+  participant B as Browser
+  participant C as MCP Client
+  participant M as MCP Server (RS)
+  participant A as Authorization Server
+  C->>M: POST /mcp (ไม่มี token)
+  M-->>C: 401 + WWW-Authenticate (resource_metadata, scope)
+  C->>M: GET /.well-known/oauth-protected-resource
+  M-->>C: authorization_servers, scopes_supported
+  C->>A: GET /.well-known/oauth-authorization-server
+  A-->>C: issuer, endpoints, capabilities
+  Note over C,A: ลงทะเบียนหรือระบุตัว client (บทถัดไป)
+  C->>B: เปิด authorize URL + code_challenge + resource
+  B->>A: user authenticate และให้ consent
+  A-->>B: redirect พร้อม code + iss
+  B-->>C: callback
+  C->>A: POST token (code_verifier, resource)
+  A-->>C: access token
+  C->>M: POST /mcp พร้อม Authorization: Bearer
+  M-->>C: MCP result`;
+
+มาไล่ดูทีละก้าวกัน
+
+## ขั้นที่ 1: 401 challenge
+
+client ส่ง MCP request ธรรมดาโดยไม่มี token server ตอบ `401 Unauthorized` และบอก client ตาม RFC 6750 กับ RFC 9728 ว่าต้องไปดูต่อที่ไหน:
+
+```http
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource",
+                         scope="files:read"
+```
+
+มีสองพารามิเตอร์ที่สำคัญ:
+
+- `resource_metadata` คือ URL ของ Protected Resource Metadata document ของ server
+- `scope` (ไม่บังคับแต่แนะนำ) คือชุด scope *ขั้นต่ำ* ที่ request นี้ต้องการ client MUST ถือว่ามันเป็นค่าที่เชื่อถือได้สำหรับ operation ปัจจุบัน
+
+ถ้า header ไม่มี `resource_metadata` client MUST ประกอบ well-known URI ขึ้นมาเอง: ลองที่ path ของ endpoint ก่อน (`https://example.com/.well-known/oauth-protected-resource/public/mcp` สำหรับ endpoint ที่ `/public/mcp`) แล้วค่อยลองที่ root
+
+## ขั้นที่ 2: Protected Resource Metadata
+
+document นี้ (RFC 9728) บอก client ว่า authorization server ตัวไหนออก token ให้ resource นี้ได้บ้าง:
+
+```json
+{
+  "resource": "https://mcp.example.com/mcp",
+  "authorization_servers": ["https://auth.example.com"],
+  "scopes_supported": ["files:read", "files:write"],
+  "bearer_methods_supported": ["header"]
+}
+```
+
+MCP server MUST serve document นี้ และมันต้องมีอย่างน้อยหนึ่งรายการใน `authorization_servers` ถ้ามีหลายรายการ client เป็นคนเลือก แต่ละตัวเป็น issuer อิสระที่มี client registration และ token ของตัวเอง
+
+`scopes_supported` ตั้งใจให้เป็นชุด *ขั้นต่ำ* สำหรับการใช้งานพื้นฐาน ไม่ใช่รายการทั้งหมด scope เพิ่มเติมจะขอทีหลังผ่าน step-up (ด้านล่าง)
+
+## ขั้นที่ 3: ค้นหา authorization server
+
+พอมี issuer URL แล้ว client ก็ไปดึง metadata ของ authorization server MCP client MUST ลองหลาย well-known location ตามลำดับความสำคัญ เพราะ issuer อาจเป็น OAuth ล้วน ๆ หรือเป็น OpenID provider และอาจมี path ต่อท้าย
+
+สำหรับ issuer **ที่มี** path (`https://auth.example.com/tenant1`):
+
+1. `https://auth.example.com/.well-known/oauth-authorization-server/tenant1` (RFC 8414, แทรก path)
+2. `https://auth.example.com/.well-known/openid-configuration/tenant1` (OIDC, แทรก path)
+3. `https://auth.example.com/tenant1/.well-known/openid-configuration` (OIDC, ต่อท้าย path)
+
+สำหรับ issuer **ที่ไม่มี** path (`https://auth.example.com`):
+
+1. `https://auth.example.com/.well-known/oauth-authorization-server`
+2. `https://auth.example.com/.well-known/openid-configuration`
+
+document หน้าตาประมาณนี้:
+
+```json
+{
+  "issuer": "https://auth.example.com",
+  "authorization_endpoint": "https://auth.example.com/authorize",
+  "token_endpoint": "https://auth.example.com/token",
+  "code_challenge_methods_supported": ["S256"],
+  "client_id_metadata_document_supported": true,
+  "authorization_response_iss_parameter_supported": true,
+  "scopes_supported": ["files:read", "files:write", "offline_access"]
+}
+```
+
+มีการตรวจสอบหนึ่งอย่างที่บังคับ: ค่า `issuer` ใน document MUST ตรงเป๊ะกับ issuer ที่ใช้ประกอบ well-known URL document ที่ดึงมาจาก `attacker.example` แต่อ้างว่า `"issuer": "https://honest.example"` MUST ถูกปฏิเสธ การตรวจครั้งเดียวนี้คือสิ่งที่ทำให้การเทียบ `iss` ในขั้นถัดไปมีความหมาย
+
+## ขั้นที่ 4: ระบุตัว client
+
+ก่อนจะขอ code ได้ client ต้องมี `client_id` ก่อน มีสามวิธี (pre-registered, Client ID Metadata Document หรือ dynamic registration ที่ deprecated แล้ว) ซึ่งมี[บทเรียนของตัวเอง](/mcp/th/security-and-auth/client-registration/) ใน walkthrough นี้สมมติว่า client ใช้ HTTPS URL เป็น identifier
+
+## ขั้นที่ 5: authorization request
+
+client สร้างพารามิเตอร์ PKCE เลือก scope บันทึก issuer ที่กำลังจะคุยด้วย แล้วเปิด browser:
+
+```http
+GET /authorize?response_type=code
+  &client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
+  &redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback
+  &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &code_challenge_method=S256
+  &resource=https%3A%2F%2Fmcp.example.com%2Fmcp
+  &scope=files%3Aread
+  &state=af0ifjsldkj HTTP/1.1
+Host: auth.example.com
+```
+
+มีสามรายละเอียดที่เป็นของ MCP โดยเฉพาะ:
+
+**`resource` (RFC 8707)** MCP client MUST ส่งมันทั้งใน authorization request และ token request ไม่ว่า authorization server จะประกาศว่ารองรับหรือไม่ ค่าของมันคือ *canonical URI* ของ server: scheme และ host เป็นตัวพิมพ์เล็ก ไม่มี fragment และเป็น URI ที่เจาะจงที่สุดเท่าที่ client รู้ `https://mcp.example.com/mcp` และ `https://mcp.example.com:8443` ใช้ได้ ส่วน `mcp.example.com` (ไม่มี scheme) และ `https://mcp.example.com#frag` ใช้ไม่ได้ ควรใช้แบบไม่มี slash ปิดท้าย
+
+**การเลือก scope** client SHOULD ยึดหลัก least privilege ตามลำดับนี้: ใช้ `scope` จาก `WWW-Authenticate` challenge ถ้ามี ไม่งั้นใช้ทุกอย่างใน `scopes_supported` จาก resource metadata ถ้าไม่มีอันนั้นอีก ก็ไม่ต้องส่ง `scope` เลย
+
+**บันทึก issuer** ก่อน redirect client MUST เก็บ `issuer` ที่ตรวจสอบแล้วไว้คู่กับ PKCE verifier และ `state` การตรวจ redirect ในขั้นที่ 6 จะดีได้แค่เท่าที่ค่าที่บันทึกไว้นี้ดี
+
+## ขั้นที่ 6: ตรวจสอบ redirect
+
+authorization server redirect กลับมาพร้อม code และตาม RFC 9207 SHOULD แนบ `iss` มาด้วย:
+
+```http
+HTTP/1.1 302 Found
+Location: http://127.0.0.1:3000/callback?code=SplxlOBeZQQYbYS6WxSbIA&state=af0ifjsldkj&iss=https%3A%2F%2Fauth.example.com
+```
+
+ก่อนจะส่ง code ไปไหน client MUST ใช้ตารางนี้:
+
+| `authorization_response_iss_parameter_supported` | `iss` ใน response | สิ่งที่ client ต้องทำ |
+|---|---|---|
+| `true` | มี | เทียบกับ issuer ที่บันทึกไว้ด้วยการเปรียบเทียบ string ตรง ๆ |
+| `true` | ไม่มี | ปฏิเสธ response |
+| `false` หรือไม่มี | มี | เทียบกับ issuer ที่บันทึกไว้อยู่ดี |
+| `false` หรือไม่มี | ไม่มี | ไปต่อได้ |
+
+"เปรียบเทียบ string ตรง ๆ" หมายความตามนั้นจริง ๆ: ไม่ปรับตัวพิมพ์ ไม่ตัด default port ไม่ normalize slash ปิดท้ายหรือ percent-encoding กฎเดียวกันใช้กับ error response ด้วย ดังนั้นถ้า `iss` ไม่ตรง client ห้ามแม้แต่จะแสดง `error_description`
+
+นี่คือวิธีรับมือ **mix-up attack** ที่ authorization server ซึ่งผู้โจมตีควบคุมพยายามรับ code ที่ออกโดย AS ตัวจริง PKCE อย่างเดียวหยุดมันไม่ได้ เพราะ client จะส่ง `code_verifier` ไปที่ token endpoint ของผู้โจมตี
+
+## ขั้นที่ 7: แลก code
+
+```http
+POST /token HTTP/1.1
+Host: auth.example.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=SplxlOBeZQQYbYS6WxSbIA
+&redirect_uri=http%3A%2F%2F127.0.0.1%3A3000%2Fcallback
+&client_id=https%3A%2F%2Fapp.example.com%2Foauth%2Fclient.json
+&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+&resource=https%3A%2F%2Fmcp.example.com%2Fmcp
+```
+
+response จะมี access token และอาจมี refresh token แล้วแต่ดุลยพินิจของ authorization server client ที่อยากได้ refresh token SHOULD ใส่ `refresh_token` ใน `grant_types` ของ metadata, MAY เพิ่ม `offline_access` ใน `scope` เมื่อ AS ประกาศว่ารองรับ, MUST เก็บ refresh token เป็นความลับ และ MUST NOT ทึกทักว่าจะได้มาแน่ ๆ ส่วนฝั่ง server SHOULD NOT ใส่ `offline_access` ใน `WWW-Authenticate` หรือ `scopes_supported` เพราะ refresh token เป็นความสะดวกของ client ไม่ใช่ข้อกำหนดของ resource
+
+## ขั้นที่ 8: ใช้ token
+
+จากนี้ไปทุก MCP request จะแนบ token ใน header ตามที่ OAuth 2.1 section 5.1.1 กำหนด:
+
+```http
+POST /mcp HTTP/1.1
+Host: mcp.example.com
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: list_files
+```
+
+token MUST NOT อยู่ใน query string ของ URI ฝั่ง server จะตรวจ token ทุก request (signature, วันหมดอายุ, audience, scope) และ token ที่ไม่ถูกต้องหรือหมดอายุจะได้ `401` ใหม่ ซึ่งเป็นการเริ่ม flow ใหม่
+
+## error response และ step-up
+
+server MUST ใช้ status เหล่านี้:
+
+| Status | ความหมาย | ใช้เมื่อ |
+|--------|---------|-------|
+| `401` | Unauthorized | ไม่มี token หรือ token ไม่ถูกต้อง/หมดอายุ |
+| `403` | Forbidden | token ถูกต้องแต่ scope ไม่พอสำหรับ operation นี้ |
+| `400` | Bad Request | authorization request ผิดรูปแบบ |
+
+ตัวที่น่าสนใจคือ `403` เมื่อ client ถือ token อยู่แล้วแต่เรียก tool ที่ต้องการสิทธิ์มากกว่านั้น server SHOULD challenge ด้วยชุด scope *ทั้งหมด* ที่ operation นั้นต้องการภายในรอบเดียว:
+
+```http
+HTTP/1.1 403 Forbidden
+WWW-Authenticate: Bearer error="insufficient_scope",
+                         scope="files:write",
+                         resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource",
+                         error_description="File write permission required for this operation"
+```
+
+จากนั้น client รัน **step-up authorization flow**:
+
+1. parse challenge
+2. หา **union** ของ scope ที่เคยขอไปก่อนหน้ากับ scope ใน challenge การสะสม scope เป็นหน้าที่ของ client server ไม่จำเป็นต้องพูดซ้ำ scope ที่ให้ไปแล้ว และ scope แบบลำดับชั้นไม่ต้อง dedupe เพราะ AS จะ normalize ให้เอง
+3. รัน authorization flow ใหม่ด้วยชุดนั้น
+4. retry request เดิม แต่จำกัดจำนวนครั้ง และถ้ายังล้มเหลวซ้ำ ๆ ให้ถือเป็น authorization error ถาวร
+
+client ที่ทำแทน user SHOULD ลอง step-up ส่วน client แบบ `client_credentials` MAY ยกเลิกไปเลยก็ได้ server MUST คำนึงถึงลำดับชั้นของ scope (scope กว้างกว่าครอบคลุม scope แคบกว่า) ตอนตัดสินว่า token เพียงพอหรือไม่
+
+<Callout title="สรุปหนึ่งบรรทัด">
+flow คือ 401 → resource metadata → AS metadata (ตรวจ `issuer`) → PKCE authorize พร้อม `resource=` → ตรวจ `iss` ตอน redirect → token → `Authorization: Bearer` ตลอดไป และ `403 insufficient_scope` จะเริ่มมันใหม่ด้วย union ของ scope เก่ากับใหม่
+</Callout>
+
+export const quizFlow = [
+  {
+    q: 'พารามิเตอร์ `resource_metadata` ใน header `WWW-Authenticate` ของ 401 ชี้ไปที่อะไร?',
+    options: [
+      'authorization server metadata document',
+      'Protected Resource Metadata document ที่ระบุ authorization server สำหรับ MCP server ตัวนี้',
+      'รายการ tool',
+      'OAuth token endpoint',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม MCP client ต้องส่งพารามิเตอร์ `resource` ใน authorization request และ token request?',
+    options: [
+      'เพื่อเลือกว่าต้องการ scope อะไร',
+      'เพื่อผูก token ที่ออกมาเข้ากับ MCP server ตัวนี้โดยเฉพาะ จะได้เอาไปใช้ที่อื่นไม่ได้',
+      'เพื่อบอก AS ว่าใช้ transport แบบไหน',
+      'ส่งเฉพาะเมื่อ AS ประกาศว่ารองรับเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'AS metadata บอกว่า `authorization_response_iss_parameter_supported: true` แต่ redirect ไม่มี `iss` client ต้องทำอย่างไร?',
+    options: [
+      'ไปต่อได้ พารามิเตอร์นี้ไม่บังคับ',
+      'normalize URL แล้วเทียบ',
+      'ปฏิเสธ response',
+      'retry token request โดยไม่ใช้ PKCE',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'client ที่ถือ token ที่ถูกต้องได้ `403` พร้อม `error="insufficient_scope", scope="files:write"` ควรขอชุด scope อะไรในครั้งถัดไป?',
+    options: [
+      '`files:write` เท่านั้น',
+      'union ของ scope ที่เคยขอไปก่อนหน้ากับ `files:write`',
+      'ทุกอย่างใน `scopes_supported`',
+      'ไม่ต้องระบุ scope ปล่อยให้ AS ตัดสินใจ',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/oauth-flow" questions={quizFlow} />
+
+<ProgressTracker client:visible id="security-and-auth/oauth-flow" />

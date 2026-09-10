@@ -1,0 +1,221 @@
+---
+title: 'Deploying Remote Servers'
+description: 'รัน Streamable HTTP server บน production — scale แบบ stateless หลัง load balancer อะไรก็ได้, runtime แบบ web-standard กับ Node, การตั้งค่า proxy สำหรับ SSE, Python หลัง uvicorn, การ hardening, observability ผ่าน header ที่ mirror มา และการออก version โดยไม่ทำ client พัง'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## stateless คือเรื่องราวทั้งหมดของการ deploy
+
+protocol version `2026-07-28` ทำให้ MCP เป็น protocol แบบ stateless: ทุก request พก version, capability และ identity มาใน `_meta` และ server **ต้องไม่** พึ่ง request ก่อนหน้าบน connection เดียวกัน ไม่มี `Mcp-Session-Id` ไม่มี handshake ไม่มี GET stream ที่ต้องเปิดค้างไว้
+
+ในเชิงปฏิบัติการ นั่นหมายความว่า:
+
+- **load balancer อะไรก็ใช้ได้** ไม่ต้องมี sticky session ไม่ต้อง consistent hashing round-robin ก็พอ
+- **autoscaling ง่ายมาก** instance ใหม่ตอบ request ถัดไปได้ทันทีแบบ cold state ที่อยู่นานอยู่หลัง handle ที่ชัดเจนใน database ไม่ใช่ใน process
+- **restart ได้อย่างปลอดภัย** request ที่ค้างอยู่หายไป client ส่งใหม่ด้วย id ใหม่ และ client เปิด `subscriptions/listen` stream ใหม่เอง
+
+<Mermaid title="fleet แบบ stateless หลัง load balancer ธรรมดา" code={fleetDiagram} />
+
+export const fleetDiagram = `flowchart LR
+  c1["client A"] --> lb["HTTPS load balancer"]
+  c2["client B"] --> lb
+  lb --> s1["instance 1"]
+  lb --> s2["instance 2"]
+  lb --> s3["instance 3"]
+  s1 --> db["shared state store, keyed by handle"]
+  s2 --> db
+  s3 --> db`;
+
+ถ้าคุณเริ่มอยากได้ sticky session แปลว่าคุณซ่อน state ไว้ใน process ย้ายมันไปไว้หลัง handle
+
+## เลือกรูปแบบ runtime
+
+`createMcpHandler` ของ TypeScript SDK สร้าง handler แบบ **web-standard** (function สไตล์ `fetch`) ซึ่งรันบน Cloudflare Workers, Deno และ Bun ได้โดยไม่ต้องแก้ ส่วน Node ก็ห่ออีกชั้นเดียว
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // server.ts — shared between runtimes
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    export const handler = createMcpHandler(() => {
+      const server = new McpServer({ name: 'notes', version: '1.4.0' });
+      server.registerTool(
+        'add-note',
+        { description: 'Save a note', inputSchema: z.object({ text: z.string() }) },
+        async ({ text }) => ({ content: [{ type: 'text', text: `Saved: ${text}` }] }),
+      );
+      return server;
+    });
+
+    // worker.ts — Cloudflare Workers / Deno / Bun: the handler is the app
+    export default handler;
+
+    // node.ts — Node behind Express
+    import { createMcpExpressApp } from '@modelcontextprotocol/express';
+    import { toNodeHandler } from '@modelcontextprotocol/node';
+
+    const app = createMcpExpressApp({ host: '0.0.0.0', allowedHosts: ['mcp.example.com'] });
+    const node = toNodeHandler(handler);
+    app.all('/mcp', (req, res) => void node(req, res, req.body));
+    app.get('/healthz', (_req, res) => res.send('ok'));
+    app.listen(8080);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    # server.py
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("Notes")
+
+
+    @mcp.tool()
+    def add_note(text: str) -> str:
+        """Save a note."""
+        return f"Saved: {text}"
+
+
+    if __name__ == "__main__":
+        # Streamable HTTP, stateless, one JSON object per response where possible.
+        mcp.run(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=8080,
+            streamable_http_path="/mcp",
+            stateless_http=True,
+            json_response=True,
+        )
+    ```
+  </TabItem>
+</Tabs>
+
+ใน Python มีสองปุ่มที่สำคัญบน production `stateless_http=True` คือโหมด per-request แบบยุคใหม่ ส่วน `json_response=True` ทำให้ server ตอบด้วย JSON body เดียวแทน SSE stream ทุกครั้งที่ทำได้ ซึ่งเป็นมิตรกับ proxy และ log ง่ายกว่า แต่แลกกับการเสีย `notifications/progress` ระหว่าง call เลือกตาม server: service lookup ที่เร็วอยากได้ JSON ส่วน importer ที่รันนานอยากได้ SSE
+
+รูปแบบ factory ต่อ request (`createMcpHandler(() => ...)`) ตั้งใจให้เป็นแบบนี้: SDK สร้าง `McpServer` ใหม่ทุก request เพื่อไม่ให้อะไรรั่วข้ามผู้เรียก ทำ factory ให้ถูก — สร้าง client และ pool *นอก* factory แล้ว closure เข้าไปใช้
+
+## proxy ต้องทำอะไรบ้าง
+
+Streamable HTTP คือ POST ธรรมดา แต่ response บางอันเป็น SSE stream และ `subscriptions/listen` คือ stream ที่เปิดค้างไว้นานเท่าที่ client ยังสนใจ reverse proxy มักตั้งค่า default ที่ทำให้ทั้งสองอย่างพัง:
+
+| การตั้งค่า | เหตุผล | ค่าทั่วไป |
+|---------|-----|---------------|
+| **ปิด** response buffering | SSE ที่ถูก buffer จะมาถึงเป็นก้อนเดียวตอนจบ | server ส่ง `X-Accel-Buffering: no`; nginx `proxy_buffering off` |
+| read / idle timeout **ยาว** | listen stream อาจเงียบเป็นนาทีระหว่าง notification | หลายนาทีถึงหลายชั่วโมง เฉพาะ route `/mcp` |
+| keep-alive | intermediary ปิด connection ที่เงียบ | server ส่ง SSE comment line `:\r\n` เป็นระยะ; client เมินมัน |
+| HTTP/1.1 หรือ HTTP/2 ไปยัง upstream | HTTP/1.0 stream chunked response ไม่ได้ | `proxy_http_version 1.1` บน nginx |
+| ขีดจำกัด request body | argument ของ tool ใหญ่ได้แต่ไม่ไร้ขอบเขต | 1–10 MB แล้วตอบ 413 |
+
+spec แนะนำ `X-Accel-Buffering: no` บนทุก SSE response ก็เพราะ proxy สไตล์ nginx buffer เป็น default SDK ตั้งให้อยู่แล้ว แต่ proxy ตรงกลางยัง override ได้ ดังนั้นให้ตรวจด้วย stream จริง
+
+## Hardening
+
+- **validate `Origin`** server **ต้อง** ตอบ `403` เมื่อมี `Origin` ที่ไม่ถูกต้อง นี่คือการป้องกัน DNS rebinding `createMcpExpressApp({ allowedHosts })` ทำให้ ตั้งเป็น hostname จริงของคุณ
+- **HTTPS เท่านั้น** terminate TLS ที่ edge แล้ว bind แอปกับ interface ส่วนตัว ตอนรันบนเครื่องให้ bind `127.0.0.1` ไม่ใช่ `0.0.0.0`
+- **authenticate ทุก request** module authorization พูดถึง pattern ของ OAuth resource server ไปแล้ว บน production ทุก POST ไปที่ `/mcp` ต้องพก bearer token ที่คุณตรวจ audience และ scope
+- **rate limit ต่อ token** ไม่ใช่ต่อ IP agent ที่อยู่หลัง NAT เดียวกันดูเหมือน IP เดียว
+- **จำกัดทุกอย่าง:** ขนาด request, เวลารันของ tool, ความซับซ้อนของ schema (`anyOf` tree ที่ลึกคือช่องทาง DoS ต่อ validator) และจำนวน listen stream พร้อมกันต่อ principal
+- **validate input ของ tool เอง** ถึง schema จะทำอยู่แล้ว เพราะ schema ไม่รู้ business rule ของคุณ
+
+## observability มาฟรีใน header
+
+transport mirror field ของ body ไปเป็น HTTP header ก็เพื่อให้ infrastructure route และวัดผลได้โดยไม่ต้อง parse JSON:
+
+```http
+POST /mcp HTTP/1.1
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: execute_sql
+Mcp-Param-Region: us-west1
+```
+
+- `Mcp-Method` ให้ dashboard latency และ error ต่อ method ที่ load balancer
+- `Mcp-Name` ให้ metric ต่อ tool และให้ WAF block tool อันตรายตัวเดียวได้โดยไม่แตะ body
+- `Mcp-Param-{Name}` ที่มาจาก `x-mcp-header` ใน `inputSchema` ของ tool ให้ gateway route ตาม tenant หรือ region *ก่อน* request ไปถึง instance
+
+server หลัง proxy **ยังต้อง** ตรวจว่าค่าใน header ตรงกับ body (`-32020` เมื่อไม่ตรง) เพื่อให้ intermediary กับ instance ไม่มีวันเห็นต่างกันว่า request นี้คืออะไร ห้ามใส่ความลับหรือ PII ใน parameter ที่มี `x-mcp-header` เพราะ header มองเห็นได้ทุก hop
+
+## การออก version ของ server
+
+client cache `tools/list` ตาม `ttlMs` และ model จำชื่อ tool ของคุณไว้ในบทสนทนายาว ๆ เปลี่ยนแปลงอย่างระมัดระวัง:
+
+1. **bump `serverInfo.version`** ทุก release client log มันไว้ คุณจะอยากเห็นใน bug report
+2. **ให้การเปลี่ยน tool เป็นแบบเพิ่มเท่านั้น** parameter optional ใหม่ที่มี default, tool ใหม่, enum ที่กว้างขึ้น ห้ามเปลี่ยนชื่อ tool หรือทำให้ parameter optional กลายเป็น required ในที่เดิม
+3. **deprecate ใน description ก่อน:** `"Deprecated: use search_issues_v2. Will be removed after 2026-12-01."` model อ่านมัน คนก็อ่าน
+4. **ส่ง `notifications/tools/list_changed`** ให้ client ที่ listen `toolsListChanged` เมื่อชุด tool เปลี่ยนจริง และลด `ttlMs` ในช่วง migration
+5. **รองรับ protocol สองยุค** ถ้ายังมี client `2025-11-25` อยู่: TypeScript handler รองรับทั้งคู่โดย default ตั้ง `legacy: 'reject'` เฉพาะเมื่อมั่นใจแล้ว
+
+## container ขั้นต่ำ
+
+```dockerfile
+FROM node:22-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY dist ./dist
+ENV NODE_ENV=production PORT=8080
+EXPOSE 8080
+USER node
+CMD ["node", "dist/node.js"]
+```
+
+เพิ่ม route `GET /healthz` ธรรมดา (นอก `/mcp`) สำหรับ liveness probe ของ orchestrator เพราะ MCP endpoint เองพูดแค่ POST ถ้า probe ด้วย GET จะได้ `405` ซึ่ง health checker ส่วนใหญ่ถือว่าล้มเหลว
+
+<Callout title="สรุปหนึ่งบรรทัด">
+server ยุค `2026-07-28` เป็น stateless จึง deploy ได้เหมือน HTTP service แบบ stateless ทั่วไป — round-robin load balancing, autoscaling, restart ได้ตามใจ — แล้วเอาความใส่ใจไปลงที่ proxy (ไม่ buffer, timeout ยาว, keep-alive สำหรับ `subscriptions/listen`), ที่ hardening (Origin, HTTPS, limit ต่อ token), ที่ header `Mcp-*` ที่ mirror มาสำหรับ routing และ metric และที่การเปลี่ยน tool แบบเพิ่มเท่านั้น มี description และมี version
+</Callout>
+
+export const quizDeploy = [
+  {
+    q: 'ทำไม server ยุค 2026-07-28 ถึงไม่ต้องใช้ sticky session บน load balancer?',
+    options: [
+      'เพราะ HTTP/2 จัดการ affinity ให้',
+      'เพราะ protocol เป็น stateless: ทุก request พก version, capability และ state handle มาเอง instance ไหนก็ serve ได้',
+      'เพราะ proxy route ตาม Mcp-Session-Id',
+      'เพราะ client ต่อได้ทีละตัวเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'X-Accel-Buffering: no ทำอะไรบน SSE response?',
+    options: [
+      'เปิด gzip',
+      'บอก proxy สไตล์ nginx ว่าอย่า buffer เพื่อให้ event ไปถึง client ทันที',
+      'ปิด TLS',
+      'mark ว่า response cache ได้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'json_response=True ใน Python SDK แลกกับอะไร?',
+    options: [
+      'มันปิด authentication',
+      'response เป็น JSON body เดียว ซึ่ง proxy และ log ชอบ แต่เสีย progress notification ระหว่าง call',
+      'มันบังคับ sticky session',
+      'มันใช้ได้แค่บน stdio',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อไหนคือวิธี evolve tool บน production ที่ปลอดภัย?',
+    options: [
+      'เปลี่ยนชื่อ tool แล้วหวังว่า client จะ refresh',
+      'ทำให้ parameter optional กลายเป็น required',
+      'เพิ่ม parameter optional ใหม่ที่มี default และระบุ deprecation ไว้ใน description',
+      'ลบ outputSchema ทิ้ง',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/deploying-remote-servers" questions={quizDeploy} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/deploying-remote-servers" />

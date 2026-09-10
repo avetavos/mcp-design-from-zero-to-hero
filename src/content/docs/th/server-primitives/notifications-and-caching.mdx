@@ -1,0 +1,263 @@
+---
+title: 'Change Notifications, Subscriptions, and Caching'
+description: 'client opt-in รับ notification แบบ list-changed และ resource-updated ผ่าน subscriptions/listen อย่างไร, acknowledgment และ subscriptionId หมายถึงอะไร และ ttlMs, cacheScope กับ cursor ทำให้ discovery ถูกลงได้อย่างไร'
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## list เปลี่ยนได้ แต่ polling แพง
+
+ชุด tool โตขึ้นเมื่อ deploy, resource อัปเดตเมื่อไฟล์ถูกแก้, prompt ถูกเพิ่มโดย admin client ที่รัน `tools/list` ซ้ำก่อนทุกเทิร์นเสีย round trip เปล่า ๆ; client ที่ไม่เคยรันซ้ำก็ใช้ข้อมูลเก่า MCP แก้ปัญหานี้ด้วยกลไกสองอย่างที่ทำงานร่วมกัน:
+
+1. **notification แบบ opt-in** ผ่าน request `subscriptions/listen` ที่เปิดค้างไว้ เพื่อให้ server บอกว่า "มีอะไรเปลี่ยน" ได้ทันทีที่มันเกิดขึ้น
+2. **caching hint** (`ttlMs`, `cacheScope`) บนผลลัพธ์ list และ read ทุกตัว เพื่อให้ client รู้ว่าคำตอบที่ cache ไว้ใช้ได้นานแค่ไหน
+
+ทั้งสองอย่างไม่ได้การันตีการส่งถึง notification เป็นแบบ best-effort — การ reconnect อาจทำหล่นสักตัว — ดังนั้น client ยังต้อง refresh เมื่อ TTL หมด สองอย่างรวมกันให้คุณสภาพ *ปกติทันที และถูกต้องในที่สุดเสมอ*
+
+## การเปิด notification stream
+
+ใน revision 2026-07-28 ไม่มี GET stream แยกและไม่มี method `resources/subscribe` client ส่ง request เดียวและระบุชัดว่าต้องการ notification type ไหนบ้าง:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "subscriptions/listen",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    },
+    "notifications": {
+      "toolsListChanged": true,
+      "promptsListChanged": true,
+      "resourcesListChanged": true,
+      "resourceSubscriptions": ["file:///project/config.json"]
+    }
+  }
+}
+```
+
+| Field ของ filter | Type | ส่งมอบ |
+|--------------|------|----------|
+| `toolsListChanged` | boolean | `notifications/tools/list_changed` |
+| `promptsListChanged` | boolean | `notifications/prompts/list_changed` |
+| `resourcesListChanged` | boolean | `notifications/resources/list_changed` |
+| `resourceSubscriptions` | string[] | `notifications/resources/updated` สำหรับแต่ละ URI ที่ระบุ |
+
+ทุก field เลือกใส่ได้; ไม่ใส่หมายถึง "ไม่ต้องส่งอันนั้น" server **ต้องไม่** ส่ง notification type ที่ client ไม่ได้ขอ
+
+<Mermaid title="อายุของ subscription หนึ่งตัว" code={subDiagram} />
+
+export const subDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: subscriptions/listen (id 7, filter)
+  S-->>C: notifications/subscriptions/acknowledged (subscriptionId 7)
+  Note over C,S: stream เปิดค้างไว้
+  S-->>C: notifications/tools/list_changed (subscriptionId 7)
+  C->>S: tools/list
+  S-->>C: tools[] ชุดใหม่
+  S-->>C: notifications/resources/updated uri=file:///project/config.json
+  C->>S: resources/read
+  S-->>C: result สำหรับ id 7 (ปิดอย่างสุภาพ)`;
+
+### acknowledgment มาก่อนเสมอ
+
+message **แรก** ของ server สำหรับ subscription หนึ่งคือ `notifications/subscriptions/acknowledged` เสมอ มันถือ subscription ID — ซึ่งก็คือ `id` ของ JSON-RPC ของ request `subscriptions/listen` นั่นเอง — และสะท้อน *ส่วนย่อย* ของ filter ที่ server ตกลงจะให้กลับมา:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/subscriptions/acknowledged",
+  "params": {
+    "_meta": { "io.modelcontextprotocol/subscriptionId": 7 },
+    "notifications": { "toolsListChanged": true, "resourceSubscriptions": ["file:///project/config.json"] }
+  }
+}
+```
+
+ตรงนี้ server ตัด `promptsListChanged` และ `resourcesListChanged` ทิ้ง — อาจเพราะมันไม่ได้ประกาศ capability `listChanged` พวกนั้น client ควรเทียบ filter ที่ได้รับการยืนยันกับที่ขอไป แล้วถอยไป poll สำหรับสิ่งที่ขาด
+
+### ทุก notification ถูกติดป้าย
+
+notification ทุกตัวบน stream มี `io.modelcontextprotocol/subscriptionId` ใน `_meta`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/resources/updated",
+  "params": { "_meta": { "io.modelcontextprotocol/subscriptionId": 7 }, "uri": "file:///project/config.json" }
+}
+```
+
+บน Streamable HTTP `subscriptions/listen` แต่ละตัวได้ SSE response stream ของตัวเอง ป้ายนี้จึงเป็นแค่ความสะดวก แต่บน **stdio** ทุก message ใช้ช่องทางเดียวกัน และ client **ต้อง** ใช้ป้ายนี้ในการ demultiplex — คุณอาจมี subscription หนึ่งสำหรับการเปลี่ยนแปลงของ tool และอีกตัวสำหรับ resource ที่มีชีวิตอยู่พร้อมกัน
+
+เฉพาะ notification เรื่อง *การเปลี่ยนแปลง* เท่านั้นที่ไหลบน listen stream notification ที่ผูกกับ request อย่าง `notifications/progress` และ `notifications/message` เดินทางบน response stream ของ request ที่มันสังกัด ไม่ใช่ตรงนี้
+
+## subscription จบอย่างไร
+
+- **client ยกเลิก:** ปิด SSE stream (HTTP) หรือส่ง `notifications/cancelled` โดยระบุ ID ของ listen request (stdio)
+- **server ปิดอย่างสุภาพ** (shutdown, redeploy): ควรส่ง *result* ปกติสำหรับ listen request ติดป้ายด้วย subscription ID แล้วค่อยปิด result หมายถึง "ปิดเรียบร้อย"; transport หลุดโดยไม่มี result หมายถึง "ไม่คาดคิด — ควรพิจารณา reconnect"
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "result": { "resultType": "complete", "_meta": { "io.modelcontextprotocol/subscriptionId": 7 } } }
+```
+
+- **transport ตาย:** HTTP timeout, TCP reset, process ของ stdio จบ เพราะ protocol เป็น stateless server จึงไม่เก็บ state ของ subscription ไว้; บน stdio หลัง restart client **ต้อง** ส่ง `subscriptions/listen` อีกครั้ง
+
+## การส่งสัญญาณการเปลี่ยนแปลงจาก server
+
+SDK จัดการงานเบื้องหลังของ stream ให้; หน้าที่ของคุณคือส่งสัญญาณว่ามีอะไรเปลี่ยน
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const server = new McpServer(
+      { name: 'board', version: '1.0.0' },
+      { capabilities: { tools: { listChanged: true }, resources: { listChanged: true, subscribe: true } } },
+    );
+
+    // การลงทะเบียน tool หลัง server เริ่มทำงานแล้วจะกระตุ้น
+    // notifications/tools/list_changed ไปยัง client ที่ subscribe ไว้
+    function enableReports() {
+      server.registerTool(
+        'sprint_report',
+        { description: 'Summarize completed tasks' },
+        async () => ({ content: [{ type: 'text', text: report() }] }),
+      );
+    }
+    ```
+    `McpServer` ติดตามการลงทะเบียน; การเพิ่ม, ลบ, เปิด หรือปิด tool หลัง startup ทำให้ SDK ส่ง notification แบบ list-changed ไปยัง client ที่ฟังอยู่ ส่วนการอัปเดต resource ส่งสัญญาณผ่าน notification API ของ server สำหรับ URI นั้น ๆ
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server.mcpserver import Context, MCPServer
+
+    mcp = MCPServer("Sprint Board")
+    BOARDS = {"sprint": {"design": False, "build": False}}
+
+
+    @mcp.resource("board://{name}")
+    def board(name: str) -> str:
+        tasks = BOARDS[name]
+        return "\n".join(f"[{'x' if done else ' '}] {t}" for t, done in tasks.items())
+
+
+    @mcp.tool()
+    async def complete_task(board: str, task: str, ctx: Context) -> str:
+        BOARDS[board][task] = True
+        await ctx.notify_resource_updated(f"board://{board}")
+        return f"{task}: done"
+
+
+    def sprint_report() -> str:
+        done = sum(d for tasks in BOARDS.values() for d in tasks.values())
+        return f"{done} task(s) done"
+
+
+    @mcp.tool()
+    async def enable_reports(ctx: Context) -> str:
+        mcp.add_tool(sprint_report)
+        await ctx.notify_tools_changed()
+        return "reporting is live"
+    ```
+    `ctx.notify_resource_updated(uri)` ไปถึง client ที่ `resourceSubscriptions` มี URI นั้น; `ctx.notify_tools_changed()` ไปถึง client ที่ขอ `toolsListChanged`
+  </TabItem>
+</Tabs>
+
+อย่าลืมกฎจาก[หน้าแรกของโมดูล](/mcp/th/server-primitives/): การเปลี่ยนแปลงต้องเป็น *ระดับ global* (หรือตาม authorization) ไม่ใช่ต่อ connection `enable_reports` ข้างบนเพิ่ม tool ให้ทุกคน — แบบนั้นทำได้ แต่การเพิ่มให้เฉพาะผู้เรียกที่กดมันทำไม่ได้
+
+## caching hint: `ttlMs` และ `cacheScope`
+
+ผลลัพธ์ของ `tools/list`, `prompts/list`, `resources/list`, `resources/templates/list`, `resources/read` และ `server/discover` ทุกตัวมี field บังคับสองตัว:
+
+| Field | ค่า | ความหมาย |
+|-------|--------|---------|
+| `ttlMs` | integer เป็น ms | คำใบ้เรื่องความสด: client ใช้ผลลัพธ์นี้ซ้ำได้นานเท่านี้โดยไม่ต้องถามใหม่ |
+| `cacheScope` | `"public"` หรือ `"private"` | `public`: intermediary ที่ใช้ร่วมกัน (gateway, corporate proxy) cache แล้วเสิร์ฟให้ผู้เรียกรายอื่นได้ `private`: เฉพาะผู้เรียกรายนี้ cache ได้ — ใช้กับอะไรก็ตามที่ขึ้นกับ authorization ของผู้เรียก |
+
+แนวทางสำหรับ server:
+
+- tool list แบบ static: TTL ยาว (หลายนาทีถึงหนึ่งชั่วโมง), `public`
+- tool list ที่กรองตาม scope: `private` เพราะผู้เรียกรายอื่นต้องไม่ได้รับมันจาก cache
+- `resources/read` ของเอกสารเฉพาะ user: TTL สั้น, `private`
+
+แนวทางสำหรับ client: เคารพ TTL **แต่** ให้ถือว่า list ที่ cache ไว้เก่าทันทีที่ notification `list_changed` ที่ตรงกันมาถึง แม้ TTL จะยังไม่หมด notification ชนะ TTL
+
+เพราะ tool list ของ model มักอยู่ใน prompt prefix ของ LLM host จึงจับคู่สิ่งนี้กับลำดับที่แน่นอน (ดู [Tools](/mcp/th/server-primitives/tools/)) เพื่อให้ cache hit ฝั่ง MCP ยังเป็น cache hit ฝั่ง LLM ด้วย
+
+## pagination
+
+method `*/list` ทุกตัวรับ `cursor` แบบเลือกใส่ และอาจคืน `nextCursor`:
+
+```json
+{ "method": "tools/list", "params": { "cursor": "eyJwYWdlIjoyfQ" } }
+```
+
+- cursor เป็น string **ทึบ** client ต้องไม่ parse หรือประกอบมันขึ้นเอง; server จะเข้ารหัสเลขหน้า, offset หรือ keyset อย่างไรก็ได้
+- ไม่มี `nextCursor` หมายความว่านี่คือหน้าสุดท้าย
+- ขนาดหน้าเป็นเรื่องที่ server เลือก ทำให้หน้าเล็กพอที่ `ttlMs` ยังมีความหมายสำหรับแต่ละหน้า
+
+client ที่ต้องการ "tool ทั้งหมด" จะวนจนกว่า `nextCursor` จะหายไป แล้ว cache list ที่ประกอบได้ด้วย `ttlMs` ที่ *น้อยที่สุด* ที่เห็น
+
+## หมายเหตุยุคเก่า
+
+ใน protocol version 2025-11-25 และก่อนหน้า change notification มาถึงบน HTTP GET stream แยกต่างหาก (หรือถูกส่งมาเองบน stdio) โดยไม่ต้อง opt-in และการอัปเดต resource ใช้ request `resources/subscribe` และ `resources/unsubscribe` อย่างชัดเจน `ttlMs` และ `cacheScope` ยังไม่มี เมื่อคุยกับ server ยุคเก่า อย่าคาดหวัง filter semantic ข้างบนเลย; ดู [Backward Compatibility](/mcp/th/transports/backward-compatibility/)
+
+<Callout title="สรุปหนึ่งบรรทัด">
+client opt-in รับ change notification ด้วย request `subscriptions/listen` เดียวที่ระบุ filter; server ยืนยันก่อน ติดป้าย subscription ID ให้ทุก notification และปิดด้วย result เมื่อ shutdown อย่างสุภาพ จับคู่กับ hint `ttlMs` และ `cacheScope` บนผลลัพธ์ list และ read ทุกตัว — และ cursor แบบทึบสำหรับ list ขนาดใหญ่ — แล้ว discovery จะถูก สด และ cache ได้อย่างปลอดภัย
+</Callout>
+
+export const quizNotifications = [
+  {
+    q: 'ค่าของ io.modelcontextprotocol/subscriptionId บน notification จาก subscription คืออะไร?',
+    options: [
+      'UUID สุ่มที่ server สร้างขึ้น',
+      'id ของ JSON-RPC ของ request subscriptions/listen ที่เปิด stream นั้น',
+      'ชื่อ server',
+      'progressToken ของ client',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'acknowledgment ไม่มี promptsListChanged ทั้งที่ client ขอไป หมายความว่าอย่างไร?',
+    options: [
+      'request ผิดรูปและต้องส่งใหม่',
+      'server จะไม่ให้ notification type นั้น client ควร poll การเปลี่ยนแปลงของ prompt แทน',
+      'prompt ถูกปิดสำหรับ user รายนี้',
+      'subscription ล้มเหลวทั้งหมด',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'tools/list ที่ cache ไว้ยังเหลือ ttlMs อีก 4 นาที แต่ notifications/tools/list_changed มาถึง client ควรทำอย่างไร?',
+    options: [
+      'ใช้ cache ต่อจนกว่า TTL จะหมด',
+      'ถือว่า cache เก่าทันทีแล้ว fetch ใหม่',
+      'เมิน notification เพราะ ttlMs เป็นตัวชี้ขาด',
+      'ปิด subscription',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'server ควรใช้ cacheScope แบบไหนกับ tool list ที่ขึ้นกับ OAuth scope ของผู้เรียก?',
+    options: [
+      'public',
+      'private',
+      'shared',
+      'ไม่ใส่ field นี้',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/notifications-and-caching" questions={quizNotifications} />
+
+<ProgressTracker client:visible id="server-primitives/notifications-and-caching" />

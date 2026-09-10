@@ -1,0 +1,219 @@
+---
+title: 'Progress, Cancellation, and Timeouts'
+description: 'Keeping a long call alive and stoppable — progressToken and notifications/progress, how cancellation differs between stdio and Streamable HTTP, and how clients should pick timeouts.'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## One request, some patience
+
+Not every tool call is instant. Importing a catalog, running a test suite, rendering a report — these take seconds to minutes, and during that time two things can go wrong: the client gives up (a timeout), or the user changes their mind and nobody tells the server. Progress notifications fix the first; cancellation fixes the second.
+
+Both stay *inside* a single request. If the work would outlive any reasonable request — minutes to hours, or must survive a disconnect — reach for the [Tasks extension](/mcp/en/client-interaction/tasks-extension/) instead.
+
+## Progress
+
+### Opting in with progressToken
+
+Progress is client-initiated: a client that *wants* updates puts a `progressToken` in the request's `_meta`. The token is a string or integer the client chooses; it must be unique across the client's active requests.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "import_catalog",
+    "arguments": { "urls": ["https://a.example/1.csv", "https://a.example/2.csv"] },
+    "_meta": {
+      "progressToken": "imp-7",
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+No token, no progress — a server must only send progress for tokens it actually received on an in-flight request.
+
+### The notification
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/progress",
+  "params": {
+    "progressToken": "imp-7",
+    "progress": 1,
+    "total": 2,
+    "message": "Imported https://a.example/1.csv"
+  }
+}
+```
+
+Rules that matter:
+
+- `progress` **must increase** with every notification, even when `total` is unknown.
+- `total` and `message` are optional; both values may be floating point.
+- Servers **may** send none, or as many as they like, but **should** rate-limit rather than flood.
+- Notifications **must stop** once the request completes.
+
+<Mermaid title="Progress rides on the request it belongs to" code={progressDiagram} />
+
+export const progressDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call with progressToken
+  S-->>C: notifications/progress 1 of 3
+  S-->>C: notifications/progress 2 of 3
+  S-->>C: notifications/progress 3 of 3
+  S-->>C: result
+  Note over C,S: no more progress after the result`;
+
+### Where it travels
+
+- **Streamable HTTP**: the server answers the POST with an SSE stream scoped to that request; progress events arrive on it, followed by the final JSON-RPC response, which closes the stream. Progress never appears on a `subscriptions/listen` stream.
+- **stdio**: everything shares one stdout channel; the client matches notifications to requests by `progressToken`.
+
+### In code
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    server.registerTool(
+      'import_catalog',
+      { description: 'Import catalog files', inputSchema: z.object({ urls: z.array(z.string()) }) },
+      async ({ urls }, ctx) => {
+        const progressToken = ctx.mcpReq._meta?.progressToken;
+        for (let i = 0; i < urls.length; i++) {
+          await importOne(urls[i]);
+          if (progressToken !== undefined) {
+            await ctx.mcpReq.notify({
+              method: 'notifications/progress',
+              params: { progressToken, progress: i + 1, total: urls.length, message: `Imported ${urls[i]}` },
+            });
+          }
+        }
+        return { content: [{ type: 'text', text: `Imported ${urls.length} files` }] };
+      }
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver import Context
+
+    mcp = MCPServer("catalog")
+
+
+    @mcp.tool()
+    async def import_catalog(urls: list[str], ctx: Context) -> str:
+        """Import book records from a list of catalog URLs."""
+        for done, url in enumerate(urls, start=1):
+            await import_one(url)
+            # no-op if the client did not send a progressToken
+            await ctx.report_progress(done, total=len(urls), message=f"Imported {url}")
+        return f"Imported {len(urls)} records."
+    ```
+  </TabItem>
+</Tabs>
+
+## Cancellation
+
+The client can abandon a request it no longer cares about. *How* depends on the transport, because the two transports have different ideas of what "a request" physically is.
+
+| Transport | How the client cancels | Why |
+|-----------|------------------------|-----|
+| stdio | sends `notifications/cancelled` with the request's `requestId` (and optional `reason`) | one shared channel — there is no per-request stream to close |
+| Streamable HTTP | **closes the SSE response stream** of that request | each request has its own stream, so the disconnect is unambiguous; no `notifications/cancelled` is expected |
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/cancelled",
+  "params": { "requestId": 7, "reason": "user pressed stop" }
+}
+```
+
+On either transport the server **should** stop work as soon as practical and **must not** send any further messages for that request — no late progress, no result. The client, for its part, should ignore anything that does arrive after it cancelled; races happen.
+
+A few edge rules worth knowing:
+
+- A `subscriptions/listen` stream is cancelled the same way — close the stream on HTTP, or send `notifications/cancelled` for the listen request's id on stdio.
+- Cancellation is best-effort and cooperative. A tool halfway through a non-reversible side effect may finish it; design tools so that what has already happened is visible (return handles, make writes idempotent).
+- Legacy note: on stdio, `notifications/cancelled` is the *only* client-to-server notification left in the 2026-07-28 core protocol.
+
+## Timeouts
+
+MCP does not mandate a timeout; it leaves the policy to the client, and that is a design choice you will make in every host you build. Two sane options:
+
+1. **Fixed deadline** — simplest. Every request gets, say, 60 s; if it elapses, cancel it. Predictable, but it kills legitimately long tools.
+2. **Progress-reset deadline** — the timer restarts each time a `notifications/progress` arrives, with a hard ceiling so a chatty-but-stuck server cannot run forever. This is the pattern most hosts converge on: a silent server is presumed dead; a talking one gets patience, up to a limit.
+
+Servers should assume option 2 exists and emit progress on anything slower than a couple of seconds — it is the difference between "still importing 4,000 rows" and "request timed out".
+
+When a timeout fires, the client should actually cancel (close the stream or send `notifications/cancelled`), not just stop listening, so the server can free resources.
+
+## Design notes
+
+- **Progress is for the user, not the model.** Put human-readable text in `message`; do not encode data the LLM is supposed to act on.
+- **Never block on progress.** Sending a notification must not stall the work; treat it as fire-and-forget.
+- **A long tool with no progress is a bug** in production. If the work cannot report progress, it is probably a candidate for the Tasks extension.
+
+<Callout title="The one-line takeaway">
+Clients opt into progress with a `progressToken`; servers answer with strictly increasing `notifications/progress` on the request's own stream and stop when done. Cancellation is `notifications/cancelled` on stdio and simply closing the SSE stream on HTTP — and a good client resets its timeout on progress but never waits forever.
+</Callout>
+
+export const quizProgress = [
+  {
+    q: 'When may a server send notifications/progress?',
+    options: [
+      'Whenever it likes, for any request',
+      'Only for a request that included a progressToken in _meta and is still in flight',
+      'Only on stdio',
+      'Only after the result has been sent',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a Streamable HTTP client cancel an in-flight tools/call?',
+    options: [
+      'Sends notifications/cancelled on a new POST',
+      'Sends HTTP DELETE to the MCP endpoint',
+      'Closes the SSE response stream for that request',
+      'Calls tasks/cancel',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which statement about the progress value is correct?',
+    options: [
+      'It must increase with every notification, even if total is unknown',
+      'It must be an integer percentage',
+      'It may go backwards to indicate retries',
+      'It is only valid when total is provided',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'After receiving a cancellation, what must the server not do?',
+    options: [
+      'Free resources',
+      'Stop the work',
+      'Send any further messages for that request',
+      'Log the cancellation to stderr',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="client-interaction/progress-and-cancellation" questions={quizProgress} />
+
+<ProgressTracker client:visible id="client-interaction/progress-and-cancellation" />

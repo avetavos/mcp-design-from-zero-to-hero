@@ -1,0 +1,207 @@
+---
+title: 'Client Registration'
+description: 'How an MCP client obtains a client_id with no prior relationship to the server: pre-registration, Client ID Metadata Documents, and the deprecated Dynamic Client Registration, plus the binding and impersonation rules that come with each.'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The problem OAuth never had to solve
+
+Classic OAuth assumes the client developer visited the provider's developer console and registered an app by hand. MCP breaks that assumption: a general-purpose host like Claude Code or an IDE will connect to servers its authors never heard of, run by organisations with their own authorization servers. Neither side can pre-arrange a `client_id`.
+
+MCP therefore supports three registration mechanisms and tells clients which to prefer:
+
+1. **Pre-registered credentials**, if the client has them for this server.
+2. **Client ID Metadata Documents (CIMD)**, if the authorization server advertises `client_id_metadata_document_supported: true`.
+3. **Dynamic Client Registration (DCR)** as a fallback, if the AS exposes a `registration_endpoint`. This path is deprecated.
+4. **Ask the user** to paste client details if nothing else works.
+
+## Client ID Metadata Documents
+
+CIMD is the mechanism the spec now recommends (SHOULD) for both clients and authorization servers. The idea is that the client's identifier *is* an HTTPS URL, and that URL serves a JSON document describing the client:
+
+```json
+{
+  "client_id": "https://app.example.com/oauth/client-metadata.json",
+  "client_name": "Example MCP Client",
+  "client_uri": "https://app.example.com",
+  "logo_uri": "https://app.example.com/logo.png",
+  "redirect_uris": [
+    "http://127.0.0.1:3000/callback",
+    "http://localhost:3000/callback"
+  ],
+  "grant_types": ["authorization_code"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none"
+}
+```
+
+Requirements on the **client**:
+
+- The `client_id` URL MUST use `https` and MUST contain a path component (`https://example.com/client.json`, not a bare origin).
+- The document MUST contain at least `client_id`, `client_name`, and `redirect_uris`.
+- The `client_id` value *inside* the document MUST match the document's URL exactly.
+- Public clients (desktop apps, CLIs) use `token_endpoint_auth_method: "none"`. Clients that can hold a key MAY use `private_key_jwt` with a JWKS referenced from the document.
+
+Requirements on the **authorization server**:
+
+- SHOULD fetch the document when it sees a URL-formatted `client_id`.
+- MUST validate the fetched `client_id` equals the URL, MUST validate the document is well-formed JSON with the required fields, and MUST validate the `redirect_uri` in each authorization request against the document's `redirect_uris`.
+- SHOULD cache the document respecting HTTP cache headers.
+
+<Mermaid title="Client ID Metadata Document flow" code={cimdDiagram} />
+
+export const cimdDiagram = `sequenceDiagram
+  participant U as User
+  participant C as MCP Client
+  participant A as Authorization Server
+  participant D as Metadata URL (client's HTTPS host)
+  C->>A: authorize (client_id = https://app.example.com/oauth/client.json)
+  A->>U: authenticate
+  A->>D: GET client metadata document
+  D-->>A: JSON (client_id, client_name, redirect_uris)
+  Note over A: validate client_id equals URL, redirect_uri allowed
+  A->>U: consent screen showing client_name
+  U-->>A: approve
+  A-->>C: code via redirect_uri`;
+
+Why this design wins for MCP:
+
+- **No prior relationship needed.** Any AS can verify any client by fetching a document from a domain the client controls.
+- **Portable.** Because the identifier is a self-hosted URL, the same `client_id` works with every authorization server. If a server switches to a different AS, the client needs no re-registration.
+- **Accountable.** The AS can apply trust policies by domain (allowlist, reputation, certificate checks) and display the domain prominently on the consent screen.
+
+The AS advertises support in its metadata:
+
+```json
+{ "client_id_metadata_document_supported": true }
+```
+
+Clients SHOULD check that flag and MAY fall back to DCR or pre-registration when it is absent.
+
+## Pre-registration
+
+Clients SHOULD still support static credentials, in one of two forms:
+
+1. A `client_id` (and secret, if confidential) hard-coded for a specific authorization server, the way a first-party app would ship.
+2. A settings UI where the user pastes a `client_id` they obtained by registering the client themselves in the provider's console.
+
+Claude Code exposes the second form on the command line:
+
+```bash
+claude mcp add --transport http \
+  --client-id your-client-id --client-secret --callback-port 8080 \
+  my-server https://mcp.example.com/mcp
+```
+
+Pre-registered credentials are tied to one issuer. If the server's Protected Resource Metadata starts pointing at a different AS, the client SHOULD surface an error rather than try the old credentials there.
+
+## Dynamic Client Registration (deprecated)
+
+RFC 7591 lets a client POST its metadata to a `registration_endpoint` and receive a `client_id` without user interaction. Early MCP relied on it heavily. It is now **deprecated** in favour of CIMD and remains only for authorization servers that do not support metadata documents.
+
+If you do fall back to DCR, one field is now mandatory:
+
+```json
+{
+  "client_name": "Example MCP Client",
+  "redirect_uris": ["http://127.0.0.1:3000/callback"],
+  "grant_types": ["authorization_code"],
+  "token_endpoint_auth_method": "none",
+  "application_type": "native"
+}
+```
+
+`application_type` MUST be set. Under OpenID Connect Dynamic Client Registration, omitting it defaults to `"web"`, and OIDC servers then reject `localhost` and custom-scheme redirect URIs. Use:
+
+- `"native"` for desktop apps, mobile apps, CLI tools, and locally hosted web apps reached via `localhost`.
+- `"web"` for remote browser-based applications served from a real host.
+
+Non-OIDC servers ignore the parameter, so there is no cost to always sending it. Clients MUST be prepared for registration to fail on redirect-URI constraints, SHOULD show a meaningful error, and MAY retry with an adjusted `application_type` or conforming redirect URIs.
+
+Why DCR lost: every AS ends up with an unbounded table of anonymous registrations, each client gets a *different* `client_id` per AS, and the combination of static upstream client IDs with dynamic downstream registration is exactly what enables the confused-deputy attack described in [Threats and Mitigations](/mcp/en/security-and-auth/threats-and-mitigations/).
+
+## Credentials are bound to their issuer
+
+Whichever way a client got its credentials, they belong to the authorization server that issued them:
+
+- Clients MUST key persisted credentials (client IDs, secrets, tokens) by the AS `issuer` identifier.
+- Clients MUST NOT reuse credentials with a different authorization server.
+- When the server's Protected Resource Metadata names a new AS, clients MUST re-register there (or, with CIMD, simply present the same URL, which the new AS resolves on demand).
+
+The practical consequence: a token store is a map from issuer to credentials, never a flat "the token for this server".
+
+## Localhost redirect URIs and trust
+
+Native clients redirect to `http://127.0.0.1:PORT/callback`. CIMD proves the client's authors control `app.example.com`; it cannot prove which local process is listening on that port. An attacker can therefore:
+
+1. Use the legitimate client's metadata URL as their `client_id`.
+2. Bind any localhost port and supply it as `redirect_uri` (it is in the allowed list).
+3. Receive the authorization code when the user approves what looks like the real client.
+
+The spec's countermeasures live on the authorization server: display additional warnings when a client's metadata contains only `localhost` redirect URIs, show the redirect hostname clearly during consent, and apply **trust policies** to URL-based client IDs. Protected servers may allowlist domains; open servers may accept any HTTPS `client_id` but still check reputation, domain age, or certificates, and must always display the client's hostname so phishing stands out.
+
+## Choosing, as a client author
+
+| Situation | Use |
+|-----------|-----|
+| You ship a first-party client for your own AS | Pre-registered `client_id` |
+| General-purpose host connecting to arbitrary servers | CIMD, hosted on your product's domain |
+| AS is old and has only a `registration_endpoint` | DCR with `application_type` set, and log that you fell back |
+| Nothing works | Ask the user for client details |
+
+<Callout title="The one-line takeaway">
+Prefer pre-registered credentials when you have them, otherwise identify yourself with a Client ID Metadata Document at an HTTPS URL you control; fall back to (deprecated) dynamic registration only when the AS supports nothing else, always send `application_type`, and store every credential keyed by the issuer that granted it.
+</Callout>
+
+export const quizRegistration = [
+  {
+    q: 'What is the `client_id` in a Client ID Metadata Document?',
+    options: [
+      'A random string issued by the AS',
+      'An HTTPS URL with a path that serves the client metadata JSON, and the document must contain the same value',
+      'The client application name',
+      'A hash of the redirect URI',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which registration mechanism is deprecated in the current spec?',
+    options: [
+      'Pre-registration',
+      'Client ID Metadata Documents',
+      'Dynamic Client Registration (RFC 7591)',
+      'Asking the user',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A CLI client falls back to Dynamic Client Registration. Which field must it include?',
+    options: [
+      '`application_type: "native"`',
+      '`token_endpoint_auth_method: "client_secret_basic"`',
+      '`logo_uri`',
+      '`scope: "*"`',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'A server changes its authorization server. What happens to a client that had registered via DCR at the old one?',
+    options: [
+      'Its credentials keep working because the resource is the same',
+      'It must re-register with the new AS; credentials are bound to the issuer that created them',
+      'The old AS forwards its tokens',
+      'It must switch to stdio',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/client-registration" questions={quizRegistration} />
+
+<ProgressTracker client:visible id="security-and-auth/client-registration" />

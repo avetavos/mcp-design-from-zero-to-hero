@@ -1,0 +1,270 @@
+---
+title: 'Resources'
+description: 'context ที่ระบุด้วย URI — การ list, การอ่านเนื้อหาแบบ text และ binary, template ตาม RFC 6570 พร้อม completion, annotation, กฎของ URI scheme และ error กับการตรวจสอบด้าน security ที่มาด้วยกัน'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## context ไม่ใช่ action
+
+**resource** คือข้อมูลที่ server ยื่นให้ host ได้: ไฟล์, database schema, ท้ายของ log, record สักตัว มันถูกระบุด้วย URI และถูกอ่านเมื่อต้องการ ต่างจาก tool ตรงที่ไม่มีอะไร *เกิดขึ้น* ตอนคุณอ่านมัน — ซึ่งนั่นแหละคือเหตุผลที่ interaction model เป็นแบบ **application-driven**: host เป็นคนตัดสินใจว่าจะแสดง resource อย่างไร รูปแบบที่พบบ่อยคือ tree หรือ list picker, ช่องค้นหา, `@`-mention ในช่องแชต หรือการแนบอัตโนมัติตาม heuristic
+
+<Mermaid title="ค้นพบ แล้วค่อยอ่าน" code={resFlow} />
+
+export const resFlow = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: resources/list
+  S-->>C: resources[] (ttlMs, cacheScope)
+  C->>S: resources/templates/list
+  S-->>C: resourceTemplates[]
+  C->>S: resources/read uri=file:///project/src/main.rs
+  S-->>C: contents[] text หรือ blob`;
+
+## resource object
+
+```json
+{
+  "uri": "file:///project/README.md",
+  "name": "README.md",
+  "title": "Project Documentation",
+  "description": "Top-level project overview",
+  "mimeType": "text/markdown",
+  "size": 4096,
+  "icons": [ { "src": "https://example.com/md.png", "mimeType": "image/png", "sizes": ["48x48"] } ],
+  "annotations": { "audience": ["user"], "priority": 0.8, "lastModified": "2026-09-01T15:00:58Z" }
+}
+```
+
+| Field | หมายเหตุ |
+|-------|-------|
+| `uri` | ตัวระบุที่ไม่ซ้ำ; ต้องเป็น URI ที่ถูกต้องตาม RFC 3986 |
+| `name` | ชื่อสั้น ๆ |
+| `title` | ชื่อสำหรับแสดงผลที่คนอ่านได้ |
+| `description` | มีอะไรอยู่ข้างในและสำคัญอย่างไร |
+| `mimeType` | ช่วยให้ host ตัดสินใจว่าจะ render อย่างไร และ model ใช้ได้ไหม |
+| `size` | ขนาดเป็น byte ใส่หรือไม่ก็ได้ — ให้ host ประเมิน context ก่อนอ่าน |
+| `annotations` | คำใบ้สำหรับการเลือกและแสดงผล (ด้านล่าง) |
+
+### annotation
+
+resource, template และ content block ใช้ annotation รูปแบบเดียวกัน:
+
+- **`audience`** — `["user"]`, `["assistant"]` หรือทั้งคู่ stack trace ดิบ ๆ อาจเป็นของ assistant อย่างเดียว; สรุปที่ render แล้วอาจเป็นของ user อย่างเดียว
+- **`priority`** — 0.0 ถึง 1.0 ค่า 1 หมายถึงแทบจะบังคับ; ค่า 0 หมายถึงไม่จำเป็นเลย host ใช้มันตัดสินใจว่าจะใส่อะไรเมื่อ context จำกัด
+- **`lastModified`** — timestamp แบบ ISO 8601 สำหรับเรียงตามความใหม่และตัดสินใจเรื่อง cache
+
+## `resources/list` และ `resources/read`
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": { "cursor": "optional" } }
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "resources": [ { "uri": "file:///project/src/main.rs", "name": "main.rs", "mimeType": "text/x-rust" } ],
+    "nextCursor": "next-page-cursor",
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+```
+
+การอ่านคืน array `contents` แต่ละรายการเป็น **text** หรือ **blob** (base64) อย่างใดอย่างหนึ่ง:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "contents": [
+      { "uri": "file:///project/src/main.rs", "mimeType": "text/x-rust", "text": "fn main() {}" }
+    ],
+    "ttlMs": 60000,
+    "cacheScope": "private"
+  }
+}
+```
+
+```json
+{ "uri": "file:///logo.png", "mimeType": "image/png", "blob": "iVBORw0KGgo…" }
+```
+
+การอ่านครั้งเดียว **อาจ** คืน contents หลายรายการ — การอ่าน resource ที่เป็น directory อาจคืนทุกไฟล์ในนั้น ผลลัพธ์ของ `resources/read` ก็มี `ttlMs` และ `cacheScope` เช่นกัน; เอกสารเฉพาะ user เป็น `private` เอกสารสาธารณะเป็น `public` ได้
+
+และเช่นเดียวกับ `tools/call` และ `prompts/get` `resources/read` **อาจ** คืน `InputRequiredResult` เมื่อ server ต้องการ input จาก user ก่อน (เช่น ถามว่าจะอ่าน config ของ environment ไหน) ดู [MRTR](/mcp/th/client-interaction/multi-round-trip-requests/)
+
+## resource template
+
+เมื่อ server มี resource *เป็นตระกูล* — ทุกไฟล์ในโปรเจกต์, ทุก record ของลูกค้า — มันไม่ควร list ทั้งหมดออกมา ให้เปิด **template** ด้วย URI template ตาม RFC 6570 แล้วให้ client (หรือ user) เติมตัวแปรเอง:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "resultType": "complete",
+    "resourceTemplates": [
+      {
+        "uriTemplate": "repo://{repo}/readme",
+        "name": "Repository README",
+        "title": "README of one repository",
+        "mimeType": "text/markdown"
+      }
+    ],
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+```
+
+ตัวแปร auto-complete ได้ผ่าน `completion/complete` ดังนั้น picker เสนอค่า `repo` ที่ถูกต้องขณะ user พิมพ์ได้ นั่นคือ completion API ตัวเดียวกับที่ prompt ใช้ — ดู [Prompts](/mcp/th/server-primitives/prompts/)
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
+
+    const server = new McpServer({ name: 'repos', version: '1.0.0' });
+
+    // resource แบบตายตัว
+    server.registerResource(
+      'guidelines',
+      'docs://guidelines',
+      { title: 'Contribution guidelines', mimeType: 'text/markdown' },
+      async (uri) => ({
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: '# How we work\n…' }],
+      }),
+    );
+
+    // template พร้อม completion สำหรับตัวแปร {repo}
+    server.registerResource(
+      'readme',
+      new ResourceTemplate('repo://{repo}/readme', {
+        list: undefined,
+        complete: {
+          repo: async (value) => {
+            const repos = await listRepos();
+            return repos.filter((r) => r.startsWith(value));
+          },
+        },
+      }),
+      { description: 'The README of one repository' },
+      async (uri, { repo }) => ({
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: await readReadme(repo) }],
+      }),
+    );
+    ```
+    `list: undefined` หมายความว่า template จะไม่แจกแจง resource ตัวจริงใน `resources/list`; ใส่ callback `list` ถ้าอยากให้บางตัวโผล่ในนั้นด้วย
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("repos")
+
+
+    @mcp.resource("docs://guidelines", mime_type="text/markdown")
+    def guidelines() -> str:
+        """Contribution guidelines."""
+        return "# How we work\n…"
+
+
+    @mcp.resource("repo://{repo}/readme", mime_type="text/markdown")
+    def readme(repo: str) -> str:
+        """The README of one repository."""
+        return read_readme(repo)
+    ```
+    URI ที่มี `{variables}` จะลงทะเบียนเป็น template; parameter ของ function ต้องชื่อตรงกับตัวแปร การ return `str` ให้ contents แบบ text; การ return `bytes` ให้ `blob` แบบ base64
+  </TabItem>
+</Tabs>
+
+## URI scheme และสิ่งที่มันสัญญา
+
+scheme คือสัญญากับ client ว่าจะได้ byte มา *อย่างไร*:
+
+| Scheme | กฎ |
+|--------|------|
+| `https://` | ใช้ **เฉพาะ** เมื่อ client fetch resource จากเว็บได้เองโดยตรงโดยไม่ต้องผ่าน MCP server ถ้า server ของคุณเป็นคน download แล้วเสิร์ฟ ให้ใช้ scheme อื่น — แม้ต้นทางจะอยู่บนอินเทอร์เน็ตก็ตาม |
+| `file://` | resource ที่ทำตัวเหมือน filesystem ไม่จำเป็นต้อง map กับ disk จริง; database เสนอ table เป็นไฟล์ก็ได้ รายการที่ไม่ใช่ไฟล์ปกติอาจใช้ XDG MIME type เช่น `inode/directory` |
+| `git://` | การเชื่อมต่อกับ Git version control |
+| custom (`repo://`, `docs://`, `ticket://`) | อนุญาตและสนับสนุน; ต้องถูกต้องตาม RFC 3986 |
+
+กฎเรื่อง `https://` ทำให้หลายคนแปลกใจ server ที่ proxy `https://api.example.com/users/42` ผ่านการเรียกที่ต้องยืนยันตัวตน ควรเปิดมันเป็น `users://42` หรือทำนองนั้น เพราะ client ที่เห็น `https://` อาจพยายาม GET เองโดยตรง — แล้วล้มเหลว หรือแย่กว่านั้นคือยิงไปแบบไม่มี auth
+
+## error
+
+- ไม่พบ resource → JSON-RPC error `-32602` (Invalid params) ใส่ URI ไว้ใน `data`
+- ความล้มเหลวภายใน → `-32603`
+- server ยุคเก่า (2025-11-25 และก่อนหน้า) ใช้ `-32002` สำหรับ not-found client ควรยังรับมันได้; server ใหม่ต้องไม่ส่งมันออกมา
+- server **ต้องไม่** ตอบ resource ที่หายไปด้วย array `contents` ว่าง ค่าว่างกำกวม — "มีอยู่แต่ว่างเปล่า" กับ "ไม่มีอยู่" — ดังนั้นให้ error เสมอ
+
+```json
+{ "jsonrpc": "2.0", "id": 5, "error": { "code": -32602, "message": "Resource not found", "data": { "uri": "file:///nonexistent.txt" } } }
+```
+
+## security
+
+server **ต้อง** validate ทุก URI ที่ได้รับ และ **ต้อง** sanitize path เมื่อเสิร์ฟ resource แบบ `file://` — `file:///project/../../etc/passwd` คือการโจมตีสุดคลาสสิก access control ควรถูกนำมาใช้กับ resource ที่อ่อนไหวและตรวจก่อนการอ่านทุกครั้ง ข้อมูล binary ต้องเข้ารหัส base64 ให้ถูกต้อง และเหมือนทุกที่ใน MCP list ที่คุณคืนอาจขึ้นกับ authorization ของผู้เรียก แต่ไม่ขึ้นกับประวัติของ connection
+
+<Callout title="สรุปหนึ่งบรรทัด">
+resource คือ context ที่ระบุด้วย URI ซึ่ง *application* เลือกจะแนบ: list มันออกมา (หรือเปิด template สำหรับตระกูล), อ่านเป็น text หรือ blob, ใส่ annotation ด้วย audience และ priority, เลือก scheme ที่บอกตามตรงว่าได้ byte มาอย่างไร และตอบ error -32602 — ไม่ใช่ array ว่าง — เมื่อ URI ไม่มีอยู่
+</Callout>
+
+export const quizResources = [
+  {
+    q: 'server ใช้ scheme https:// สำหรับ resource URI ได้เมื่อไร?',
+    options: [
+      'ทุกครั้งที่ข้อมูลต้นทางอยู่บน web server',
+      'เฉพาะเมื่อ client fetch resource จากเว็บได้เองโดยตรงโดยไม่ต้องผ่าน MCP server',
+      'เฉพาะกับ binary blob',
+      'ไม่ได้เลย — อนุญาตแค่ file:// และ custom scheme',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client ขออ่าน URI ที่ไม่มีอยู่ server ต้องคืนอะไร?',
+    options: [
+      'contents array ว่าง',
+      'JSON-RPC error code -32602',
+      'text content block ที่บอกว่า "not found"',
+      'HTTP 404 ไม่มี body',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'resource template ให้อะไรที่ resource ธรรมดาไม่ให้?',
+    options: [
+      'เนื้อหาแบบ binary',
+      'URI ตระกูลเดียวกันที่รับ parameter ได้ พร้อมตัวแปรที่ auto-complete ได้',
+      'subscription อัตโนมัติ',
+      'priority ที่สูงกว่าบน UI ของ host',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'annotation ตัวไหนบอก host ว่า resource สำคัญแค่ไหนเมื่อ context จำกัด?',
+    options: [
+      'audience',
+      'priority',
+      'lastModified',
+      'mimeType',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/resources" questions={quizResources} />
+
+<ProgressTracker client:visible id="server-primitives/resources" />

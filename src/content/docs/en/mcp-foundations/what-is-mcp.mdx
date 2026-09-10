@@ -1,0 +1,137 @@
+---
+title: 'What Is MCP?'
+description: 'Hosts, clients, and servers; the three server primitives and the client primitive; local versus remote servers; and what MCP deliberately leaves out.'
+sidebar:
+  order: 2
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Three participants
+
+MCP is a client-server protocol with a twist: the "client" is not the user's application itself but a component *inside* it.
+
+- **MCP host** — the AI application: Claude Desktop, Claude Code, VS Code, or the agent you are building. It coordinates everything: which servers to connect, which tools to show the model, when to ask the user for approval.
+- **MCP client** — an object the host creates for **each** server it connects to. It holds that one connection, sends requests, and receives results. One server, one client, one dedicated connection.
+- **MCP server** — a program that provides context. It might be the [filesystem server](https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem) running as a subprocess on your laptop, or Sentry's hosted server on the other side of the internet.
+
+<Mermaid title="One host, several clients, several servers" code={participantsDiagram} />
+
+export const participantsDiagram = `flowchart TB
+  subgraph Host["MCP Host: e.g. VS Code"]
+    C1["MCP Client 1"]
+    C2["MCP Client 2"]
+    C3["MCP Client 3"]
+    C4["MCP Client 4"]
+  end
+  C1 ---|"dedicated connection"| A["Server A: filesystem (local)"]
+  C2 ---|"dedicated connection"| B["Server B: database (local)"]
+  C3 ---|"dedicated connection"| S["Server C: Sentry (remote)"]
+  C4 ---|"dedicated connection"| S`;
+
+The word **server** describes the program's role, not where it runs. When Claude Desktop launches the filesystem server as a child process, that process is a server — a *local* one. Sentry's hosted endpoint is also a server — a *remote* one. Both speak exactly the same protocol.
+
+## What servers offer: three primitives
+
+A server exposes up to three kinds of things. The important design question for each is *who decides when it is used*.
+
+| Primitive | Controlled by | What it is | Wire methods |
+|-----------|---------------|------------|--------------|
+| **Tools** | The **model** | Functions the model can call to act: run a query, create an issue, send an email | `tools/list`, `tools/call` |
+| **Resources** | The **application** | Data that gives the model context: a file, a schema, a record | `resources/list`, `resources/read`, `resources/templates/list` |
+| **Prompts** | The **user** | Reusable message templates the user picks explicitly, often as slash commands | `prompts/list`, `prompts/get` |
+
+The control column is the heart of MCP's design:
+
+- **Tools are model-controlled.** The model reads the tool descriptions and decides, on its own, to call one. That is why tool descriptions matter so much and why hosts keep a human in the loop for anything sensitive.
+- **Resources are application-driven.** The host decides how to surface them — a file picker, a search box, automatic inclusion. The model does not "call" a resource; the host reads it and puts it in context.
+- **Prompts are user-controlled.** They appear as commands the user invokes deliberately. The server writes the prompt's content; the user decides when to use it.
+
+Consider a database server. It would expose a `run_query` **tool** (the model decides when to query), a `schema://main` **resource** (the host attaches the schema as context), and an `explain_slow_query` **prompt** (the user runs it as a slash command with a query as the argument).
+
+## What clients offer: elicitation
+
+The flow is not one way. A server can ask the client for something mid-request, and the client primitive for that is **elicitation**: "ask the user a question and give me the answer." A booking tool might elicit *"Confirm: book a table for 4 on Friday?"* before committing.
+
+Elicitation comes in two modes: **form** (the client renders a small schema-driven form and returns the values) and **URL** (the client opens a page in the browser for interactions that must not pass through the client, such as entering credentials). Under the current revision the request is delivered inside the tool's *result* using the multi round-trip pattern, which the [Client Interaction](/mcp/en/client-interaction/) module covers in full.
+
+Two other client features — **sampling** (server asks the host's model for a completion) and **roots** (server asks which directories it may work in) — are deprecated as of 2026-07-28. They still function during the deprecation window, but new servers should not adopt them; the same module explains what to do instead.
+
+## Local vs remote servers
+
+| | Local server | Remote server |
+|--|--------------|---------------|
+| Transport | **stdio** — the host spawns the server as a subprocess and talks over stdin/stdout | **Streamable HTTP** — the server is a web service with a single `POST` endpoint |
+| Typical examples | Filesystem, git, a local database, a CLI wrapper | Sentry, GitHub, Notion, a company-internal API |
+| Serves | Usually one client | Many clients at once |
+| Credentials | Read from the environment (env vars, config files) | OAuth 2.1 bearer tokens |
+| Who can run it | Anyone with the package installed | The organisation that hosts it |
+
+The choice is a design decision you make once per server. A server that wraps something on the user's machine (their files, their Docker daemon) must be local. A server that fronts a multi-tenant SaaS should be remote so the operator controls updates and auth. The [Transports](/mcp/en/transports/) module goes through both in detail.
+
+## What MCP deliberately does not do
+
+MCP's scope is narrow on purpose, and knowing the edges saves you from designing against the grain:
+
+- **It does not talk to the model.** The host uses its own LLM API (for Claude, the Messages API). MCP never sees a prompt or a completion.
+- **It does not dictate how the host uses context.** A host may put every tool in the model's context, or hide them behind a search tool, or ask the user before each call. The protocol says what is *available*, not how it is *used*.
+- **It does not manage conversations or sessions.** MCP is stateless: each request stands alone. If your server needs state across calls, it hands out an explicit handle (a cart ID, a job ID) and the caller passes it back.
+- **It does not define your domain.** What `run_query` does, what `schema://main` contains — that is entirely yours.
+
+## A mental model to keep
+
+Think of a host as a **hub** and each server as a **device**. The hub knows how to enumerate a device's features (`server/discover`, `tools/list`), how to use them (`tools/call`, `resources/read`), and how to hear about changes (`subscriptions/listen`). The device knows nothing about the model, the UI, or the other devices. That separation is what lets one server work in every host, and one host work with every server.
+
+<Callout title="The one-line takeaway">
+A host creates one MCP client per MCP server; servers expose tools (model-controlled), resources (application-driven), and prompts (user-controlled); clients expose elicitation; local servers run over stdio and remote ones over Streamable HTTP — and MCP stays out of how the host talks to the model.
+</Callout>
+
+export const quizWhatIs = [
+  {
+    q: 'Which primitive is described as "model-controlled"?',
+    options: [
+      'Resources',
+      'Prompts',
+      'Tools',
+      'Elicitation',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'A user types a slash command that fills in a server-provided template. Which primitive is that?',
+    options: [
+      'A prompt',
+      'A tool',
+      'A resource',
+      'A root',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'Which statement about "server" is correct?',
+    options: [
+      'A server must run on a remote machine',
+      'A server is the program that provides context, whether it runs locally as a subprocess or remotely over HTTP',
+      'A server is the AI application itself',
+      'A server always owns the language model',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which of these is a client primitive rather than a server primitive?',
+    options: [
+      'Elicitation',
+      'Tools',
+      'Resources',
+      'Prompts',
+    ],
+    answer: 0,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/what-is-mcp" questions={quizWhatIs} />
+
+<ProgressTracker client:visible id="mcp-foundations/what-is-mcp" />

@@ -1,0 +1,241 @@
+---
+title: 'JSON-RPC Messages and _meta'
+description: 'The four message shapes and their rules, resultType, the error-code map, the _meta field with its reserved keys and required per-request fields, and how the SDKs fill it in for you.'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Four shapes
+
+Every MCP message is a JSON-RPC 2.0 message. There are only four shapes, and once you can read them you can read any MCP traffic.
+
+<Mermaid title="Requests get a response; notifications do not" code={shapesDiagram} />
+
+export const shapesDiagram = `flowchart LR
+  R["Request (id, method, params)"] --> OK["Result response (id, result)"]
+  R --> ERR["Error response (id, error)"]
+  N["Notification (method, params) - no id"]`;
+
+### Request
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": { "name": "get_weather", "arguments": { "location": "Seattle" } } }
+```
+
+- `id` **must** be a string or integer, never `null`.
+- `id` **must not** be reused while a request with the same id is still in flight.
+- In the current revision, requests flow from client to server. Servers do not send their own requests any more; when they need something from the client they say so *in the result* (see `resultType` below).
+
+### Result response
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "result": { "resultType": "complete", "content": [ { "type": "text", "text": "Sunny" } ] } }
+```
+
+- Same `id` as the request.
+- `result` is any object, but it **must** include `resultType`.
+
+### Error response
+
+```json
+{ "jsonrpc": "2.0", "id": 7, "error": { "code": -32602, "message": "Unknown tool: get_wether" } }
+```
+
+- Same `id`, unless the request was so malformed the id could not be read.
+- `code` is an integer; `message` is a string; `data` is optional and free-form.
+
+### Notification
+
+```json
+{ "jsonrpc": "2.0", "method": "notifications/progress", "params": { "progressToken": "abc", "progress": 3, "total": 10 } }
+```
+
+- No `id`, and the receiver **must not** reply.
+
+## `resultType`: polymorphic results
+
+The `resultType` field tells the client what kind of result it is holding:
+
+| Value | Meaning |
+|-------|---------|
+| `"complete"` | The request finished; this is the final content. |
+| `"input_required"` | The server needs more from the client before it can finish (an elicitation, for example). The result is an `InputRequiredResult`, and the client retries the original request with the answers. |
+| extension-defined | Extensions may add values (the Tasks extension adds `"task"`), but only ones both sides negotiated via capabilities. |
+
+Two rules keep this safe. An unrecognised `resultType` **must** be treated as invalid. And a result that *omits* the field — which happens with servers on legacy revisions (2025-11-25 and earlier) — **must** be treated as `"complete"`.
+
+## Error codes
+
+MCP reuses the standard JSON-RPC codes and carves up the implementation-defined range:
+
+| Code | Name | When |
+|------|------|------|
+| `-32700` | Parse error | The body was not valid JSON |
+| `-32600` | Invalid request | Not a valid JSON-RPC request object |
+| `-32601` | Method not found | Unknown method (on HTTP, paired with status 404) |
+| `-32602` | Invalid params | Bad or missing params — also **unknown tool**, **unknown prompt**, **resource not found**, and a request missing required `_meta` fields |
+| `-32603` | Internal error | Something broke inside the server |
+| `-32020` | `HeaderMismatch` | Streamable HTTP: a mirrored header disagrees with the body, or a required header is missing |
+| `-32021` | `MissingRequiredClientCapability` | The request needs a capability the client did not declare; `data.requiredCapabilities` lists them |
+| `-32022` | `UnsupportedProtocolVersion` | The server does not speak the requested version; `data.supported` lists what it does |
+
+The range `-32000` to `-32019` is *legacy*: SDKs used it before the policy existed, and new code must not allocate there. One code from it still matters: `-32002` was "resource not found" in 2025-11-25 and earlier. Current servers must send `-32602` instead, but clients should still *accept* `-32002` from older servers. `-32020` to `-32099` is reserved for the specification, so never emit a code there that the spec has not defined. If you need application errors, use codes outside `-32768..-32000` entirely.
+
+There is one more category that is not a JSON-RPC error at all: a **tool execution error**. A tool that fails in a way the model could fix (bad date format, record not found) returns a normal result with `isError: true` and an explanatory message. That distinction is covered in [Server Primitives → Tools](/mcp/en/server-primitives/tools/).
+
+## The `_meta` field
+
+`_meta` is a bag of key/value pairs that can appear on request `params` and on `result` objects. MCP uses it for protocol-level metadata so the main payload stays clean.
+
+### Key naming
+
+A key is an optional **prefix** (dot-separated labels ending in `/`, reverse-DNS style: `com.example/`) followed by a **name** (alphanumeric at both ends, hyphens/underscores/dots inside). Any prefix whose second label is `modelcontextprotocol` or `mcp` is reserved for the protocol — `io.modelcontextprotocol/` is the one you will see everywhere. `com.example.mcp/` is fine, because its second label is `example`.
+
+### Reserved keys
+
+| Key | Purpose |
+|-----|---------|
+| `progressToken` | Opts a request into progress notifications |
+| `io.modelcontextprotocol/protocolVersion` | The version this request speaks |
+| `io.modelcontextprotocol/clientInfo` | Client name and version |
+| `io.modelcontextprotocol/clientCapabilities` | Client capabilities relevant to this request |
+| `io.modelcontextprotocol/logLevel` | Minimum log level the server should emit for this request |
+| `io.modelcontextprotocol/subscriptionId` | Ties a notification to the `subscriptions/listen` that opened it |
+| `io.modelcontextprotocol/serverInfo` | Server name and version, on results |
+| `traceparent`, `tracestate`, `baggage` | OpenTelemetry trace context — the one exception to the prefix rule, kept for compatibility with existing tracing conventions |
+
+### Required per-request fields
+
+Two keys are **required on every client request**; a request missing either is malformed and the server rejects it with `-32602` (HTTP status 400):
+
+| Key | Required |
+|-----|----------|
+| `io.modelcontextprotocol/protocolVersion` | Yes |
+| `io.modelcontextprotocol/clientCapabilities` | Yes |
+| `io.modelcontextprotocol/clientInfo` | No, but clients **should** send it |
+| `io.modelcontextprotocol/logLevel` | No |
+
+Because capabilities ride on every request, a server never has to remember what the client declared earlier. If a request needs a capability the client did not include, the server returns `-32021` rather than guessing.
+
+Servers, for their part, **should** put `io.modelcontextprotocol/serverInfo` in every result's `_meta`. Both `clientInfo` and `serverInfo` are self-reported and unverified: use them for logs and UI, never for security decisions.
+
+### Trace context
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "get_weather",
+    "arguments": { "location": "New York" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {},
+      "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"
+    }
+  }
+}
+```
+
+Attach a W3C `traceparent` and your tool calls show up as spans in the same trace as the host's request. It costs one line and pays for itself the first time you debug a slow tool.
+
+## JSON Schema in MCP
+
+Tool input and output schemas, elicitation schemas, and structured content all use JSON Schema. Three rules:
+
+1. **Default dialect is 2020-12.** A schema without `$schema` is read as JSON Schema 2020-12. Implementations must support it and may support others if the schema declares them.
+2. **No network `$ref` by default.** A `$ref` pointing at an absolute URI must not be dereferenced automatically; an implementation may offer an opt-in fetch mode, but it must be off by default and should block private and loopback addresses. A schema that cannot validate because of an unresolved external `$ref` should be rejected, not silently accepted.
+3. **Bound composition.** `anyOf`/`oneOf`/`allOf`/`if-then-else` and `$defs` are allowed, but implementations should cap depth and subschema count so a hostile schema cannot become a denial-of-service against the validator.
+
+## You almost never write `_meta` yourself
+
+Everything above is what crosses the wire. In practice the SDK builds it. Here is a tool call from a client in each language; note that neither touches `_meta`, `id`, or `resultType`:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+
+    const client = new Client({ name: 'my-client', version: '1.0.0' });
+    await client.connect(new StreamableHTTPClientTransport(new URL('http://localhost:3000/mcp')));
+
+    // The SDK adds protocolVersion, clientInfo, clientCapabilities and the id.
+    const result = await client.callTool({ name: 'get_weather', arguments: { location: 'Seattle' } });
+
+    if (result.isError) console.error('tool error:', result.content);
+    else console.log(result.content);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp import Client
+
+    async def main() -> None:
+        # Client accepts a URL, a stdio spec, or an in-process MCPServer.
+        async with Client("http://127.0.0.1:8000/mcp") as client:
+            # _meta, id and resultType are handled by the SDK.
+            result = await client.call_tool("get_weather", {"location": "Seattle"})
+            print(result.content, result.is_error)
+    ```
+  </TabItem>
+</Tabs>
+
+Knowing the wire format still matters: it is what you read in the Inspector's traffic pane, what proxies validate, and what you fall back to when an SDK abstraction leaks.
+
+<Callout title="The one-line takeaway">
+MCP messages are plain JSON-RPC 2.0 — request, result (always with `resultType`), error, notification — with protocol metadata carried in `_meta`, where every client request must declare its protocol version and capabilities; the SDKs write those fields for you, but the error-code map and the `_meta` keys are what you read when something goes wrong.
+</Callout>
+
+export const quizJsonRpc = [
+  {
+    q: 'Which of these is a valid JSON-RPC request id in MCP?',
+    options: [
+      'null',
+      'An integer or a string that is not currently in flight',
+      'A boolean',
+      'An object',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A result from a legacy server has no resultType. How must a client treat it?',
+    options: [
+      'As invalid',
+      'As "input_required"',
+      'As "complete"',
+      'As an error',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which _meta keys are required on every client request?',
+    options: [
+      'protocolVersion and clientCapabilities (under io.modelcontextprotocol/)',
+      'clientInfo and serverInfo',
+      'progressToken and logLevel',
+      'traceparent and baggage',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'A current server cannot find a requested resource. Which error code does it send?',
+    options: [
+      '-32002',
+      '-32602',
+      '-32022',
+      '-32020',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/json-rpc-and-meta" questions={quizJsonRpc} />
+
+<ProgressTracker client:visible id="mcp-foundations/json-rpc-and-meta" />

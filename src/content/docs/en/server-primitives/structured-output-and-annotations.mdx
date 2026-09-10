@@ -1,0 +1,258 @@
+---
+title: 'Structured Output and Annotations'
+description: 'outputSchema and structuredContent for machine-readable results, the behavior hints hosts use to gate confirmations, and the title and icon metadata that make tools presentable.'
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Text is for the model, structure is for the program
+
+A tool's `content` array is what the language model reads. But increasingly the *consumer* of a tool result is not a model at all — it is code: a host generating typed wrappers, a "code mode" sandbox chaining tools, an MCP App rendering a chart. Those consumers want JSON with a known shape, not prose to parse.
+
+MCP gives you both channels in one result:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 5,
+  "result": {
+    "resultType": "complete",
+    "content": [ { "type": "text", "text": "{\"name\":\"Travel mug\",\"price\":24}" } ],
+    "structuredContent": { "name": "Travel mug", "price": 24 }
+  }
+}
+```
+
+- `structuredContent` — any JSON value (object, array, string, number, boolean, or null). If the tool declares an `outputSchema`, this value **MUST** conform to it.
+- `content` — still present. For backward compatibility, a tool returning structured content SHOULD also return the serialized JSON as a `text` block, so older clients and the model still get something.
+
+<Mermaid title="Two consumers, two channels" code={channelsDiagram} />
+
+export const channelsDiagram = `flowchart LR
+  S["Tool result"] --> C["content[] text"]
+  S --> SC["structuredContent"]
+  C --> LLM["Language model reads prose"]
+  SC --> Code["Host code validates against outputSchema"]
+  SC --> App["MCP App renders UI"]`;
+
+Do not confuse this with an LLM's "structured outputs" feature. `structuredContent` is *server-produced* data; it says nothing about how the model generates text.
+
+## Declaring an output schema
+
+```json
+{
+  "name": "product_details",
+  "description": "Look up one product by its exact name",
+  "inputSchema": { "type": "object", "properties": { "name": { "type": "string" } }, "required": ["name"] },
+  "outputSchema": {
+    "type": "object",
+    "properties": { "name": { "type": "string" }, "price": { "type": "number" } },
+    "required": ["name", "price"]
+  }
+}
+```
+
+The contract that comes with it:
+
+- Servers **MUST** return `structuredContent` that conforms to `outputSchema`.
+- Clients **SHOULD** validate `structuredContent` against it (and follow the `$ref` rules — never auto-fetch a network `$ref`).
+- `outputSchema` may be any JSON Schema 2020-12, including arrays at the root:
+
+```json
+{ "type": "array", "items": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } }
+```
+
+Why bother? A host that knows the output shape can generate a typed function (`productDetails(name): Promise<{name: string; price: number}>`) for programmatic tool calling, chain your tool into others without passing the data through the model, and reject a malformed result before it poisons the conversation. Tools without an `outputSchema` fall back to "it's a string, good luck".
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    server.registerTool(
+      'product_details',
+      {
+        description: 'Look up one product by its exact name',
+        inputSchema: z.object({ name: z.string() }),
+        outputSchema: z.object({ name: z.string(), price: z.number() }),
+      },
+      async ({ name }) => {
+        const product = catalog.find((p) => p.name === name);
+        if (!product) {
+          return { content: [{ type: 'text', text: `No product named ${name}` }], isError: true };
+        }
+        const output = { name: product.name, price: product.price };
+        return {
+          content: [{ type: 'text', text: JSON.stringify(output) }],
+          structuredContent: output,
+        };
+      },
+    );
+    ```
+    When `outputSchema` is set, `structuredContent` is required on the result and the SDK validates it against the schema before sending.
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from pydantic import BaseModel, Field
+
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    mcp = MCPServer("catalog")
+
+
+    class Product(BaseModel):
+        name: str
+        price: float = Field(description="Price in USD.")
+
+
+    @mcp.tool()
+    def product_details(name: str) -> Product:
+        """Look up one product by its exact name."""
+        for p in CATALOG:
+            if p["name"] == name:
+                return Product(**p)
+        raise ToolError(f"No product named {name!r}")
+    ```
+    Returning a pydantic `BaseModel` gives an **unwrapped** object: the model's JSON schema becomes `outputSchema` and the instance becomes `structuredContent`. Returning a primitive such as `str` or `int` is **wrapped** — the SDK produces a schema like `{"result": …}` so the value still has a well-defined shape.
+  </TabItem>
+</Tabs>
+
+## Annotations: telling the host how a tool behaves
+
+The host is the one that decides whether to ask the human before running a tool. It cannot read your code, so tell it with **annotations**:
+
+```json
+{
+  "name": "clear_catalog",
+  "title": "Clear the catalog",
+  "description": "Remove every product from the catalog",
+  "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false }
+}
+```
+
+| Hint | Default | Meaning |
+|------|---------|---------|
+| `readOnlyHint` | `false` | The tool does not modify its environment |
+| `destructiveHint` | `true` | If not read-only, the tool may perform destructive updates (delete, overwrite) rather than only additive ones |
+| `idempotentHint` | `false` | Calling it again with the same arguments has no additional effect |
+| `openWorldHint` | `true` | The tool interacts with external entities (the web, third-party APIs) rather than a closed system |
+
+What a well-behaved host does with these:
+
+- Auto-approve `readOnlyHint: true` tools; prompt for confirmation on destructive ones.
+- Retry `idempotentHint: true` tools safely after a timeout; never blindly retry a non-idempotent one.
+- Flag `openWorldHint: true` tools in the UI so the user knows data may leave the machine.
+
+The default values are deliberately *pessimistic*: an annotation-free tool is treated as potentially destructive, non-idempotent, and open-world. So set them — a read-only search tool that never declares `readOnlyHint` will generate confirmation prompts it does not need.
+
+### Annotations are hints, not guarantees
+
+The spec is blunt: **clients MUST consider tool annotations untrusted unless they come from trusted servers.** A malicious server can label `rm -rf` as read-only. Annotations improve the experience with servers you trust; they are not a security boundary. Hosts should still show tool inputs to the user before sending them, and users should still be able to deny any call.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    server.registerTool(
+      'clear_catalog',
+      {
+        title: 'Clear the catalog',
+        description: 'Remove every product from the catalog',
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+      },
+      async () => {
+        catalog.length = 0;
+        return { content: [{ type: 'text', text: 'Catalog cleared' }] };
+      },
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.types import ToolAnnotations
+
+
+    @mcp.tool(
+        title="Clear the catalog",
+        annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=True),
+    )
+    def clear_catalog() -> str:
+        """Remove every product from the catalog."""
+        CATALOG.clear()
+        return "Catalog cleared"
+    ```
+  </TabItem>
+</Tabs>
+
+## `title` versus `name`
+
+`name` is the identifier the model uses in `tools/call`; it must follow the naming rules and never changes casually. `title` is free text for humans: "Search the product catalog" instead of `search_catalog`. Hosts show `title` in confirmation dialogs and tool pickers, and fall back to `name` when it is absent. The same split exists on resources and prompts.
+
+## Icons
+
+Tools, prompts, resources, and the server itself may carry `icons`:
+
+```json
+{ "icons": [ { "src": "https://example.com/search.png", "mimeType": "image/png", "sizes": ["48x48"] } ] }
+```
+
+Only `https:` and `data:` URIs are allowed; clients MUST reject `javascript:`, `file:`, and other schemes, fetch icons without credentials, and verify the icon origin matches the server's. Clients that render icons must support PNG and JPEG, and should support SVG (with sanitization — SVG can contain scripts) and WebP. Treat icons as a nicety for graphical hosts, never as something your server depends on.
+
+## `x-mcp-header`
+
+One more property can appear inside `inputSchema`: `"x-mcp-header": "Region"` on a primitive-typed parameter tells Streamable HTTP clients to mirror that argument into an `Mcp-Param-Region` header so load balancers can route on it without parsing the body. It is a transport concern with strict constraints — covered in [Streamable HTTP](/mcp/en/transports/streamable-http/). Never mark secrets with it.
+
+<Callout title="The one-line takeaway">
+Return `structuredContent` that conforms to an `outputSchema` whenever code will consume your result, and keep a text block alongside for the model. Set the four annotation hints so trusted hosts can skip needless confirmations and retry safely — but remember clients treat them as untrusted, so they are UX, not security.
+</Callout>
+
+export const quizStructured = [
+  {
+    q: 'A tool declares an outputSchema. What MUST the server do?',
+    options: [
+      'Omit the content array',
+      'Return structuredContent that conforms to the schema',
+      'Return only a text block containing JSON',
+      'Set isError to false explicitly',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What is the default value of destructiveHint when a tool has no annotations?',
+    options: [
+      'false — tools are assumed safe',
+      'true — a non-read-only tool is assumed potentially destructive',
+      'null — the host must ask the server',
+      'It depends on openWorldHint',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How must a client treat tool annotations from an unknown server?',
+    options: [
+      'As binding security guarantees',
+      'As untrusted hints that do not replace user confirmation',
+      'As required fields that fail validation if missing',
+      'As documentation only shown to developers',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which icon src is a client required to reject?',
+    options: [
+      'https://example.com/icon.png',
+      'data:image/png;base64,iVBORw0…',
+      'javascript:alert(1)',
+      'https://example.com/icon.svg',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="server-primitives/structured-output-and-annotations" questions={quizStructured} />
+
+<ProgressTracker client:visible id="server-primitives/structured-output-and-annotations" />

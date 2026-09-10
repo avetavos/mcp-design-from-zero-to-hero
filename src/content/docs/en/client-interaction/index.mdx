@@ -1,0 +1,105 @@
+---
+title: 'Client Interaction'
+description: 'Why a stateless server sometimes needs the client — to ask the user a question or to outlive a single request — and the patterns MCP gives it: MRTR, elicitation, progress, cancellation, and the Tasks extension.'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## The server is not always the one with the answer
+
+Most of MCP flows one way: the client asks, the server answers. `tools/list`, `tools/call`, `resources/read` — request in, result out. But a real tool sometimes hits a wall halfway through:
+
+- **It needs a human decision.** "Book the table for 4 or 6 people?" "Which region should I deploy to?" Only the user can say.
+- **It needs a secret it must not see in the clear.** An API key for a third-party service, a payment authorization, an OAuth consent.
+- **It will take longer than one HTTP request can politely stay open.** A CI pipeline, a bulk import, a job that waits on an approval.
+
+In every one of these the *server* needs something from the *client* — but MCP is a stateless, client-driven protocol. That single design decision shapes everything in this module.
+
+## The constraint: no server-initiated requests
+
+In the 2026-07-28 revision, MCP is stateless: every request carries everything the server needs in its `_meta`, and a server must not infer anything from a previous request on the same connection. A consequence that surprises people coming from legacy (2025-11-25 and earlier): **the server can no longer send its own JSON-RPC requests to the client**. There is no open channel on which `elicitation/create` or `sampling/createMessage` could travel upstream.
+
+<Mermaid title="The server has to answer — so it answers with a question" code={overviewDiagram} />
+
+export const overviewDiagram = `sequenceDiagram
+  participant U as User
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call (id 1)
+  Note over S: I need the user to pick a region
+  S-->>C: InputRequiredResult (inputRequests, requestState)
+  C->>U: form: choose a region
+  U-->>C: eu-west-1
+  C->>S: tools/call (id 2, same args + inputResponses + requestState)
+  S-->>C: final result`;
+
+So instead of *sending a request*, the server *returns a result that asks for input*. The client gathers it and **retries the original request** with the answers attached. That is the Multi Round-Trip Requests pattern (MRTR), and it is the backbone of everything below.
+
+## What this module covers
+
+| Lesson | Mechanism | Solves |
+|--------|-----------|--------|
+| [MRTR](/mcp/en/client-interaction/multi-round-trip-requests/) | `InputRequiredResult` → retry with `inputResponses` | any server-to-client question, without server state |
+| [Elicitation](/mcp/en/client-interaction/elicitation/) | `elicitation/create` in form or URL mode | asking the user for data or consent |
+| [Progress & cancellation](/mcp/en/client-interaction/progress-and-cancellation/) | `notifications/progress`, `notifications/cancelled`, stream close | keeping a long call alive and stoppable |
+| [Tasks extension](/mcp/en/client-interaction/tasks-extension/) | `resultType: "task"`, `tasks/get`, `tasks/update` | work that outlives the request |
+| [Deprecated features](/mcp/en/client-interaction/deprecated-features/) | sampling, roots, logging | what to do instead |
+
+## Two kinds of "wait"
+
+It helps to separate the cases by *who* the server is waiting on:
+
+- **Waiting on the user** — elicitation. The answer comes from a person, through the client's UI. Under MRTR the server does not wait at all: it returns, and the retry brings the answer.
+- **Waiting on time** — a long-running operation. The connection is the fragile part here. Progress notifications keep a single request alive and honest; the Tasks extension turns the work into a durable handle you can poll after reconnecting.
+
+Both keep the server free of per-connection state. The state either travels with the request (`requestState`) or is an explicit identifier (`taskId`) the client passes on every call.
+
+## What was retired
+
+Three client features were deprecated in 2026-07-28 (SEP-2577): **sampling** (server asks the host's LLM for a completion), **roots** (server asks which directories it may touch), and **logging** (server pushes log lines). They still work during the deprecation window, but new servers should not adopt them. The last lesson explains why and what replaces each.
+
+<Callout title="The one-line takeaway">
+MCP servers cannot call the client — so when they need the user, they *return* a question (`InputRequiredResult`) and the client retries the same request with the answer; when they need time, they report progress or hand back a task handle. State rides in the request, never in the connection.
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'Why can a 2026-07-28 MCP server not send elicitation/create as its own JSON-RPC request?',
+    options: [
+      'Elicitation was removed from the protocol',
+      'The protocol is stateless and client-driven: there is no server-initiated request channel',
+      'JSON-RPC forbids requests from servers',
+      'Only stdio servers may send requests',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'How does a server ask the user a question under MRTR?',
+    options: [
+      'It opens a WebSocket back to the client',
+      'It blocks the HTTP request until the user answers',
+      'It returns an InputRequiredResult and the client retries the original request with inputResponses',
+      'It writes a prompt to stderr',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'Which pair of features addresses "the work outlives one request"?',
+    options: [
+      'Roots and sampling',
+      'Progress notifications and the Tasks extension',
+      'Prompts and resources',
+      'Logging and ping',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="client-interaction/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="client-interaction/index" />

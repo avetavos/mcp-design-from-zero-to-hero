@@ -1,0 +1,207 @@
+---
+title: 'Building an HTTP Server'
+description: 'serve McpServer ตัวเดิมบน Streamable HTTP ด้วย createMcpHandler ใน TypeScript และ mcp.run() ใน Python, ทดสอบแบบ in-process และออกแบบให้ stateless เพื่อ scale หลัง load balancer ธรรมดาได้'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## จาก script บน stdio ไปเป็น service
+
+tool ของคุณไม่ต้องเปลี่ยนอะไรเลยเมื่อย้ายไป HTTP สิ่งที่เปลี่ยนคือใครเป็นเจ้าของ process และ request มาถึงอย่างไร SDK ซ่อนกลไกของ transport ให้; งานของคุณคือส่วนที่ SDK ทำแทนไม่ได้ — ทำให้ server ถูกต้องเมื่อหลาย client แชร์มัน และไม่มีอะไรรับประกันว่าสอง request จะไปตกที่ instance เดียวกัน
+
+<Mermaid title="HTTP server ที่ stateless scale แนวนอนได้" code={scaleDiagram} />
+
+export const scaleDiagram = `flowchart LR
+  c1["Client A"] --> lb["Load balancer"]
+  c2["Client B"] --> lb
+  lb --> i1["Instance 1"]
+  lb --> i2["Instance 2"]
+  lb --> i3["Instance 3"]
+  i1 --> db[("Shared state keyed by explicit handles")]
+  i2 --> db
+  i3 --> db`;
+
+## แพทเทิร์น factory
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ใน TypeScript SDK `createMcpHandler` รับ **factory** ที่สร้าง `McpServer` factory ถูกรันต่อ request ดังนั้นให้ลงทะเบียน tool, resource และ prompt ทุกตัว *ภายใน* มัน — handler ที่ return มาพูด `Request`/`Response` ตามมาตรฐาน web
+
+    ```ts
+    import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+    import * as z from 'zod/v4';
+
+    export const handler = createMcpHandler(() => {
+      const server = new McpServer({ name: 'notes', version: '1.0.0' });
+      server.registerTool(
+        'add-note',
+        { description: 'Save a note', inputSchema: z.object({ text: z.string() }) },
+        async ({ text }) => ({ content: [{ type: 'text', text: `Saved: ${text}` }] }),
+      );
+      return server;
+    });
+    ```
+
+    บน runtime มาตรฐาน web (Cloudflare Workers, Deno, Bun) handler *คือ* แอปเลย:
+
+    ```ts
+    export default handler;
+    ```
+
+    บน Node ให้แปลงด้วย `toNodeHandler` แล้ว mount บน Express ผ่าน helper ของ SDK ซึ่งจัดการเรื่องตรวจ host และ `Origin` ให้คุณ:
+
+    ```ts
+    import { createMcpExpressApp } from '@modelcontextprotocol/express';
+    import { toNodeHandler } from '@modelcontextprotocol/node';
+
+    const app = createMcpExpressApp({ host: '0.0.0.0', allowedHosts: ['api.example.com'] });
+    const node = toNodeHandler(handler);
+    app.all('/mcp', (req, res) => void node(req, res, req.body));
+    app.listen(3000);
+    ```
+
+    ติดตั้ง: `npm install @modelcontextprotocol/server @modelcontextprotocol/node @modelcontextprotocol/express zod`
+  </TabItem>
+  <TabItem label="Python">
+    ใน Python SDK object `MCPServer` ตัวเดิมรันบน HTTP ได้ด้วยการเปลี่ยน transport ใน `run()` option ของ transport เป็น argument ของ `run()` ไม่ใช่ของ constructor
+
+    ```python
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("notes")
+
+    @mcp.tool()
+    def add_note(text: str) -> str:
+        """Save a note."""
+        return f"Saved: {text}"
+
+    if __name__ == "__main__":
+        mcp.run(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=9000,
+            json_response=True,     # answer with plain JSON unless streaming is needed
+            stateless_http=True,    # no per-connection state
+        )
+    ```
+
+    `streamable_http_path` ใช้ตั้ง endpoint path ถ้าไม่ต้องการค่า default bind `host="127.0.0.1"` สำหรับ server ที่ใช้ในเครื่องเท่านั้น
+  </TabItem>
+</Tabs>
+
+## ทดสอบแบบ in-process
+
+คุณไม่ต้องมี port เพื่อทดสอบ HTTP server handler ของ TypeScript มี `fetch` ให้ และ client transport รับ `fetch` แบบ custom ได้ ทั้งสองจึงต่อกันใน memory ได้เลย:
+
+```ts
+import assert from 'node:assert/strict';
+import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
+
+const transport = new StreamableHTTPClientTransport(new URL('http://test.local/mcp'), {
+  fetch: (url, init) => handler.fetch(new Request(url, init)),
+});
+const client = new Client({ name: 'test', version: '1.0.0' });
+await client.connect(transport);
+
+const result = await client.callTool({ name: 'add-note', arguments: { text: 'hi' } });
+assert.equal(result.isError, undefined);
+```
+
+ใน Python `Client(mcp)` ต่อตรงเข้ากับ server object โดยไม่มี transport เลย — ดู [testing and debugging](/mcp/th/production-and-ecosystem/testing-and-debugging/)
+
+## ออกแบบเพื่อความ stateless
+
+MCP เป็น stateless protocol: ทุก request พกทุกอย่างที่จำเป็นในการประมวลผลมัน และ server **ห้าม** อนุมานอะไรจาก request ก่อนหน้าบน connection เดียวกัน บน HTTP เรื่องนี้มีผลที่เป็นรูปธรรม
+
+### handle ไม่ใช่ session
+
+ไม่มี session ID ให้แขวน state ถ้า tool ต้องการ state ข้าม call — ตะกร้าสินค้า, browser context ที่เปิดอยู่, transaction — ให้ return **handle** ที่ชัดเจนจาก tool ที่สร้าง แล้วรับมันเป็น argument ใน call ต่อ ๆ ไป:
+
+```jsonc
+// tools/call create_basket → result
+{ "content": [{ "type": "text", "text": "Created basket bsk_a1b2c3" }],
+  "structuredContent": { "basket_id": "bsk_a1b2c3" } }
+
+// tools/call add_item
+{ "name": "add_item", "arguments": { "basket_id": "bsk_a1b2c3", "sku": "MUG-24" } }
+```
+
+model พก `basket_id` ต่อไป; server เก็บตะกร้าไว้ใต้ key นั้นใน shared storage กฎการออกแบบ handle: ทำให้มัน opaque และมี entropy สูง (UUIDv4 ถ้าไม่มี authentication), ให้มีอายุจำกัดและบอกไว้ใน description ของ tool, validate authorization ของผู้เรียกกับ handle ทุก call และ return tool error ที่ชัดเจนเมื่อ handle หมดอายุเพื่อให้ model สร้างใหม่ได้
+
+### scale หลัง load balancer ธรรมดา
+
+เพราะไม่มีอะไรผูกกับ connection instance ไหนก็ให้บริการ request ไหนก็ได้ ไม่ต้องมี sticky session ไม่ต้องมี shared in-memory registry ไม่ต้องประสานงานกัน ทำให้ instance ไม่มี memory ต่อ client และเก็บของที่ต้องคงอยู่ไว้ใน store ที่ทุก instance เข้าถึงได้
+
+### ลำดับ tool ที่คงที่
+
+return tool จาก `tools/list` ในลำดับเดิมทุกครั้ง client cache รายการนี้ และ LLM provider cache prompt prefix ที่มีรายการนี้อยู่ — รายการที่สลับไปมาคือ cache miss ทั้งสองฝั่ง
+
+### authorization เป็นราย request
+
+credential มาถึงในแต่ละ request เป็น bearer token ชุด tool **อาจ** ต่างกันตาม scope ของ token นั้น (return เฉพาะที่ผู้เรียกได้รับอนุญาต) แต่ **ห้าม** ต่างกันตาม connection หรือเป็นผลข้างเคียงจาก request ก่อนหน้า
+
+## JSON หรือ SSE?
+
+server เลือกได้เป็นราย request:
+
+- ตอบ **JSON** เมื่อผลลัพธ์พร้อมเร็วและไม่มีอะไรต้องรายงานระหว่างทาง มันถูกกว่าสำหรับ intermediary และ cache ได้ง่าย
+- ตอบ **SSE** เมื่อคุณจะส่ง `notifications/progress` หรือ `notifications/message` ก่อนผลลัพธ์ หรือเมื่องานใช้เวลานานพอที่ proxy อาจ timeout response ที่เงียบ อย่าลืม `X-Accel-Buffering: no`
+
+สำหรับงานที่รันเป็นนาที ทั้งสองแบบไม่เหมาะ — ให้ return task handle แทน; ดู [Tasks extension](/mcp/th/client-interaction/tasks-extension/)
+
+<Callout title="สรุปหนึ่งบรรทัด">
+สร้าง server ครั้งเดียว serve มันด้วย `createMcpHandler` (มาตรฐาน web หรือ `toNodeHandler` บน Node) หรือ `mcp.run(transport="streamable-http")`, ทดสอบแบบ in-process และออกแบบให้ stateless: handle ที่ชัดเจนแทน session, ลำดับ tool ที่คงที่, auth ต่อ request — เพื่อให้ instance ไหนก็ตามหลัง load balancer ธรรมดาตอบ request ไหนก็ได้
+</Callout>
+
+export const quizBuild = [
+  {
+    q: 'ทำไม createMcpHandler ถึงรับ factory function แทนที่จะรับ server instance?',
+    options: [
+      'เพื่อ lazy-load SDK',
+      'factory ถูกรันต่อ request ดังนั้นแต่ละ request ได้ server ใหม่ที่ลงทะเบียนครบ',
+      'เพราะ TypeScript ส่ง object ไม่ได้',
+      'เพื่อปิด tool โดยค่าเริ่มต้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'tool ต้องจำตะกร้าสินค้าระหว่าง call วิธีแบบ MCP-native คืออะไร?',
+    options: [
+      'ใช้ header Mcp-Session-Id',
+      'return handle basket_id ที่ชัดเจน แล้วรับมันใน call ต่อ ๆ ไป',
+      'เก็บตะกร้าในตัวแปรที่ผูกกับ connection',
+      'บังคับให้ client ใช้ TCP connection เดิม',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อใดเป็นเหตุผลที่ชอบธรรมที่ tools/list จะต่างกันระหว่างสอง request?',
+    options: [
+      'มันมาจาก connection คนละเส้น',
+      'bearer token ของผู้เรียกคนหนึ่งมี scope น้อยกว่า',
+      'server ชอบสุ่มลำดับ',
+      'request ก่อนหน้าเป็น tools/call',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'server ควรตอบ request ด้วย SSE แทน JSON เมื่อไร?',
+    options: [
+      'เสมอ — SSE เป็นค่าเริ่มต้น',
+      'เมื่อมันจะส่ง progress หรือ log notification ก่อนผลลัพธ์สุดท้าย',
+      'เฉพาะกับ notification',
+      'เมื่อ client ส่ง Accept: application/json',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="transports/building-an-http-server" questions={quizBuild} />
+
+<ProgressTracker client:visible id="transports/building-an-http-server" />

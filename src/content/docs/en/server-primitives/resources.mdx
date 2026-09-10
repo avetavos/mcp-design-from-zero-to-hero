@@ -1,0 +1,270 @@
+---
+title: 'Resources'
+description: 'URI-addressed context — listing, reading text and binary contents, RFC 6570 templates with completion, annotations, URI scheme rules, and the errors and security checks that come with them.'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## Context, not action
+
+A **resource** is data a server can hand to the host: a file, a database schema, a log tail, a record. It is identified by a URI and read on demand. Unlike a tool, nothing *happens* when you read it — which is exactly why the interaction model is **application-driven**: the host decides how to surface resources. Common patterns are a tree or list picker, a search box, an `@`-mention in the chat input, or automatic inclusion by heuristics.
+
+<Mermaid title="Discover, then read" code={resFlow} />
+
+export const resFlow = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: resources/list
+  S-->>C: resources[] (ttlMs, cacheScope)
+  C->>S: resources/templates/list
+  S-->>C: resourceTemplates[]
+  C->>S: resources/read uri=file:///project/src/main.rs
+  S-->>C: contents[] text or blob`;
+
+## The resource object
+
+```json
+{
+  "uri": "file:///project/README.md",
+  "name": "README.md",
+  "title": "Project Documentation",
+  "description": "Top-level project overview",
+  "mimeType": "text/markdown",
+  "size": 4096,
+  "icons": [ { "src": "https://example.com/md.png", "mimeType": "image/png", "sizes": ["48x48"] } ],
+  "annotations": { "audience": ["user"], "priority": 0.8, "lastModified": "2026-09-01T15:00:58Z" }
+}
+```
+
+| Field | Notes |
+|-------|-------|
+| `uri` | Unique identifier; must be a valid RFC 3986 URI |
+| `name` | Short name |
+| `title` | Human-readable display name |
+| `description` | What it contains and why it matters |
+| `mimeType` | Helps the host decide how to render and whether the model can use it |
+| `size` | Bytes, optional — lets hosts budget context before reading |
+| `annotations` | Hints for selection and display (below) |
+
+### Annotations
+
+Resources, templates, and content blocks share one annotation shape:
+
+- **`audience`** — `["user"]`, `["assistant"]`, or both. A raw stack trace might be assistant-only; a rendered summary might be user-only.
+- **`priority`** — 0.0 to 1.0. 1 means effectively required; 0 means entirely optional. Hosts use it to decide what to include when context is tight.
+- **`lastModified`** — ISO 8601 timestamp, for sorting by recency and cache decisions.
+
+## `resources/list` and `resources/read`
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": { "cursor": "optional" } }
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "resources": [ { "uri": "file:///project/src/main.rs", "name": "main.rs", "mimeType": "text/x-rust" } ],
+    "nextCursor": "next-page-cursor",
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+```
+
+Reading returns a `contents` array. Each entry is either **text** or **blob** (base64):
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "contents": [
+      { "uri": "file:///project/src/main.rs", "mimeType": "text/x-rust", "text": "fn main() {}" }
+    ],
+    "ttlMs": 60000,
+    "cacheScope": "private"
+  }
+}
+```
+
+```json
+{ "uri": "file:///logo.png", "mimeType": "image/png", "blob": "iVBORw0KGgo…" }
+```
+
+A single read **MAY** return several contents — reading a directory resource might return every file in it. `resources/read` results also carry `ttlMs` and `cacheScope`; a per-user document is `private`, a public doc can be `public`.
+
+And, like `tools/call` and `prompts/get`, `resources/read` **MAY** return an `InputRequiredResult` when the server needs user input first (for example, to elicit which environment's config to read). See [MRTR](/mcp/en/client-interaction/multi-round-trip-requests/).
+
+## Resource templates
+
+When a server has a *family* of resources — every file in a project, every customer record — it should not list them all. It exposes a **template** with an RFC 6570 URI template and lets the client (or user) fill in the variables:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "resultType": "complete",
+    "resourceTemplates": [
+      {
+        "uriTemplate": "repo://{repo}/readme",
+        "name": "Repository README",
+        "title": "README of one repository",
+        "mimeType": "text/markdown"
+      }
+    ],
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+```
+
+Variables can be auto-completed through `completion/complete`, so a picker can offer valid `repo` values as the user types. That is the same completion API prompts use — see [Prompts](/mcp/en/server-primitives/prompts/).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { McpServer, ResourceTemplate } from '@modelcontextprotocol/server';
+
+    const server = new McpServer({ name: 'repos', version: '1.0.0' });
+
+    // A fixed resource
+    server.registerResource(
+      'guidelines',
+      'docs://guidelines',
+      { title: 'Contribution guidelines', mimeType: 'text/markdown' },
+      async (uri) => ({
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: '# How we work\n…' }],
+      }),
+    );
+
+    // A template with completion for the {repo} variable
+    server.registerResource(
+      'readme',
+      new ResourceTemplate('repo://{repo}/readme', {
+        list: undefined,
+        complete: {
+          repo: async (value) => {
+            const repos = await listRepos();
+            return repos.filter((r) => r.startsWith(value));
+          },
+        },
+      }),
+      { description: 'The README of one repository' },
+      async (uri, { repo }) => ({
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: await readReadme(repo) }],
+      }),
+    );
+    ```
+    `list: undefined` means the template does not enumerate concrete resources in `resources/list`; provide a `list` callback if you want some of them to appear there too.
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+
+    mcp = MCPServer("repos")
+
+
+    @mcp.resource("docs://guidelines", mime_type="text/markdown")
+    def guidelines() -> str:
+        """Contribution guidelines."""
+        return "# How we work\n…"
+
+
+    @mcp.resource("repo://{repo}/readme", mime_type="text/markdown")
+    def readme(repo: str) -> str:
+        """The README of one repository."""
+        return read_readme(repo)
+    ```
+    A URI with `{variables}` registers a template; the function parameters must match the variable names. Returning `str` produces text contents; returning `bytes` produces a base64 `blob`.
+  </TabItem>
+</Tabs>
+
+## URI schemes and what they promise
+
+The scheme is a contract with the client about *how* to get the bytes:
+
+| Scheme | Rule |
+|--------|------|
+| `https://` | Use it **only** when the client can fetch the resource directly from the web on its own, without the MCP server. If your server downloads something and serves it, use another scheme — even if the origin is on the internet |
+| `file://` | Resources that behave like a filesystem. They need not map to a real disk; a database can present tables as files. Non-regular entries may use an XDG MIME type such as `inode/directory` |
+| `git://` | Git version-control integration |
+| custom (`repo://`, `docs://`, `ticket://`) | Allowed and encouraged; must be RFC 3986-valid |
+
+The `https://` rule surprises people. A server that proxies `https://api.example.com/users/42` through authenticated calls should expose it as `users://42` or similar, because a client that sees `https://` may try to GET it directly — and fail, or worse, hit it unauthenticated.
+
+## Errors
+
+- Resource not found → JSON-RPC error `-32602` (Invalid params). Include the URI in `data`.
+- Internal failures → `-32603`.
+- Legacy servers (2025-11-25 and earlier) used `-32002` for not-found. Clients SHOULD still accept it; new servers MUST NOT emit it.
+- A server **MUST NOT** answer a missing resource with an empty `contents` array. Empty is ambiguous — "exists but empty" versus "does not exist" — so always error.
+
+```json
+{ "jsonrpc": "2.0", "id": 5, "error": { "code": -32602, "message": "Resource not found", "data": { "uri": "file:///nonexistent.txt" } } }
+```
+
+## Security
+
+Servers **MUST** validate every URI they receive and **MUST** sanitize paths when serving `file://` resources — `file:///project/../../etc/passwd` is the classic attack. Access controls SHOULD be applied to sensitive resources and checked before every read, binary data MUST be correctly base64-encoded, and, as everywhere in MCP, the list you return MAY depend on the caller's authorization but not on connection history.
+
+<Callout title="The one-line takeaway">
+Resources are URI-addressed context the *application* chooses to attach: list them (or expose templates for families), read them as text or blob, annotate them with audience and priority, pick a scheme that honestly describes how the bytes are obtained, and error with -32602 — never an empty array — when a URI does not exist.
+</Callout>
+
+export const quizResources = [
+  {
+    q: 'When may a server use the https:// scheme for a resource URI?',
+    options: [
+      'Whenever the underlying data lives on a web server',
+      'Only when the client can fetch the resource directly from the web without the MCP server',
+      'Only for binary blobs',
+      'Never — only file:// and custom schemes are allowed',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'A client asks to read a URI that does not exist. What must the server return?',
+    options: [
+      'An empty contents array',
+      'A JSON-RPC error with code -32602',
+      'A text content block saying "not found"',
+      'HTTP 404 with no body',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'What does a resource template provide that a plain resource does not?',
+    options: [
+      'Binary contents',
+      'A parameterized URI family with variables that can be auto-completed',
+      'Automatic subscriptions',
+      'Higher priority in the host UI',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'Which annotation tells a host how important a resource is when context is limited?',
+    options: [
+      'audience',
+      'priority',
+      'lastModified',
+      'mimeType',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/resources" questions={quizResources} />
+
+<ProgressTracker client:visible id="server-primitives/resources" />

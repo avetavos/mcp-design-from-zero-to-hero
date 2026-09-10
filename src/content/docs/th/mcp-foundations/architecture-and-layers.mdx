@@ -1,0 +1,308 @@
+---
+title: 'Architecture: Data Layer and Transport Layer'
+description: 'สอง layer ของ MCP, ลำดับ discover → list → call → notify แบบเต็มพร้อม JSON จริงบน wire และวิธีที่ host รวม tool จากหลาย server ให้เป็น tool list เดียวสำหรับ model'
+sidebar:
+  order: 3
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## สอง layer
+
+MCP ถูกสร้างเป็น **data layer** ชั้นในที่ถูกห่อด้วย **transport layer** ชั้นนอก การแยกสองชั้นนี้ออกจากกันคือสิ่งที่ทำให้ message เดียวกันวิ่งผ่าน pipe ของ subprocess หรือ HTTPS connection ได้โดยไม่เปลี่ยนแปลง
+
+<Mermaid title="data layer เหมือนกันบนทุก transport" code={layersDiagram} />
+
+export const layersDiagram = `flowchart TB
+  subgraph T["Transport layer"]
+    direction LR
+    T1["stdio: newline-delimited JSON over stdin/stdout"]
+    T2["Streamable HTTP: one POST endpoint, JSON or SSE replies, OAuth"]
+  end
+  subgraph D["Data layer (JSON-RPC 2.0)"]
+    direction LR
+    D1["Discovery: server/discover"]
+    D2["Primitives: tools, resources, prompts"]
+    D3["Client features: elicitation"]
+    D4["Utilities: progress, subscriptions, caching, pagination"]
+  end
+  T --> D`;
+
+**Data layer** — exchange protocol ที่อิง JSON-RPC 2.0 มันนิยามรูปร่างและความหมายของทุก message: client ค้นหาว่า server รองรับอะไรได้อย่างไร, primitive สามอย่างฝั่ง server, elicitation และ utility อย่าง progress notification กับ change subscription ทุก implementation ต้องรองรับ base protocol, versioning และ message pattern ส่วนที่เหลือเลือกได้
+
+**Transport layer** — message เหล่านั้นเดินทางจริงอย่างไร **stdio** สำหรับ subprocess ในเครื่อง; **Streamable HTTP** สำหรับ remote server รวมถึง authorization framework ที่สร้างบน OAuth 2.1 transport จัดการเรื่องการสร้าง connection, message framing และ security แต่ไม่เคยเปลี่ยนความหมายของ message
+
+คนเขียน server ส่วนใหญ่ใช้เวลาทั้งหมดอยู่ใน data layer เพราะนั่นคือที่อยู่ของ tools, resources และ prompts ส่วน transport เลือกครั้งเดียวตอน deploy
+
+## ลำดับการแลกเปลี่ยนแบบเต็ม บน wire
+
+นี่คือ interaction ครบชุดระหว่าง client กับ server ตัวเล็ก ๆ ทุก request พก protocol version และ client capability มาใน `_meta` เพื่อให้ server ประมวลผลแต่ละ request แยกกันได้อิสระ — ไม่มี handshake และไม่มี session
+
+### 1. Discovery
+
+client ที่อยากรู้ว่า server รองรับอะไรบ้างก่อนจะทำอย่างอื่น จะส่ง `server/discover` ทุก server ต้อง implement มัน
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "server/discover",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"],
+    "capabilities": {
+      "tools": { "listChanged": true },
+      "resources": {}
+    },
+    "_meta": {
+      "io.modelcontextprotocol/serverInfo": { "name": "example-server", "version": "1.0.0" }
+    },
+    "ttlMs": 3600000,
+    "cacheScope": "public"
+  }
+}
+```
+
+round trip เดียวนี้เกิดสามอย่าง client ประกาศว่าพูด **version** ไหน และ server ตอบรายการ version ที่ยอมรับ แต่ละฝั่งประกาศ **capability** ของตัวเอง — client รับมือ elicitation ได้; server มี tools (และจะแจ้งเตือนเมื่อรายการเปลี่ยน) กับ resources และแต่ละฝั่ง **ระบุตัวตน** ไว้สำหรับ log และ debugging ส่วน `ttlMs` บอกว่า cache คำตอบนี้ได้หนึ่งชั่วโมง
+
+### 2. Tool discovery
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/list",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "resultType": "complete",
+    "tools": [
+      {
+        "name": "weather_current",
+        "title": "Weather Information",
+        "description": "Get current weather information for any location worldwide",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "location": { "type": "string", "description": "City name, address, or coordinates" },
+            "units": { "type": "string", "enum": ["metric", "imperial", "kelvin"], "default": "metric" }
+          },
+          "required": ["location"]
+        }
+      }
+    ],
+    "ttlMs": 300000,
+    "cacheScope": "public"
+  }
+}
+```
+
+tool แต่ละตัวมี `name` (key ที่ใช้เรียก), `title` สำหรับคนอ่าน, `description` ที่ model อ่านเพื่อตัดสินใจว่าจะใช้เมื่อไร และ `inputSchema` (JSON Schema) ที่บอกว่ารับ argument อะไรบ้าง
+
+### 3. Tool execution
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "weather_current",
+    "arguments": { "location": "San Francisco", "units": "imperial" },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "resultType": "complete",
+    "content": [
+      { "type": "text", "text": "Current weather in San Francisco: 68°F, partly cloudy, humidity 65%" }
+    ]
+  }
+}
+```
+
+ผลลัพธ์เป็น array `content` — รายการ block ที่มี type (ในที่นี้คือ text; image, audio และ resource ก็ใช้ได้) — ที่ host ส่งกลับให้ model
+
+### 4. Change notification
+
+notification เป็นแบบ opt-in client ที่อยากรู้เมื่อ tool list เปลี่ยน จะเปิด stream ที่เปิดค้างไว้ยาว ๆ ด้วย `subscriptions/listen` โดยระบุประเภท notification ที่ต้องการ:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 4,
+  "method": "subscriptions/listen",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
+    },
+    "notifications": { "toolsListChanged": true }
+  }
+}
+```
+
+server จะ acknowledge ก่อน โดยตอบกลับเฉพาะ subset ที่มันจะทำให้ จากนั้นค่อยส่ง notification บน stream นั้นเมื่อเกิดเหตุการณ์ ทุก message บน stream พก ID ของ subscription (คือ JSON-RPC `id` ของ request `subscriptions/listen`) ใน `_meta`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/subscriptions/acknowledged",
+  "params": {
+    "_meta": { "io.modelcontextprotocol/subscriptionId": 4 },
+    "notifications": { "toolsListChanged": true }
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/tools/list_changed",
+  "params": { "_meta": { "io.modelcontextprotocol/subscriptionId": 4 } }
+}
+```
+
+notification ไม่มี `id` และไม่คาดหวัง response เมื่อได้รับ client ก็แค่ส่ง `tools/list` อีกครั้ง
+
+<Mermaid title="ลำดับการแลกเปลี่ยนทั้งหมด" code={exchangeDiagram} />
+
+export const exchangeDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: server/discover
+  S-->>C: versions, capabilities, serverInfo
+  C->>S: tools/list
+  S-->>C: tool definitions
+  C->>S: tools/call weather_current
+  S-->>C: content blocks
+  C->>S: subscriptions/listen (toolsListChanged)
+  S-->>C: notifications/subscriptions/acknowledged
+  S-->>C: notifications/tools/list_changed
+  C->>S: tools/list (refresh)`;
+
+## host รวมหลาย server เข้าเป็น model เดียวอย่างไร
+
+host เป็นผู้เล่นเพียงคนเดียวที่เห็นทุกอย่าง หน้าที่ของมันคือแปลง primitive จาก N server ให้เป็นชุด capability ที่กลมกลืนชุดเดียวสำหรับ model แล้ว route การตัดสินใจแต่ละครั้งของ model กลับไปยัง server ที่ถูกต้อง เขียนเป็น pseudo-code ได้แบบนี้:
+
+```python
+# 1. Connect and discover
+for cfg in configured_servers:
+    client = await connect(cfg)            # SDK sends server/discover for you
+    if client.server_capabilities.tools:
+        app.register(client)
+
+# 2. Build one tool list for the model
+available_tools = []
+for client in app.mcp_clients():
+    result = await client.list_tools()
+    for tool in result.tools:
+        # namespace to avoid collisions between servers
+        available_tools.append(rename(tool, f"{client.name}_{tool.name}"))
+conversation.register_available_tools(available_tools)
+
+# 3. Route each model tool call to its server
+async def handle_tool_call(tool_name, arguments):
+    client, original = app.find_client_for(tool_name)
+    result = await client.call_tool(original, arguments)
+    conversation.add_tool_result(result.content)
+```
+
+ใน sketch นั้นซ่อนประเด็นด้านการออกแบบไว้สามข้อ:
+
+- **Namespacing** ชื่อ tool ไม่ซ้ำกันเฉพาะภายใน server เดียว สอง server อาจเปิด `search` ทั้งคู่ host จึงเติม prefix (`github_search`, `docs_search`) เพื่อให้ model แยกออก
+- **มนุษย์อยู่ใน loop** ก่อนที่ขั้นที่ 3 จะรัน tool ที่อ่อนไหว host ที่ดีจะแสดงชื่อ tool กับ argument ให้ผู้ใช้ดูแล้วถามก่อน protocol แนะนำเรื่องนี้อย่างหนักแน่น
+- **ความสดของข้อมูล** host cache `tools/list` ไว้ตาม `ttlMs` ที่ประกาศ แต่จะถือว่า cache นั้นเก่าทันทีที่ได้รับ notification `list_changed`
+
+โมดูล [Building Clients & Hosts](/mcp/th/building-clients/) จะเปลี่ยน sketch นี้ให้เป็นโค้ดที่ทำงานได้จริงกับ Claude API
+
+<Callout title="สรุปหนึ่งบรรทัด">
+MCP คือ data layer แบบ JSON-RPC (discover, list, call, notify) ที่ถูกขนส่งด้วย transport layer ที่สลับกันได้ (stdio หรือ Streamable HTTP); ทุก request อธิบายตัวเองผ่าน `_meta` และหน้าที่ของ host คือรวม tool จากทุก server ให้เป็น list เดียวที่มี namespace สำหรับ model แล้ว route call กลับไป
+</Callout>
+
+export const quizArch = [
+  {
+    q: 'layer ไหนนิยามความหมายของ tools/call?',
+    options: [
+      'transport layer',
+      'data layer',
+      'LLM API',
+      'host UI',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทุก client request ต้องพกอะไรใน _meta?',
+    options: [
+      'session ID',
+      'protocol version และ client capability',
+      'OAuth token',
+      'ชื่อผู้ใช้',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client รับ notifications/tools/list_changed ได้อย่างไร?',
+    options: [
+      'ได้อัตโนมัติทุก connection',
+      'polling tools/list ทุกวินาที',
+      'เปิด stream subscriptions/listen ที่ opt-in toolsListChanged',
+      'ตั้ง listChanged ใน capability ของตัวเอง',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ทำไม host ถึงเติมชื่อ server เป็น prefix ให้ชื่อ tool?',
+    options: [
+      'spec บังคับ',
+      'ชื่อ tool ไม่ซ้ำกันเฉพาะภายใน server เดียว สอง server อาจเปิดชื่อเดียวกันได้',
+      'ทำให้ tool รันเร็วขึ้น',
+      'model อ่านชื่อที่สั้นกว่า 10 ตัวอักษรไม่ได้',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="mcp-foundations/architecture-and-layers" questions={quizArch} />
+
+<ProgressTracker client:visible id="mcp-foundations/architecture-and-layers" />

@@ -1,0 +1,147 @@
+---
+title: 'Security and Authorization'
+description: 'trust boundary ในระบบ MCP, ทำไม stdio กับ HTTP server ถึง authenticate ต่างกัน, บทบาท OAuth 2.1 ของแต่ละฝ่าย และมาตรฐานที่ authorization spec สร้างขึ้นมาจาก'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ห้าฝ่าย สี่เส้นแบ่ง
+
+ระบบ MCP ของจริงไม่เคยเป็นแค่ "client กับ server" request หนึ่งครั้งต้องข้าม trust boundary หลายชั้น และแต่ละชั้นคือจุดที่ credential อาจรั่ว ถูกเอาไปใช้ซ้ำ หรือถูกปลอมได้:
+
+<Mermaid title="trust boundary ที่ tool call ครั้งเดียวต้องข้าม" code={boundariesDiagram} />
+
+export const boundariesDiagram = `flowchart LR
+  U["User"] -->|"อนุมัติ action"| H["Host (AI app)"]
+  H -->|"client หนึ่งตัวต่อหนึ่ง server"| C["MCP Client"]
+  C -->|"MCP ผ่าน stdio หรือ HTTP"| S["MCP Server"]
+  S -->|"credential ของตัวเอง"| T["Third-party API"]
+  A["Authorization Server"] -.->|"ออก token ให้ S"| C`;
+
+| Boundary | สิ่งที่ข้ามไป | คำถามที่ต้องถาม |
+|----------|-----------------|---------------------|
+| User ↔ Host | การยินยอมให้รัน tool, ดู form ของ elicitation, เปิด URL | user รู้ไหมว่า server ไหนกำลังขอ และขออะไร |
+| Host ↔ Client | tool definition และผลลัพธ์ที่จะเข้าไปในโมเดล | description และผลลัพธ์ของ tool ถูกมองเป็น input ที่เชื่อไม่ได้หรือเปล่า |
+| Client ↔ Server | request พร้อม bearer token บน HTTP | token นี้ออกมา *สำหรับ server ตัวนี้* จริงไหม |
+| Server ↔ Third-party API | credential *ของ server เอง* สำหรับ upstream service | server แอบเอา token ของ client ไปใช้แทนของตัวเองหรือเปล่า |
+
+โมดูลนี้ว่าด้วยสาม boundary หลัง ส่วน boundary แรกเป็นเรื่อง UX ที่พูดถึงไปแล้วใน [Server Primitives](/mcp/th/server-primitives/) และ [Client Interaction](/mcp/th/client-interaction/)
+
+## stdio กับ HTTP authenticate ไม่เหมือนกัน
+
+authorization spec ผูกกับ **transport** โดยรวมมันเป็น OPTIONAL และเมื่อ server รองรับ:
+
+- **Streamable HTTP server SHOULD** implement OAuth 2.1 flow ตามที่อธิบายในโมดูลนี้
+- **stdio server SHOULD NOT** implement มัน เพราะ stdio server คือ subprocess ที่ host รันขึ้นมาบนเครื่องของ user เอง มันรับ credential จาก environment (`env` ใน config ของ host, keychain, config file) เหมือน CLI ทั่วไป
+- custom transport MUST ทำตามแนวปฏิบัติด้าน security ที่เป็นมาตรฐานของ protocol นั้น ๆ
+
+เหตุผลตรงไปตรงมา: stdio server ไม่มี network endpoint ให้ต้องป้องกัน และ host ก็ตัดสินใจไว้แล้วว่าเชื่อใจมันพอที่จะรันมัน ส่วน remote HTTP server ใครก็ยิง POST ถึงได้ มันเลยต้องมีวิธีรู้ว่า *ใคร* กำลังถาม และ *ได้รับสิทธิ์อะไร* มาบ้าง
+
+```json
+// config ของ host สำหรับ stdio server: credential มาจาก environment
+{
+  "mcpServers": {
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@example/github-mcp"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    }
+  }
+}
+```
+
+## บทบาทตาม OAuth 2.1
+
+MCP ไม่ได้คิดค้น authentication protocol ใหม่ แค่เอาบทบาทของ OAuth 2.1 มาแปะให้ผู้เล่นที่มีอยู่แล้ว:
+
+| ฝ่ายใน MCP | บทบาท OAuth 2.1 | หน้าที่ |
+|-----------------|----------------|----------------|
+| MCP server (HTTP) | **Resource server** | รับ bearer token, ตรวจสอบ (signature, วันหมดอายุ, *audience*, scope) และตอบ `401`/`403` เมื่อไม่ผ่าน |
+| MCP client | **OAuth client** | ค้นหา authorization server, ลงทะเบียนหรือระบุตัวตน, รัน authorization-code flow พร้อม PKCE แทน user แล้วส่ง token ไปกับทุก request |
+| Authorization server | **Authorization server** | authenticate user, แสดงหน้า consent, ออก access token (และ refresh token ถ้ามี) *สำหรับ resource ที่ระบุ* |
+| User | **Resource owner** | อนุญาตหรือปฏิเสธไม่ให้ client เข้าถึง server |
+
+authorization server จะอยู่ข้าง ๆ MCP server หรือเป็น identity provider แยกต่างหากก็ได้ spec ตั้งใจไม่พูดถึงวิธี implement มันเลย แค่บังคับให้ MCP server *ชี้ไปหามัน* ผ่าน Protected Resource Metadata ซึ่งจะพูดถึงใน[บทถัดไป](/mcp/th/security-and-auth/oauth-flow/)
+
+## สามเรื่องที่ spec เข้มงวดจริง ๆ
+
+OAuth ส่วนใหญ่เป็น "SHOULD" แต่มีสามข้อที่เป็น "MUST" และเป็นข้อที่กัน token ไม่ให้เดินข้าม boundary ไปมั่ว ๆ:
+
+1. **Audience binding** client ขอ token *สำหรับ server ตัวนี้* (พารามิเตอร์ `resource=`) และ server MUST ตรวจว่า token ถูกออกให้ตัวเองจริง token ของ `https://mail.example.com` ใช้กับ `https://mcp.example.com` ไม่ได้ แม้ authorization server ตัวเดียวกันจะเซ็นทั้งคู่ก็ตาม
+2. **ห้าม token passthrough** server MUST NOT รับ token ที่ไม่ได้ออกให้ตัวเอง และ MUST NOT ส่งต่อ token ของ client ไปยัง downstream API ใด ๆ การเรียก upstream ต้องใช้ credential ของ server เอง
+3. **Bearer header เท่านั้น** token เดินทางใน `Authorization: Bearer …` กับทุก request ห้ามใส่ใน query string ของ URL เพราะมันจะไปโผล่ใน log และ browser history
+
+ทุกอย่างที่เหลือในโมดูลนี้ต่อยอดจากสามข้อนี้
+
+## มาตรฐานที่คุณจะได้เจอ
+
+authorization spec ของ MCP ประกอบขึ้นจาก *ส่วนย่อย* ของงาน IETF และ OpenID ที่มีอยู่แล้ว ไม่ได้นิยาม crypto ใหม่ คุณไม่ต้องอ่านทั้งหมด แต่ควรจำชื่อได้:
+
+| มาตรฐาน | MCP ใช้ทำอะไร |
+|----------|----------------------|
+| OAuth 2.1 (draft-ietf-oauth-v2-1) | flow พื้นฐาน: authorization code + PKCE ไม่มี implicit grant |
+| RFC 6750 | การใช้ bearer token และรูปแบบ challenge ใน `WWW-Authenticate` |
+| RFC 9728 | Protected Resource Metadata: วิธีที่ server ประกาศว่า authorization server ของตัวเองอยู่ที่ไหน |
+| RFC 8414 | การค้นหา Authorization Server Metadata (`/.well-known/oauth-authorization-server`) |
+| OpenID Connect Discovery 1.0 | discovery document อีกแบบ (`/.well-known/openid-configuration`) |
+| RFC 8707 | Resource indicator: พารามิเตอร์ `resource=` ที่ผูก token เข้ากับ server หนึ่งตัว |
+| RFC 9207 | พารามิเตอร์ `iss` ตอน redirect ที่ใช้กัน mix-up attack |
+| Client ID Metadata Documents (draft) | ใช้ HTTPS URL เป็น client identifier แทน dynamic registration |
+| RFC 7591 | Dynamic Client Registration ซึ่งตอนนี้ deprecated แล้ว แต่ยังเก็บไว้เพื่อ compatibility |
+
+## โมดูลนี้ครอบคลุมอะไรบ้าง
+
+| บทเรียน | คุณจะได้เรียนรู้ |
+|--------|----------------|
+| [The Authorization Flow](/mcp/th/security-and-auth/oauth-flow/) | ลำดับเต็ม ๆ ตั้งแต่ `401` จนได้ bearer token ที่ใช้งานได้ พร้อม header และ document ตัวจริง |
+| [Client Registration](/mcp/th/security-and-auth/client-registration/) | pre-registration, Client ID Metadata Documents และทำไม dynamic registration ถึงถูก deprecate |
+| [Protecting Your Server](/mcp/th/security-and-auth/protecting-your-server/) | ตรวจ token ใน SDK ของ TypeScript และ Python, scope และ step-up challenge |
+| [Threats and Mitigations](/mcp/th/security-and-auth/threats-and-mitigations/) | token passthrough, confused deputy, SSRF, handle hijacking, prompt injection และวิธีหยุดแต่ละอย่าง |
+| [Third-Party Authorization](/mcp/th/security-and-auth/third-party-auth-and-url-elicitation/) | เมื่อ server ของคุณต้องมีสิทธิ์เข้าถึง API อื่น *ด้วยตัวเอง* และ URL elicitation ช่วยให้มันปลอดภัยได้อย่างไร |
+
+<Callout title="สรุปหนึ่งบรรทัด">
+MCP หยิบ OAuth 2.1 มาใช้ทั้งก้อน: HTTP server เป็น resource server, client เป็น OAuth client และสามข้อที่ต่อรองไม่ได้คือ token ต้องผูกกับ audience, ห้าม passthrough และใช้ bearer header เท่านั้น ส่วน stdio server ข้ามทั้งหมดนี้ไปแล้วอ่าน credential จาก environment แทน
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'authorization spec ของ MCP เขียนขึ้นสำหรับ transport แบบไหน?',
+    options: [
+      'stdio เท่านั้น',
+      'transport แบบ HTTP ส่วน stdio server รับ credential จาก environment แทน',
+      'ทั้งสองแบบเท่า ๆ กัน',
+      'ไม่ใช่ทั้งคู่ มันเป็น protocol แยกต่างหาก',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ในแง่ OAuth 2.1 HTTP MCP server เล่นบทบาทอะไร?',
+    options: [
+      'Authorization server',
+      'OAuth client',
+      'Resource server',
+      'Resource owner',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'server ได้รับ token ที่ถูกต้องและยังไม่หมดอายุ แต่ถูกออกให้ service อื่นโดย authorization server ตัวเดียวกัน server ต้องทำอย่างไร?',
+    options: [
+      'รับไว้ เพราะ signature ถูกต้อง',
+      'ส่งต่อไป upstream ให้ service อีกตัวตรวจสอบเอง',
+      'ปฏิเสธ เพราะ token ต้องผูก audience กับ server ตัวนี้เท่านั้น',
+      'รับเฉพาะกับ tool ที่อ่านอย่างเดียว',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="security-and-auth/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="security-and-auth/index" />

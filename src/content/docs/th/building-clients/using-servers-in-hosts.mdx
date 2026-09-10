@@ -1,0 +1,242 @@
+---
+title: 'Using Servers in Real Hosts'
+description: 'เสียบ MCP server เข้ากับ Claude Code, Claude Desktop และ MCP connector ของ Claude API และใช้ Inspector เป็น host ชั่วคราวระหว่างพัฒนา'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## ส่วนใหญ่คุณไม่ได้เขียน host เอง
+
+server ส่วนใหญ่ถูกใช้จาก host ที่คนอื่นสร้างไว้ การรู้ว่า host เหล่านั้น config ยังไงจะบอกคุณว่า server ของคุณต้องหน้าตาเป็นอย่างไรเมื่อมองจากข้างนอก: คำสั่งอะไรใช้เปิดมัน, มันอยู่ที่ URL ไหน, อ่าน environment variable ตัวไหน และผู้ใช้ authorize มันอย่างไร
+
+<Mermaid title="สี่ host หนึ่ง server" code={hostsDiagram} />
+
+export const hostsDiagram = `flowchart LR
+  cc["Claude Code"]
+  cd["Claude Desktop"]
+  api["Claude API MCP connector"]
+  insp["MCP Inspector"]
+  s["Your MCP server"]
+  cc --> s
+  cd --> s
+  api --> s
+  insp --> s`;
+
+## Claude Code
+
+Claude Code เพิ่ม server ด้วย `claude mcp add` flag transport เป็นตัวเลือกว่าจะเชื่อมต่อแบบไหน
+
+```bash
+# remote server ผ่าน Streamable HTTP
+claude mcp add --transport http notion https://mcp.notion.com/mcp
+
+# remote server พร้อม bearer token แบบตายตัว
+claude mcp add --transport http secure-api https://api.example.com/mcp \
+  --header "Authorization: Bearer your-token"
+
+# local server ผ่าน stdio — ทุกอย่างหลัง -- คือคำสั่งเปิด server
+claude mcp add --transport stdio airtable --env AIRTABLE_API_KEY=YOUR_KEY \
+  -- npx -y airtable-mcp-server
+```
+
+ตัวคั่น `--` ไม่ใช่ของเลือกใส่สำหรับ stdio server: มันบอก CLI ว่า option ของตัวเองจบตรงไหนและคำสั่งของ server เริ่มตรงไหน
+
+### scope
+
+| Scope | เก็บที่ไหน | แชร์ไหม? | ใช้กับ |
+|-------|--------------------|---------|---------|
+| `local` (ค่าเริ่มต้น) | `~/.claude.json` แยกต่อ project | ไม่ | การทดลองส่วนตัว |
+| `project` | `.mcp.json` ที่ root ของ repo | แชร์ผ่าน git | server ที่ใช้ทั้งทีม |
+| `user` | `~/.claude.json` | ไม่ | tool ที่อยากมีในทุก project |
+
+```bash
+claude mcp add --transport http stripe --scope project https://mcp.stripe.com
+claude mcp add --transport stdio db --scope user -- npx -y @bytebase/dbhub
+```
+
+### ไฟล์ของ project
+
+server ที่ scope เป็น project ก็แค่ entry หนึ่งใน `.mcp.json` commit มันเข้าไปเพื่อให้เพื่อนร่วมทีมได้ server ชุดเดียวกัน ค่าต่าง ๆ รองรับการขยาย `${VAR}` และ `${VAR:-default}` ใน `command`, `args`, `env` และ `headers` ทำให้ secret ไม่ต้องอยู่ใน repo
+
+```json
+{
+  "mcpServers": {
+    "shared-server": {
+      "type": "http",
+      "url": "https://example.com/mcp"
+    },
+    "local-db": {
+      "type": "stdio",
+      "command": "/path/to/server",
+      "args": ["--config", "${CLAUDE_PROJECT_DIR}/config.json"],
+      "env": {
+        "DB_URL": "${DB_URL:-postgresql://localhost}"
+      },
+      "timeout": 600000
+    }
+  }
+}
+```
+
+### authorization และงานดูแลทั่วไป
+
+remote server ที่ต้องใช้ OAuth จะถูก authorize แบบ interactive: รัน `/mcp` ใน session แล้วทำตาม flow ใน browser หรือใช้ `claude mcp login <name>` จาก shell ส่วน client credential ที่ลงทะเบียนไว้ล่วงหน้าใส่ได้ด้วย `--client-id` และ `--client-secret` (อ่านจาก `MCP_CLIENT_SECRET` ใน CI)
+
+```bash
+claude mcp list            # server ที่ config ไว้ทั้งหมดพร้อมสถานะ
+claude mcp get notion      # รายละเอียดของ server ตัวเดียว
+claude mcp remove notion   # ถอดออก
+```
+
+ปุ่มปรับที่มีประโยชน์: `MCP_TIMEOUT=10000 claude` จำกัดเวลา startup ของ server เป็นมิลลิวินาที, `timeout` ต่อ server ใน `.mcp.json` จำกัดเวลารัน tool, `MAX_MCP_OUTPUT_TOKENS` จำกัดปริมาณ output ของ tool ที่ส่งให้ model ภายใน Claude Code tool ของคุณจะปรากฏเป็น `mcp__<server>__<tool>` ซึ่งเป็นแนวคิด namespace เดียวกับ[บทก่อนหน้า](/mcp/th/building-clients/wiring-tools-to-an-llm/) และเป็นชื่อที่คุณใช้ใน permission rule กับ hook
+
+## Claude Desktop
+
+Claude Desktop อ่าน `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`, Windows: `%APPDATA%\Claude\`) รูปแบบคือ map `mcpServers` แบบเดียวกัน
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/Desktop"]
+    }
+  }
+}
+```
+
+restart แอปหลังแก้ไข เพราะ Desktop เป็นคนเปิด stdio server เอง `command` จึงต้องอยู่ใน `PATH` ของแอป ปัญหาที่เจอบ่อยคือ server ที่รันได้ใน shell ของคุณแต่รันจากแอปไม่ได้ เพราะ `node` อยู่ในไดเรกทอรีของ version manager
+
+## MCP connector ของ Claude API
+
+ถ้าคุณเรียก Messages API โดยตรง คุณให้ Anthropic เป็นคนเชื่อมต่อ MCP ฝั่ง server แทนที่จะรัน client เองได้ request ต้องมีสองส่วน **คู่กัน**: `mcp_servers` ประกาศการเชื่อมต่อ และ entry `mcp_toolset` ใน `tools` เปิดมันให้ model เห็น ขาดส่วนใดส่วนหนึ่งจะเป็น validation error และทุก server ต้องถูกอ้างถึงโดย toolset เพียงหนึ่งตัวเท่านั้น
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import Anthropic from '@anthropic-ai/sdk';
+
+    const anthropic = new Anthropic();
+
+    const response = await anthropic.beta.messages.create({
+      model: 'claude-opus-5',
+      max_tokens: 16000,
+      betas: ['mcp-client-2025-11-20'],
+      mcp_servers: [
+        { type: 'url', url: 'https://mcp.example.com/mcp', name: 'example-mcp', authorization_token: process.env.EXAMPLE_TOKEN },
+      ],
+      tools: [
+        {
+          type: 'mcp_toolset',
+          mcp_server_name: 'example-mcp',
+          default_config: { enabled: false },          // โหมด allowlist
+          configs: { get_weather: { enabled: true } }, // เปิดเฉพาะ tool นี้
+        },
+      ],
+      messages: [{ role: 'user', content: 'What is the weather in Bangkok?' }],
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+    import anthropic
+
+    client = anthropic.Anthropic()
+
+    response = client.beta.messages.create(
+        model="claude-opus-5",
+        max_tokens=16000,
+        betas=["mcp-client-2025-11-20"],
+        mcp_servers=[
+            {"type": "url", "url": "https://mcp.example.com/mcp",
+             "name": "example-mcp", "authorization_token": os.environ.get("EXAMPLE_TOKEN")},
+        ],
+        tools=[
+            {"type": "mcp_toolset", "mcp_server_name": "example-mcp",
+             "default_config": {"enabled": False},
+             "configs": {"get_weather": {"enabled": True}}},
+        ],
+        messages=[{"role": "user", "content": "What is the weather in Bangkok?"}],
+    )
+    ```
+  </TabItem>
+</Tabs>
+
+connector เข้าถึงได้เฉพาะ server ที่ route ได้แบบสาธารณะผ่าน HTTPS และ loop รันอยู่ฝั่ง Anthropic คุณได้ message สุดท้าย ไม่ได้ hook ต่อ call ใช้มันเมื่ออยากเขียนโค้ดน้อยที่สุด และรัน client ของคุณเองเมื่อต้องการ consent prompt, local stdio server หรือ routing แบบกำหนดเอง
+
+## Inspector ในฐานะ host
+
+ระหว่างพัฒนา MCP Inspector คือ host ที่เร็วที่สุดที่จะชี้ไปที่ server ของคุณ มันรัน server ให้, แสดง tool, resource และ prompt ทุกตัว และ log traffic ดิบของ protocol
+
+```bash
+# Web UI กับ local stdio server
+npx @modelcontextprotocol/inspector node build/index.js
+
+# Web UI กับ remote server
+npx @modelcontextprotocol/inspector --server-url https://api.example.com/mcp --transport http
+
+# โหมด CLI สำหรับ script และ CI
+npx @modelcontextprotocol/inspector --cli node build/index.js --method tools/list
+```
+
+มัน negotiate ได้ทั้งสองยุคของ protocol จึงเป็นวิธีตรวจด้วยว่า client ที่รองรับแค่ยุคเก่ายังใช้ server ของคุณได้ไหม [บทเรื่องการทดสอบ](/mcp/th/production-and-ecosystem/testing-and-debugging/)ลงลึกกว่านี้
+
+## ข้อคิดสำหรับคนเขียน server
+
+- **เผยแพร่คำสั่งเปิด server** host ต้องการคำสั่งบรรทัดเดียว `npx -y your-package` หรือ `uvx your-package` คือธรรมเนียม
+- **อ่าน secret จาก environment** บน stdio อย่าขอมันเป็น argument ของ tool
+- **เปิด HTTPS URL ที่คงที่** สำหรับการใช้แบบ remote และ implement ฝั่ง OAuth resource server เพื่อให้ `/mcp` ใน Claude Code authorize มันได้
+- **ทำชื่อ tool ให้ปลอดภัยสำหรับ header และไม่ซ้ำ** เพราะ host จะใส่ prefix และอาจ mirror มันลงใน HTTP header
+
+<Callout title="สรุปหนึ่งบรรทัด">
+Claude Code และ Claude Desktop เปิดหรือเชื่อมต่อ server ของคุณจาก config `mcpServers` เล็ก ๆ, connector ของ Claude API ต้องมี `mcp_servers` บวกกับ `mcp_toolset` ที่จับคู่กัน และ Inspector คือ host ชั่วคราวที่คุณใช้ระหว่างสร้าง ออกแบบ server ให้ทุก host เหล่านี้เข้าถึงได้ด้วยบรรทัดเดียว
+</Callout>
+
+export const quizHosts = [
+  {
+    q: 'ใน "claude mcp add --transport stdio db -- npx -y @bytebase/dbhub" ตัว -- ทำหน้าที่อะไร?',
+    options: [
+      'ทำเครื่องหมายว่า server เป็น read-only',
+      'คั่น option ของ Claude Code ออกจากคำสั่งที่ใช้เปิด server',
+      'เปิด debug logging',
+      'ตั้ง scope เป็น project',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'scope ใดเก็บ server ใน .mcp.json เพื่อให้ commit และแชร์กับทีมได้?',
+    options: ['local', 'user', 'project', 'global'],
+    answer: 2,
+  },
+  {
+    q: 'จะเกิดอะไรขึ้นถ้าส่ง mcp_servers ให้ Claude API โดยไม่มี mcp_toolset ที่จับคู่กันใน tools?',
+    options: [
+      'server ถูกเชื่อมต่อแต่ซ่อนจาก model',
+      'request ถูกปฏิเสธเป็น validation error',
+      'tool ทุกตัวถูกเปิดโดยค่าเริ่มต้น',
+      'beta header ถูกละเลย',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'รูปแบบ default_config: { enabled: false } ใน mcp_toolset มีไว้เพื่ออะไร?',
+    options: [
+      'ปิด server ทั้งตัว',
+      'โหมด allowlist: ซ่อน tool ทุกตัวแล้วเปิดใหม่เฉพาะที่ระบุใน configs',
+      'ปิด OAuth',
+      'ทำให้ tool เป็น read-only',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="building-clients/using-servers-in-hosts" questions={quizHosts} />
+
+<ProgressTracker client:visible id="building-clients/using-servers-in-hosts" />

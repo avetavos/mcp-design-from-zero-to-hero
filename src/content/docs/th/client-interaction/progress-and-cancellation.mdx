@@ -1,0 +1,219 @@
+---
+title: 'Progress, Cancellation, and Timeouts'
+description: 'ทำให้ call ที่ยาวยังมีชีวิตและหยุดได้ — progressToken กับ notifications/progress, cancellation ต่างกันอย่างไรระหว่าง stdio กับ Streamable HTTP และ client ควรตั้ง timeout อย่างไร'
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## request เดียว กับความอดทนนิดหน่อย
+
+tool call ไม่ได้เสร็จทันทีทุกอัน import catalog, รัน test suite, render รายงาน — พวกนี้ใช้เวลาหลายวินาทีถึงหลายนาที และระหว่างนั้นมีสองอย่างที่ผิดพลาดได้: client ยอมแพ้ (timeout) หรือผู้ใช้เปลี่ยนใจแต่ไม่มีใครบอก server progress notification แก้อย่างแรก cancellation แก้อย่างหลัง
+
+ทั้งสองอย่างยังอยู่ *ภายใน* request เดียว ถ้างานจะอยู่นานกว่า request ที่สมเหตุสมผล — หลายนาทีถึงหลายชั่วโมง หรือต้องรอดจากการหลุด connection — ให้ไปใช้ [Tasks extension](/mcp/th/client-interaction/tasks-extension/) แทน
+
+## Progress
+
+### opt-in ด้วย progressToken
+
+progress เริ่มจากฝั่ง client: client ที่ *อยาก* ได้ update จะใส่ `progressToken` ไว้ใน `_meta` ของ request token เป็น string หรือ integer ที่ client เลือกเอง และต้องไม่ซ้ำกันในบรรดา request ที่ยัง active ของ client นั้น
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "method": "tools/call",
+  "params": {
+    "name": "import_catalog",
+    "arguments": { "urls": ["https://a.example/1.csv", "https://a.example/2.csv"] },
+    "_meta": {
+      "progressToken": "imp-7",
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  }
+}
+```
+
+ไม่มี token ก็ไม่มี progress — server ต้องส่ง progress เฉพาะกับ token ที่ได้รับมาจริงบน request ที่ยังค้างอยู่
+
+### ตัว notification
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/progress",
+  "params": {
+    "progressToken": "imp-7",
+    "progress": 1,
+    "total": 2,
+    "message": "Imported https://a.example/1.csv"
+  }
+}
+```
+
+กฎที่สำคัญ:
+
+- `progress` **ต้องเพิ่มขึ้น** ทุก notification แม้จะไม่รู้ `total`
+- `total` และ `message` เป็น optional ทั้งสองค่าเป็นทศนิยมได้
+- server **จะ** ไม่ส่งเลย หรือส่งกี่ครั้งก็ได้ แต่ **ควร** rate-limit ไม่ใช่ถล่มส่ง
+- notification **ต้องหยุด** ทันทีที่ request เสร็จ
+
+<Mermaid title="progress วิ่งไปกับ request ที่มันสังกัด" code={progressDiagram} />
+
+export const progressDiagram = `sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: tools/call พร้อม progressToken
+  S-->>C: notifications/progress 1 of 3
+  S-->>C: notifications/progress 2 of 3
+  S-->>C: notifications/progress 3 of 3
+  S-->>C: result
+  Note over C,S: หลัง result แล้วไม่มี progress อีก`;
+
+### มันเดินทางผ่านไหน
+
+- **Streamable HTTP**: server ตอบ POST ด้วย SSE stream ที่ผูกกับ request นั้น progress event มาบน stream นี้ ตามด้วย JSON-RPC response สุดท้ายซึ่งปิด stream progress ไม่มีทางโผล่บน stream ของ `subscriptions/listen`
+- **stdio**: ทุกอย่างใช้ stdout channel เดียวร่วมกัน client จับคู่ notification กับ request ด้วย `progressToken`
+
+### ในโค้ด
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    server.registerTool(
+      'import_catalog',
+      { description: 'Import catalog files', inputSchema: z.object({ urls: z.array(z.string()) }) },
+      async ({ urls }, ctx) => {
+        const progressToken = ctx.mcpReq._meta?.progressToken;
+        for (let i = 0; i < urls.length; i++) {
+          await importOne(urls[i]);
+          if (progressToken !== undefined) {
+            await ctx.mcpReq.notify({
+              method: 'notifications/progress',
+              params: { progressToken, progress: i + 1, total: urls.length, message: `Imported ${urls[i]}` },
+            });
+          }
+        }
+        return { content: [{ type: 'text', text: `Imported ${urls.length} files` }] };
+      }
+    );
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver import Context
+
+    mcp = MCPServer("catalog")
+
+
+    @mcp.tool()
+    async def import_catalog(urls: list[str], ctx: Context) -> str:
+        """Import book records from a list of catalog URLs."""
+        for done, url in enumerate(urls, start=1):
+            await import_one(url)
+            # ไม่ทำอะไรถ้า client ไม่ได้ส่ง progressToken มา
+            await ctx.report_progress(done, total=len(urls), message=f"Imported {url}")
+        return f"Imported {len(urls)} records."
+    ```
+  </TabItem>
+</Tabs>
+
+## Cancellation
+
+client ทิ้ง request ที่ไม่สนใจแล้วได้ *วิธี* ขึ้นกับ transport เพราะ transport สองแบบมองว่า "request หนึ่งอัน" ในทางกายภาพคืออะไรไม่เหมือนกัน
+
+| Transport | client cancel อย่างไร | ทำไม |
+|-----------|------------------------|-----|
+| stdio | ส่ง `notifications/cancelled` พร้อม `requestId` ของ request นั้น (และ `reason` ถ้าต้องการ) | channel เดียวใช้ร่วมกัน — ไม่มี stream ต่อ request ให้ปิด |
+| Streamable HTTP | **ปิด SSE response stream** ของ request นั้น | แต่ละ request มี stream ของตัวเอง การตัด connection จึงชัดเจนในตัว ไม่ต้องส่ง `notifications/cancelled` |
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/cancelled",
+  "params": { "requestId": 7, "reason": "user pressed stop" }
+}
+```
+
+ไม่ว่า transport ไหน server **ควร** หยุดงานเร็วที่สุดเท่าที่ทำได้ และ **ต้องไม่** ส่ง message ใด ๆ ของ request นั้นอีก — ไม่มี progress ที่มาช้า ไม่มี result ส่วน client ก็ควรเมินอะไรก็ตามที่มาถึงหลังจาก cancel ไปแล้ว race มันเกิดขึ้นได้
+
+กฎขอบ ๆ ที่ควรรู้:
+
+- stream ของ `subscriptions/listen` ถูก cancel แบบเดียวกัน — ปิด stream บน HTTP หรือส่ง `notifications/cancelled` ด้วย id ของ listen request บน stdio
+- cancellation เป็น best-effort และต้องร่วมมือกัน tool ที่ทำ side effect ที่ย้อนกลับไม่ได้ไปครึ่งทางอาจทำจนจบ ออกแบบ tool ให้สิ่งที่เกิดขึ้นไปแล้วมองเห็นได้ (return handle, ทำให้การเขียน idempotent)
+- หมายเหตุยุคเก่า: บน stdio `notifications/cancelled` เป็น notification จาก client ไป server *ตัวเดียว* ที่เหลืออยู่ใน core protocol 2026-07-28
+
+## Timeouts
+
+MCP ไม่ได้บังคับ timeout ปล่อยให้ client กำหนดนโยบายเอง และนั่นคือการตัดสินใจออกแบบที่คุณจะต้องทำใน host ทุกตัวที่สร้าง มีสองตัวเลือกที่สมเหตุสมผล:
+
+1. **deadline คงที่** — ง่ายที่สุด ทุก request ได้ เช่น 60 วินาที ถ้าหมดก็ cancel คาดเดาได้ แต่ฆ่า tool ที่ใช้เวลานานโดยชอบธรรม
+2. **deadline ที่ reset ตาม progress** — timer เริ่มนับใหม่ทุกครั้งที่ `notifications/progress` มาถึง โดยมีเพดานสูงสุดเพื่อไม่ให้ server ที่พูดมากแต่ค้างรันไปตลอดกาล นี่คือ pattern ที่ host ส่วนใหญ่ลงเอยด้วย: server ที่เงียบถือว่าตายแล้ว server ที่ยังพูดอยู่ได้รับความอดทน แต่มีลิมิต
+
+server ควรสมมติว่าตัวเลือก 2 มีอยู่ และส่ง progress กับอะไรก็ตามที่ช้ากว่าสองสามวินาที — มันคือความต่างระหว่าง "กำลัง import 4,000 แถวอยู่" กับ "request timed out"
+
+เมื่อ timeout ทำงาน client ควร cancel จริง ๆ (ปิด stream หรือส่ง `notifications/cancelled`) ไม่ใช่แค่หยุดฟัง เพื่อให้ server คืน resource ได้
+
+## ข้อคิดด้านการออกแบบ
+
+- **progress มีไว้ให้ผู้ใช้ ไม่ใช่ model** ใส่ข้อความที่คนอ่านรู้เรื่องใน `message` อย่าเข้ารหัสข้อมูลที่ LLM ควรเอาไปทำอะไรต่อ
+- **ห้าม block เพราะ progress** การส่ง notification ต้องไม่ทำให้งานชะงัก มองมันเป็น fire-and-forget
+- **tool ที่ยาวแต่ไม่มี progress คือ bug** ใน production ถ้างานรายงาน progress ไม่ได้ มันน่าจะเหมาะกับ Tasks extension มากกว่า
+
+<Callout title="สรุปหนึ่งบรรทัด">
+client opt-in progress ด้วย `progressToken` server ตอบด้วย `notifications/progress` ที่เพิ่มขึ้นเสมอบน stream ของ request นั้นเองและหยุดเมื่อเสร็จ cancellation คือ `notifications/cancelled` บน stdio และแค่ปิด SSE stream บน HTTP — และ client ที่ดี reset timeout ตาม progress แต่ไม่รอตลอดกาล
+</Callout>
+
+export const quizProgress = [
+  {
+    q: 'server ส่ง notifications/progress ได้เมื่อไร?',
+    options: [
+      'เมื่อไรก็ได้ กับ request ใดก็ได้',
+      'เฉพาะกับ request ที่มี progressToken ใน _meta และยังค้างอยู่เท่านั้น',
+      'เฉพาะบน stdio',
+      'หลังจากส่ง result ไปแล้วเท่านั้น',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'client แบบ Streamable HTTP cancel tools/call ที่กำลังรันอยู่อย่างไร?',
+    options: [
+      'ส่ง notifications/cancelled ใน POST ใหม่',
+      'ส่ง HTTP DELETE ไปที่ MCP endpoint',
+      'ปิด SSE response stream ของ request นั้น',
+      'เรียก tasks/cancel',
+    ],
+    answer: 2,
+  },
+  {
+    q: 'ข้อความไหนเกี่ยวกับค่า progress ที่ถูกต้อง?',
+    options: [
+      'ต้องเพิ่มขึ้นทุก notification แม้จะไม่รู้ total',
+      'ต้องเป็นเปอร์เซ็นต์แบบ integer',
+      'ถอยหลังได้เพื่อบอกว่ามีการ retry',
+      'ใช้ได้เฉพาะเมื่อมี total',
+    ],
+    answer: 0,
+  },
+  {
+    q: 'หลังได้รับ cancellation server ต้องไม่ทำอะไร?',
+    options: [
+      'คืน resource',
+      'หยุดงาน',
+      'ส่ง message ใด ๆ ของ request นั้นอีก',
+      'log การ cancel ลง stderr',
+    ],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="client-interaction/progress-and-cancellation" questions={quizProgress} />
+
+<ProgressTracker client:visible id="client-interaction/progress-and-cancellation" />

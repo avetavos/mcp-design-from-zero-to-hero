@@ -1,0 +1,163 @@
+---
+title: 'Backward Compatibility and Protocol Eras'
+description: 'MCP ยุค modern (2026-07-28) กับ legacy (2025-11-25 และก่อนหน้า): อะไรเปลี่ยนไป, client ตรวจจับได้อย่างไรว่า server พูดยุคไหนบน stdio และ HTTP, ตาราง compatibility ฉบับเต็ม และวิธีรัน server แบบ dual-era'
+sidebar:
+  order: 5
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## สองยุค
+
+revision 2026-07-28 ทำให้ MCP เป็น stateless และนั่นแบ่งประวัติของ protocol ออกเป็นสองยุค คำที่ spec ใช้เอง:
+
+- **Modern** — version ที่ส่ง protocol version, ตัวตน และ capability เป็น metadata ต่อ request: `2026-07-28` และหลังจากนั้น
+- **Legacy** — version ที่สร้าง session ด้วย handshake `initialize`: `2025-11-25` และก่อนหน้า
+- **Dual-era** — implementation ที่รองรับทั้งคู่
+
+server ส่วนใหญ่ที่ deploy อยู่ทุกวันนี้ยังเป็น legacy ดังนั้น client ที่พูดได้แค่ modern จะใช้มันไม่ได้ และ legacy client ก็ใช้ server ที่เป็น modern อย่างเดียวไม่ได้ การรู้วิธีตรวจจับและเชื่อมสองยุคจึงเป็นทักษะที่ใช้จริง ไม่ใช่เกร็ดความรู้
+
+## ยุค legacy หน้าตาเป็นอย่างไร
+
+| Legacy (2025-11-25 และก่อนหน้า) | Modern (2026-07-28) |
+|---------------------------------|---------------------|
+| request `initialize` แล้วตามด้วย `notifications/initialized`; negotiate version และ capability ครั้งเดียว | version และ capability อยู่ใน `_meta` ทุก request; `server/discover` เป็น optional |
+| header `Mcp-Session-Id` ที่ server ออกให้ จบด้วย HTTP `DELETE` | ไม่มี session ระดับ protocol; ใช้ handle ที่ชัดเจนใน argument ของ tool |
+| HTTP `GET` เปิด SSE stream แยกสำหรับ message ที่ server เป็นฝ่ายเริ่ม | ไม่มี GET; POST `subscriptions/listen` return stream ที่เปิดค้างยาว |
+| server ส่ง `sampling/createMessage`, `elicitation/create`, `roots/list` เป็น request บน SSE ได้ | server ฝังมันไว้ใน `InputRequiredResult` (MRTR) |
+| SSE resume ได้ด้วย `Last-Event-ID` | resume ไม่ได้; ส่ง request ใหม่ |
+| `resources/subscribe` / `unsubscribe`, `ping`, `logging/setLevel`, `notifications/roots/list_changed` | ถูกถอดออก; ใช้ filter `resourceSubscriptions` และ `logLevel` ต่อ request ใน `_meta` |
+| result ไม่มี `resultType` | ทุก result มี `resultType`; client ถือว่าตัวที่ไม่มีเป็น `"complete"` |
+
+ก่อนหน้านั้น 2024-11-05 ใช้ transport แยกชื่อ **HTTP+SSE** (GET stream ที่ประกาศ POST endpoint ผ่าน event `endpoint`) มันถูก deprecate ตั้งแต่ 2025-03-26 และเป็น Deprecated อย่างเป็นทางการภายใต้ feature lifecycle policy — อย่านำมาใช้
+
+## ตรวจจับยุคบน stdio
+
+ไม่มี HTTP status code ให้อิง dual-era client จึง probe ด้วย `server/discover` โดยใส่ version ยุคใหม่ที่ต้องการใน `_meta`
+
+<Mermaid title="probe ตรวจยุคบน stdio" code={probeDiagram} />
+
+export const probeDiagram = `sequenceDiagram
+  participant C as Dual-era client
+  participant S as Server
+  C->>S: server/discover (protocolVersion 2026-07-28)
+  alt DiscoverResult
+    S-->>C: supportedVersions, capabilities
+    Note over C: Modern เลือก version ที่รองรับ อยู่ในโหมด modern ต่อ
+  else Recognized modern error (e.g. -32022)
+    S-->>C: UnsupportedProtocolVersionError พร้อมรายการ supported
+    Note over C: Modern retry ด้วย version ในรายการ ห้าม fall back
+  else Other error or timeout
+    S-->>C: -32601 / -32602 / เงียบ
+    Note over C: Legacy ส่ง initialize แล้วทำต่อในโหมด legacy
+  end`;
+
+การ fallback **ต้องไม่** ผูกกับ code ตัวใดตัวหนึ่ง legacy server ตอบ request ที่ไม่รู้จักก่อน `initialize` ด้วย error แบบ implementation-defined — มักเป็น `-32601` หรือ `-32602` — หรือไม่ตอบเลย แนะนำให้ probe แม้กับ client ที่เป็น modern อย่างเดียว: legacy server บางตัวไม่ตรวจว่า request มาหลัง `initialize` หรือไม่ และจะประมวลผล `tools/call` ที่คลุมเครือระหว่างยุคด้วย semantics แบบ legacy การ probe เปลี่ยนเรื่องนั้นให้เป็นความล้มเหลวที่คาดเดาได้ซึ่งคุณรายงานให้ผู้ใช้ทราบได้
+
+## ตรวจจับยุคบน HTTP
+
+บน Streamable HTTP client แค่ลองส่ง request แบบ modern ก่อน legacy server ไม่รู้ว่าจะทำอะไรกับมันและมักตอบ `400 Bad Request` — แต่ server แบบ modern ก็ตอบ 400 เหมือนกันสำหรับ `UnsupportedProtocolVersionError`, `MissingRequiredClientCapabilityError` และความล้มเหลวจากการ validate header ดังนั้นเมื่อได้ `400` client **ควร** ตรวจ body ก่อนตัดสินใจ:
+
+- body มี **modern JSON-RPC error ที่รู้จัก** → server เป็น modern retry ด้วย version ที่ประกาศไว้หรือแก้ request ห้าม fall back
+- body ว่างหรือไม่ใช่ modern error ที่รู้จัก → fall back ไป `initialize` แล้วทำต่อด้วย revision แบบ legacy
+
+ถ้าจะรองรับ transport HTTP+SSE ที่ deprecate แล้วด้วย client ที่ได้ `400`, `404` หรือ `405` โดยไม่มี modern error body จะส่ง `GET` ไปที่ URL; ถ้า SSE stream เปิดขึ้นและ event แรกคือ `endpoint` แสดงว่าเป็น server รุ่น 2024-11-05
+
+ยุคเป็นคุณสมบัติของ **server** ไม่ใช่ของ request cache ผลไว้ตลอดอายุของ process (stdio) หรือ origin (HTTP) จะเก็บข้าม restart ของ configuration เดิมก็ได้ และ probe ใหม่ถ้าสมมติฐานที่ cache ไว้ล้มเหลวในภายหลัง
+
+## ตาราง compatibility
+
+| Client | Server | ผลลัพธ์ |
+|--------|--------|---------|
+| Modern | Modern | ใช้ได้ `server/discover` เป็น optional; version ไม่ตรงกันโผล่เป็น `-32022` แล้ว client retry |
+| Modern | Legacy | **ล้มเหลว** server อาจปฏิเสธ, เงียบ หรือประมวลผล method ที่คลุมเครือด้วย semantics แบบ legacy probe บน stdio เพื่อให้ล้มเหลวแบบคาดเดาได้ |
+| Dual-era | Modern | ใช้ได้ probe ได้ `DiscoverResult` หรือ modern error; client อยู่ในโหมด modern |
+| Dual-era | Legacy | ใช้ได้ probe ได้ error ที่ไม่ใช่ modern หรือ timeout; client fall back ไป `initialize` (และอาจไปถึง HTTP+SSE) |
+| Legacy | Modern | **ล้มเหลว** stdio: `initialize` เป็น method ที่ไม่รู้จักและไม่มี `_meta` ถูกปฏิเสธด้วย error แบบ implementation-defined HTTP: ไม่มี header บังคับ → `400` legacy client ไม่มีทาง fall forward |
+| Legacy | Dual-era | ใช้ได้ server ตอบ `initialize` และให้บริการตาม revision legacy ที่ negotiate ได้ |
+| Legacy | Legacy | ใช้ได้ตาม revision แบบ legacy |
+
+อ่านมันเป็นกฎการออกแบบ: เพื่อเข้าถึง peer ได้มากที่สุด **client ควรเป็น dual-era และ server ควรเป็น dual-era ตราบเท่าที่ legacy client ยังสำคัญกับคุณ**
+
+## server แบบ modern อย่างเดียวเจอ traffic แบบ legacy
+
+ถ้าคุณเลือกไม่รองรับ legacy client ก็ควรปฏิเสธอย่างสุภาพ:
+
+- HTTP `GET` หรือ `DELETE` มาที่ MCP endpoint → `405 Method Not Allowed`
+- header `Mcp-Session-Id` → เพิกเฉย; ห้ามออกหรือส่ง session ID กลับ
+- header `Last-Event-ID` → เพิกเฉย; stream resume ไม่ได้
+- request `initialize` บน transport ใดก็ตาม → ปฏิเสธ และ **ระบุ protocol version ที่คุณรองรับ** ใน error message legacy client ไม่มีกลไก fall forward ดังนั้น message นั้นอาจเป็นข้อมูล diagnostic เดียวที่ผู้ใช้จะได้เห็น
+
+## server แบบ dual-era
+
+dual-era server เลือกพฤติกรรมจากวิธีที่ client เปิด: request ที่พก `_meta` แบบ modern จะได้รับบริการแบบ stateless; request `initialize` เลือก semantics แบบ legacy ที่ผูกกับ process ของ stdio หรือ session ของ HTTP ทั้งสองยุครันพร้อมกันบน endpoint เดียวได้
+
+ใน TypeScript SDK เรื่องนี้เป็น option เดียวบน handler:
+
+```ts
+import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
+
+const buildServer = () => new McpServer({ name: 'notes', version: '1.0.0' });
+
+// default: also serve legacy clients, statelessly
+const handler = createMcpHandler(buildServer);
+
+// modern only: reject legacy traffic
+const strict = createMcpHandler(buildServer, { legacy: 'reject' });
+```
+
+factory ตัวเดียวกันรองรับทั้งสองยุค คุณจึงลงทะเบียน tool ครั้งเดียว MCP Inspector ก็ negotiate ทั้งสองยุคได้ ทำให้มันเป็นวิธีที่เร็วที่สุดในการยืนยันว่า server รันอยู่ในโหมดไหนจริง ๆ — ดู [testing and debugging](/mcp/th/production-and-ecosystem/testing-and-debugging/)
+
+<Callout title="สรุปหนึ่งบรรทัด">
+MCP ยุค modern ใส่ version และ capability บนทุก request; ยุค legacy negotiate ครั้งเดียวด้วย `initialize` dual-era client probe ด้วย `server/discover` บน stdio และตรวจ body ของ `400` บน HTTP โดย fall back ไป `initialize` เฉพาะเมื่อเจอ error ที่ไม่รู้จัก — และ dual-era server ตอบตามวิธีเปิดที่ได้รับ ซึ่งคือสิ่งที่ `createMcpHandler` ทำโดยค่าเริ่มต้น
+</Callout>
+
+export const quizCompat = [
+  {
+    q: 'พฤติกรรมคู่ไหนที่บ่งบอกว่า server เป็น legacy (2025-11-25 และก่อนหน้า)?',
+    options: [
+      'resultType บนทุก result และ server/discover',
+      'handshake initialize และ header Mcp-Session-Id',
+      'subscriptions/listen และ MRTR',
+      'header Mcp-Method และ x-mcp-header',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'บน HTTP request แบบ modern ได้ 400 อะไรเป็นตัวตัดสินว่า client จะ fall back ไป initialize หรือไม่?',
+    options: [
+      'status เป็น 400 เป๊ะหรือไม่',
+      'response body เป็น modern JSON-RPC error ที่รู้จักหรือไม่',
+      'server ส่ง Mcp-Session-Id หรือไม่',
+      'client fall back เสมอเมื่อเจอ 4xx ใด ๆ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'legacy client คุยกับ server ที่เป็น modern อย่างเดียว จะเกิดอะไรขึ้น?',
+    options: [
+      'ใช้ได้เพราะ server downgrade ให้อัตโนมัติ',
+      'ล้มเหลว; legacy client ไม่มีกลไก fall forward',
+      'server upgrade client ให้',
+      'client สลับไป HTTP+SSE เงียบ ๆ',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ทำไม probe บน stdio ถึงไม่ควรผูกกับ error code ตัวเดียว?',
+    options: [
+      'เพราะ server แบบ modern ไม่เคย return error',
+      'legacy server ตอบ request ที่ไม่รู้จักก่อน initialize ด้วย code ที่หลากหลายหรือเงียบไปเลย',
+      'เพราะ -32601 แปลว่า server เป็น modern',
+      'เพราะ error code ขึ้นกับ transport',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="transports/backward-compatibility" questions={quizCompat} />
+
+<ProgressTracker client:visible id="transports/backward-compatibility" />

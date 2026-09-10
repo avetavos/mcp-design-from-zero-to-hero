@@ -1,0 +1,179 @@
+---
+title: 'Extensions and the Road Ahead'
+description: 'extension แบบ optional ถูก negotiate อย่างไร, Tasks และ MCP Apps เพิ่มอะไรบน core protocol, feature lifecycle ที่กำกับการ deprecate, กระบวนการ SEP และตารางสรุปสิ่งที่เปลี่ยนใน 2026-07-28'
+sidebar:
+  order: 6
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## core เล็ก ขอบที่กำลังโต
+
+revision `2026-07-28` ตั้งใจ *ย่อ* core protocol ให้เล็กลง: session, handshake, `ping`, `logging/setLevel` และ request ที่ server เป็นฝ่ายเริ่ม ถูกถอดออกทั้งหมด สิ่งที่เหลือคือขั้นต่ำที่ทุก implementation ต้องพูดได้ ทุกอย่างที่ซับซ้อนกว่านั้นตอนนี้ไปอยู่ใน **extension** ซึ่ง optional, additive, composable และมี version ของตัวเอง
+
+นี่คือข่าวดีสำหรับคุณในฐานะคนเขียน server: implement core ครั้งเดียว แล้ว opt in เฉพาะ extension ที่ use case ของคุณต้องการจริง ๆ
+
+<Mermaid title="core บวก extension" code={coreDiagram} />
+
+export const coreDiagram = `flowchart TB
+  core["Core: JSON-RPC, _meta, server/discover, tools, resources, prompts, MRTR, subscriptions"]
+  core --> t["io.modelcontextprotocol/tasks"]
+  core --> u["io.modelcontextprotocol/ui  (MCP Apps)"]
+  core --> a["ext-auth extensions"]
+  core --> v["com.yourco/... vendor extensions"]`;
+
+## extension ถูก negotiate อย่างไร
+
+ทั้งสองฝั่งประกาศ extension ใน map `extensions` ภายใน capability key ต้องตามกฎการตั้งชื่อของ `_meta` โดยมี **prefix บังคับ**: ของทางการอยู่ใต้ `io.modelcontextprotocol/` ของคุณอยู่ใต้ prefix แบบ reverse-DNS ของตัวเอง ค่าคือ settings object ต่อ extension `{}` แปลว่า "รองรับ ไม่มี setting"
+
+client บนทุก request:
+
+```json
+{
+  "_meta": {
+    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    "io.modelcontextprotocol/clientCapabilities": {
+      "elicitation": {},
+      "extensions": {
+        "io.modelcontextprotocol/tasks": {},
+        "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] }
+      }
+    }
+  }
+}
+```
+
+server ใน `server/discover`:
+
+```json
+{
+  "capabilities": {
+    "tools": { "listChanged": true },
+    "extensions": {
+      "io.modelcontextprotocol/tasks": {}
+    }
+  }
+}
+```
+
+กฎ fallback ง่ายมาก: ถ้าฝั่งหนึ่งรองรับ extension แต่อีกฝั่งไม่ ฝั่งที่รองรับ **ต้อง** ทำตัวเป็น core ธรรมดา หรือปฏิเสธ request ด้วย error ที่ชัดเจน extension **ควร** ระบุไว้ว่าจะทำแบบไหน server ต้องไม่คืน result รูปแบบ extension (เช่น task handle) ให้ client ที่ไม่ได้ประกาศ extension นั้นบน request นั้นเด็ดขาด
+
+## Tasks
+
+`io.modelcontextprotocol/tasks` มีไว้สำหรับงานที่อยู่นานกว่า request: การรัน CI, batch import, การอนุมัติโดยคน แทนที่จะเปิด connection ค้างไว้ server คืน handle ที่คงทนแล้วให้ client poll บทเรียนก่อนหน้าเรื่องงานที่รันนานครอบคลุมกลไกไว้แล้ว สรุปรูปร่างในย่อหน้าเดียว:
+
+- client ประกาศ extension บน request server *ถ้าเลือกที่จะทำ* ตอบ `tools/call` ด้วย `resultType: "task"` ที่มี `taskId`, status, `ttlMs` และ `pollIntervalMs`
+- client เรียก `tasks/get` จนกว่า status จะเป็น terminal (`completed`, `failed` หรือ `cancelled`) ถ้า status เป็น `input_required` response จะมี `inputRequests` (เช่น elicitation) และ client ตอบด้วย `tasks/update`
+- `tasks/cancel` เป็นแบบ cooperative server อาจ push `notifications/tasks` ให้ client ที่เปิด `subscriptions/listen` ไว้ ซึ่งช่วยประหยัดการ poll
+
+Tasks ย้าย *ออกจาก* core ใน `2026-07-28` และการออกแบบใหม่แทนที่ `tasks/result` แบบ blocking ด้วยการ polling ถ้าคุณอ่าน tutorial เก่า นั่นคือเหตุผลที่ชื่อ method ต่างกัน
+
+## MCP Apps
+
+`io.modelcontextprotocol/ui` ให้ tool คืน **HTML interface แบบ interactive** — chart, form, dashboard — ที่ host render ไว้ในบทสนทนาแทนที่จะเป็นกำแพงข้อความ มันประกอบกันอย่างนี้:
+
+1. tool definition มี `_meta.ui.resourceUri` ชี้ไปที่ resource แบบ `ui://` host สามารถ preload มันได้ก่อน tool จะถูกเรียกด้วยซ้ำ
+2. resource นั้นคือหน้า HTML (มักรวม JS และ CSS ไว้ด้วยกัน) ที่ serve ด้วย MIME type `text/html;profile=mcp-app` ส่วน `_meta.ui` ของ resource ขอ `permissions` และประกาศ `csp` สำหรับ origin ภายนอกได้
+3. host render มันใน **sandboxed iframe** แอปแตะ DOM ของ parent, cookie หรือ storage ไม่ได้
+4. แอปกับ host คุยกันผ่าน `postMessage` ด้วย JSON-RPC dialect ของ MCP: บาง method ใช้ร่วมกัน (`tools/call`) บาง method ใหม่อยู่ใต้ prefix `ui/` (`ui/initialize`) แอปเรียก tool บน server ของตัวเองได้, push context ให้ model ได้ และรับ result ใหม่จาก host ได้
+
+package `@modelcontextprotocol/ext-apps` มี class `App` สำหรับฝั่งแอปและ App Bridge สำหรับ host พร้อม starter template สำหรับ React, Vue, Svelte, Preact, Solid และ JavaScript ธรรมดา มันเป็นแค่ความสะดวก ไม่ใช่ข้อบังคับ เพราะ postMessage protocol คือ web primitive มาตรฐาน host ที่รองรับ Apps ตอนนี้ได้แก่ Claude, Claude Desktop, VS Code GitHub Copilot, Microsoft 365 Copilot, Goose, Postman, MCPJam และ Archestra client matrix บนเว็บ MCP ติดตามรายชื่อไว้
+
+ใช้ App เมื่อ user ต้อง *โต้ตอบ* กับข้อมูล (เจาะลงในแผนที่, กรอก form ที่มี option เยอะ, ดู metric สด ๆ) ไม่ใช่แค่อ่าน
+
+## Authorization extension
+
+spec authorization ใน core ครอบคลุม OAuth 2.1 ระหว่าง client กับ server กลไกเพิ่มเติม — pattern identity ระดับ enterprise, credential flow ทางเลือก — อยู่ใน repository `modelcontextprotocol/ext-auth` ในฐานะ extension แบบ optional และ composable ไปดูที่นั่นก่อนจะคิด scheme เองขึ้นมา มีโอกาสสูงที่ของคุณมีคนเขียน spec ไว้แล้ว
+
+## feature lifecycle
+
+ตั้งแต่ `2026-07-28` ทุก feature อยู่ในหนึ่งในสามสถานะ ภายใต้ policy ที่เขียนไว้เป็นลายลักษณ์อักษร:
+
+| สถานะ | ความหมาย |
+|-------|---------|
+| **Active** | เป็นส่วนหนึ่งของ spec; implement ได้เลย |
+| **Deprecated** | ยังอยู่ใน spec และยังทำงานได้ พร้อม migration path ที่ระบุไว้ (หรือหมายเหตุว่าไม่ต้อง migrate) อยู่ต่ออย่างน้อย **สิบสองเดือน** (เก้าสิบวันภายใต้ข้อยกเว้นแบบเร่งด่วน) implementation ใหม่ไม่ควรนำไปใช้ |
+| **Removed** | หายไปจาก revision ถัดไป |
+
+**deprecated features registry** ที่ `/specification/2026-07-28/deprecated` คือรายการที่เป็นทางการ ณ revision นี้ประกอบด้วย:
+
+| ถูก deprecate | ใช้แทนด้วย |
+|------------|-------------|
+| Sampling (`sampling/createMessage`) | เรียก API ของ LLM provider โดยตรงจาก server |
+| Roots (`roots/list`, `notifications/roots/list_changed`) | ส่ง directory หรือ file เป็น parameter ของ tool, resource URI หรือ config ของ server |
+| feature logging (การ opt in `notifications/message` ยังอยู่ผ่าน log level ใน `_meta`) | stderr บน stdio หรือ OpenTelemetry |
+| HTTP+SSE transport (จาก 2024-11-05) | Streamable HTTP |
+| Dynamic Client Registration (RFC 7591) | Client ID Metadata Documents |
+| ค่า `includeContext` แบบ `thisServer` / `allServers` | ละ field นี้ หรือใช้ `none` |
+
+deprecated ไม่ได้แปลว่าพัง: server ยุค `2025-11-25` ที่ใช้ sampling ยังทำงานได้ตลอดช่วงเวลานั้น แต่แปลว่า *อย่าเริ่มใช้*
+
+## spec เปลี่ยนอย่างไร: SEP
+
+การเปลี่ยนแปลงใน MCP ผ่าน **Specification Enhancement Proposal** SEP คือไฟล์ markdown ที่เปิดเป็น pull request ใน directory `seps/` ของ specification repository ได้หมายเลขจาก PR ต้องมี sponsor จาก core team และเคลื่อนผ่าน status label จนกว่าจะถูกยอมรับหรือปฏิเสธ changelog ของแต่ละ revision อ้างอิง SEP เบื้องหลังทุกการเปลี่ยนแปลง (`SEP-2575` สำหรับ statelessness, `SEP-2322` สำหรับ MRTR, `SEP-2549` สำหรับ field caching เป็นต้น) ดังนั้นเมื่อพฤติกรรมไหนทำให้คุณงง SEP คือที่ที่เหตุผลอยู่
+
+ถ้าอยากมีอิทธิพลต่อ protocol นั่นคือประตู: เปิด discussion เขียน SEP หา sponsor
+
+## สิ่งที่เปลี่ยนใน 2026-07-28 ในตารางเดียว
+
+tutorial ส่วนใหญ่บนเว็บมาก่อน revision นี้ ใช้ตารางนี้แปลมัน:
+
+| revision เก่า (`2025-11-25` และก่อนหน้า) | `2026-07-28` |
+|---------------------------------------------|--------------|
+| handshake `initialize` / `notifications/initialized` | ถูกถอดออก; ทุก request พก `io.modelcontextprotocol/protocolVersion` และ `clientCapabilities` ใน `_meta` |
+| header `Mcp-Session-Id`, HTTP `DELETE` เพื่อจบ session | ถูกถอดออก; protocol เป็น stateless state ใช้ handle ที่ชัดเจน |
+| HTTP `GET` เปิด stream จาก server ไป client | ถูกถอดออก; `subscriptions/listen` เป็น POST response ที่อยู่ยาว |
+| server ส่ง `elicitation/create`, `sampling/createMessage`, `roots/list` เป็น request | MRTR: server คืน `resultType: "input_required"` พร้อม `inputRequests`; client retry พร้อม `inputResponses` |
+| `resources/subscribe` / `unsubscribe` | `subscriptions/listen` พร้อม `resourceSubscriptions` |
+| result ไม่มี type marker | ทุก result มี `resultType` (`complete`, `input_required` หรือค่าจาก extension เช่น `task`) |
+| `ping`, `logging/setLevel`, `notifications/roots/list_changed` | ถูกถอดออก; log level ต่อ request ผ่าน `_meta` |
+| SSE resumability ด้วย `Last-Event-ID` | ถูกถอดออก; ส่ง request ที่หายใหม่ด้วย id ใหม่ |
+| header `MCP-Protocol-Version` แบบ optional | บังคับ พร้อม `Mcp-Method` และ `Mcp-Name` บน POST; ไม่ตรงกันคือ `-32020` |
+| error `-32001` / `-32003` / `-32004` ใน draft; `-32002` resource not found | `-32020` HeaderMismatch, `-32021` MissingRequiredClientCapability, `-32022` UnsupportedProtocolVersion; resource not found คือ `-32602` |
+| ไม่มี caching hint | `ttlMs` และ `cacheScope` บน list result, `resources/read` และ `server/discover` |
+| Tasks อยู่ใน core | Tasks เป็น extension, poll ผ่าน `tasks/get` |
+| ไม่มี discovery RPC ที่บังคับ | `server/discover` บังคับสำหรับ server, optional สำหรับ client |
+
+<Callout title="สรุปหนึ่งบรรทัด">
+ตอนนี้ MCP มี core ที่ตั้งใจให้เล็กและขอบที่ opt in ได้: extension ถูก negotiate ผ่าน key ที่มี prefix ใน map `extensions` ของ capability, Tasks ให้งานยาว ๆ มี handle ที่คงทน, MCP Apps ให้ tool มี UI ใน sandbox, feature lifecycle สัญญาว่าจะเตือนอย่างน้อยสิบสองเดือนก่อนถอดอะไรออก, SEP คือวิธีที่ spec เปลี่ยน และตาราง `2026-07-28` ด้านบนคือตัวถอดรหัสสำหรับเนื้อหาเก่า
+</Callout>
+
+export const quizExtensions = [
+  {
+    q: 'client และ server ประกาศว่ารองรับ extension ที่ไหน?',
+    options: [
+      'ใน HTTP header Accept',
+      'ใน map extensions ภายใน capability โดยใช้ identifier ที่มี prefix เป็น key',
+      'ใน description ของ tool',
+      'โดยเรียก extensions/list',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ข้อไหนคือ feature ที่ถูก deprecate ณ 2026-07-28?',
+    options: ['Streamable HTTP', 'Elicitation', 'Sampling', 'server/discover'],
+    answer: 2,
+  },
+  {
+    q: 'tool บอก host ว่ามี UI แบบ MCP App ได้อย่างไร?',
+    options: [
+      'คืน HTML ใน text content block',
+      'ผ่าน _meta.ui.resourceUri บน tool ที่ชี้ไปยัง resource แบบ ui:// ชนิด text/html;profile=mcp-app',
+      'ตั้ง destructiveHint: false',
+      'ตั้งชื่อ tool ด้วย prefix ui_',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'ช่วงเวลา deprecation ขั้นต่ำภายใต้ feature lifecycle policy คือเท่าไร?',
+    options: ['หนึ่ง revision', 'เก้าสิบวันในทุกกรณี', 'สิบสองเดือน (เก้าสิบวันเฉพาะภายใต้ข้อยกเว้นแบบเร่งด่วน)', 'ไม่มีขั้นต่ำ'],
+    answer: 2,
+  },
+];
+
+<Quiz client:visible id="production-and-ecosystem/extensions-and-the-road-ahead" questions={quizExtensions} />
+
+<ProgressTracker client:visible id="production-and-ecosystem/extensions-and-the-road-ahead" />

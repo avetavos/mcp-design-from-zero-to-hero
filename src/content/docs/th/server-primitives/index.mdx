@@ -1,0 +1,139 @@
+---
+title: 'Server Primitives'
+description: 'tools, resources และ prompts — สามสิ่งที่ server เปิดให้ใช้ได้, ใครเป็นคนควบคุมแต่ละอย่าง และ method family แบบ list/get/call ที่ขับเคลื่อนมัน'
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../../components/Mermaid.astro';
+import Callout from '../../../../components/Callout.astro';
+import Quiz from '../../../../components/Quiz.tsx';
+import ProgressTracker from '../../../../components/ProgressTracker.tsx';
+
+## สาม primitive สามผู้ควบคุม
+
+MCP server เปิดสิ่งให้ใช้ได้แค่สามประเภทเท่านั้น บน wire มันหน้าตาคล้ายกัน — แต่ละอย่างมี method `*/list` และมีวิธีดึงมาทีละตัว — แต่ต่างกันตรง *ใครเป็นคนตัดสินใจว่าจะใช้เมื่อไร* คำถามข้อนี้ข้อเดียวคือการตัดสินใจด้านการออกแบบที่สำคัญที่สุดของโมดูลนี้
+
+| Primitive | ควบคุมโดย | UI ที่พบบ่อย | Method family |
+|-----------|---------------|------------|---------------|
+| **Tools** | **model** — LLM ตัดสินใจเรียกเองจากบริบทของบทสนทนา | หน้ายืนยัน tool call, ตัวบอกสถานะ "กำลังรัน…" | `tools/list`, `tools/call` |
+| **Resources** | **application** — host เป็นคนเลือกว่าจะแนบ context อะไร | file picker, `@`-mention, tree view | `resources/list`, `resources/templates/list`, `resources/read` |
+| **Prompts** | **user** — คนเลือกใช้เองอย่างชัดเจน | slash command, เมนู template | `prompts/list`, `prompts/get` |
+
+<Mermaid title="ใครขับเคลื่อน primitive แต่ละตัว" code={controlDiagram} />
+
+export const controlDiagram = `flowchart LR
+  LLM["Language model"] -- "ตัดสินใจเรียก" --> T["Tools"]
+  App["Host application"] -- "เลือก context" --> R["Resources"]
+  User["Human user"] -- "เลือกเองชัดเจน" --> P["Prompts"]
+  T --> S["MCP server"]
+  R --> S
+  P --> S`;
+
+protocol ไม่ได้ *บังคับ* interaction model เหล่านี้ — host จะปล่อยให้ model เลือก resource เองหรือรัน prompt อัตโนมัติก็ได้ แต่ primitive ถูกออกแบบมารอบ ๆ แนวคิดนี้ และ server ที่ดีที่สุดจะเคารพเจตนาของมัน: tool คือ *action ที่ model อาจทำ*, resource คือ *ข้อมูลที่ app ยื่นให้ model ได้*, prompt คือ *workflow ที่คนเป็นคนเรียก*
+
+## ควรใช้ primitive ตัวไหน?
+
+ตารางช่วยตัดสินใจสำหรับกรณีที่พบบ่อยที่สุด:
+
+| อยากเปิดให้ใช้… | ใช้ | เพราะ |
+|--------------------|-----|-----|
+| "ค้นหาใน catalog", "สร้าง ticket", "รัน query นี้" | **Tool** | model ต้องตัดสินใจเองว่าจะทำ *เมื่อไร* จากสิ่งที่ user ขอ |
+| ไฟล์, database schema, config document, log | **Resource** | มันคือ context ไม่ใช่ action host หรือ user จะแนบให้ตอนที่เกี่ยวข้อง |
+| "ทุกไฟล์ที่ตรงกับ `repo://{repo}/…`" | **Resource template** | resource ตระกูลเดียวกันที่รับ parameter ได้ ค้นพบและ auto-complete ได้ |
+| "รีวิว PR นี้แบบที่ทีมเราทำกัน" | **Prompt** | workflow ที่ใช้ซ้ำได้ user เป็นคนกด มี argument และโครงแบบ few-shot |
+| dashboard แบบ live ที่ user ควรโต้ตอบด้วยได้ | **Tool + MCP Apps extension** | อยู่ในบท [Extensions](/mcp/th/production-and-ecosystem/extensions-and-the-road-ahead/) |
+
+วิธีทดสอบง่าย ๆ: ถ้าคุณจะไม่สบายใจเมื่อ model ทำสิ่งนั้น *โดยไม่ถามก่อน* มันคือ tool (และคุณควรตั้ง annotation ให้รอบคอบ ดู [Structured Output and Annotations](/mcp/th/server-primitives/structured-output-and-annotations/)) ถ้ามันเป็นข้อมูลนิ่ง ๆ มันคือ resource ถ้าคนจะพูดว่า "รัน workflow X หน่อย" มันคือ prompt
+
+## Method family
+
+ทุก primitive มีรูปแบบเดียวกัน — ค้นพบก่อน แล้วค่อยลงมือ:
+
+| ขั้นตอน | Tools | Resources | Prompts |
+|------|-------|-----------|---------|
+| ค้นพบ | `tools/list` | `resources/list`, `resources/templates/list` | `prompts/list` |
+| ลงมือ | `tools/call` | `resources/read` | `prompts/get` |
+| Change notification | `notifications/tools/list_changed` | `notifications/resources/list_changed`, `notifications/resources/updated` | `notifications/prompts/list_changed` |
+
+method `*/list` ทุกตัวรองรับ cursor [pagination](/mcp/th/server-primitives/notifications-and-caching/) และมี field สำหรับ caching คือ `ttlMs` กับ `cacheScope` ส่วน method "ลงมือ" ทุกตัว — `tools/call`, `resources/read`, `prompts/get` — อาจ return `InputRequiredResult` เมื่อ server ต้องการอะไรบางอย่างจาก user ก่อน (ดู [Client Interaction](/mcp/th/client-interaction/))
+
+## การประกาศ capability
+
+server ประกาศว่ารองรับ primitive ไหนบ้างใน object `capabilities` ที่ return จาก `server/discover` แต่ละ primitive มี key ของตัวเอง พร้อม sub-flag ที่ใส่หรือไม่ใส่ก็ได้:
+
+```json
+{
+  "capabilities": {
+    "tools": { "listChanged": true },
+    "resources": { "listChanged": true, "subscribe": true },
+    "prompts": { "listChanged": false }
+  }
+}
+```
+
+- `listChanged` — server จะส่ง notification `*/list_changed` เมื่อชุดของมันเปลี่ยน (ไปยัง client ที่ opt-in ผ่าน `subscriptions/listen`)
+- `resources.subscribe` — server แจ้งเตือนการอัปเดตของ resource URI *เฉพาะตัว* ได้
+
+server ที่ประกาศ capability ใด **ต้อง** ตอบ request `*/list` ของ primitive นั้น list จะว่างก็ได้และเปลี่ยนไปตามเวลาก็ได้ ถ้า server ไม่ได้ประกาศ `prompts` client ก็ต้องไม่ส่ง `prompts/list`
+
+## list ต้องนิ่ง ไม่ผูกกับ connection
+
+เพราะ MCP เป็น stateless (ดู [Foundations](/mcp/th/mcp-foundations/)) spec จึงระบุชัดว่า list ขึ้นกับอะไรได้บ้าง:
+
+- ชุดของ tool, resource หรือ prompt **ต้องไม่** ต่างกันตาม connection และ **ต้องไม่** เปลี่ยนเป็นผลข้างเคียงจาก request อื่นบน connection เดียวกัน การเรียก `tools/call` ต้องไม่ปลดล็อก `tools/list` ชุดใหม่ให้ *เฉพาะ* client นั้น
+- ชุดนี้ **อาจ** ต่างกันตาม **authorization** ที่แนบมากับ request — ผู้เรียกที่มี `files:write` อาจเห็น tool `delete_file` ที่ผู้เรียกแบบ read-only ไม่เห็น credential เป็น input ต่อ request ไม่ใช่ state ของ connection
+- ชุดนี้ **อาจ** เปลี่ยนไปตามเวลาสำหรับทุกคน (deploy ใหม่, feature flag) ซึ่งนั่นคือหน้าที่ของ `listChanged`
+
+กติกานี้ตัด server แบบ "wizard ที่มี state" ที่เผย tool B เฉพาะเมื่อ tool A ถูกเรียกแล้วใน session นี้ออกไป ถ้าต้องการแบบนั้น ให้ tool A return handle ออกมาชัด ๆ แล้วให้ tool B รับ handle นั้นเป็น argument — รูปแบบ handle อยู่ในบท [Tools](/mcp/th/server-primitives/tools/)
+
+## โมดูลนี้ครอบคลุมอะไร
+
+| บทเรียน | คุณจะได้เรียน |
+|--------|----------------|
+| [Tools](/mcp/th/server-primitives/tools/) | นิยาม, การตั้งชื่อ, `tools/list` และ `tools/call`, content type, error สองช่องทาง |
+| [Structured Output and Annotations](/mcp/th/server-primitives/structured-output-and-annotations/) | `outputSchema`, `structuredContent`, behavior hint, title และ icon |
+| [Resources](/mcp/th/server-primitives/resources/) | URI, text กับ blob, template, annotation, URI scheme |
+| [Prompts](/mcp/th/server-primitives/prompts/) | argument, message, completion, การออกแบบ workflow ที่ใช้ซ้ำได้ |
+| [Notifications and Caching](/mcp/th/server-primitives/notifications-and-caching/) | `subscriptions/listen`, list-changed, `ttlMs` กับ `cacheScope`, pagination |
+
+<Callout title="สรุปหนึ่งบรรทัด">
+tool คือ action ที่ model ควบคุม, resource คือ context ที่ application ควบคุม, prompt คือ workflow ที่ user ควบคุม แต่ละตัวมี `*/list` ไว้ค้นพบและ method ลงมือไว้ใช้งาน ประกาศสิ่งที่รองรับใน capabilities และอย่าให้ list ขึ้นกับประวัติของ connection เด็ดขาด — ให้ขึ้นกับเวลาและ authorization ของผู้เรียกเท่านั้น
+</Callout>
+
+export const quizIndex = [
+  {
+    q: 'primitive ตัวไหนถูกออกแบบให้ language model เรียกใช้ได้เองตามการตัดสินใจของมัน?',
+    options: [
+      'Resources',
+      'Tools',
+      'Prompts',
+      'Subscriptions',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'server อยากเผย tool เพิ่มอีกตัวเฉพาะเมื่อ client เคยเรียก tool "login" ไปก่อนหน้าบน connection เดียวกัน spec ว่าอย่างไร?',
+    options: [
+      'ทำได้ ตราบใดที่ประกาศ listChanged ไว้',
+      'tool list ต้องไม่ต่างกันตาม connection ให้ return handle จาก tool แรกแทน หรือให้ list ต่างกันตาม authorization',
+      'ต้องทำผ่าน prompts ไม่ใช่ tools',
+      'ต้องใช้ Tasks extension',
+    ],
+    answer: 1,
+  },
+  {
+    q: 'sub-capability `subscribe` ใต้ `resources` หมายความว่าอย่างไร?',
+    options: [
+      'server รับชำระเงินได้',
+      'server แจ้งเตือนการอัปเดตของ resource URI เฉพาะตัวได้',
+      'อ่าน resource ได้โดยไม่ต้อง authorization',
+      'resource list มีการแบ่งหน้า',
+    ],
+    answer: 1,
+  },
+];
+
+<Quiz client:visible id="server-primitives/index" questions={quizIndex} />
+
+<ProgressTracker client:visible id="server-primitives/index" />
