@@ -43,7 +43,7 @@ authorization spec ผูกกับ **transport** โดยรวมมัน�
 เหตุผลตรงไปตรงมา: stdio server ไม่มี network endpoint ให้ต้องป้องกัน และ host ก็ตัดสินใจไว้แล้วว่าเชื่อใจมันพอที่จะรันมัน ส่วน remote HTTP server ใครก็ยิง POST ถึงได้ มันเลยต้องมีวิธีรู้ว่า *ใคร* กำลังถาม และ *ได้รับสิทธิ์อะไร* มาบ้าง
 
 ```json
-// config ของ host สำหรับ stdio server: credential มาจาก environment
+// Host config for a stdio server: credentials come from the environment
 {
   "mcpServers": {
     "github": {

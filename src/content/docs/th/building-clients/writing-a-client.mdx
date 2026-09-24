@@ -102,7 +102,7 @@ client เป็นเจ้าของ subprocess: ตอน shutdown มั�
     from mcp import Client
 
     async def main() -> None:
-        # ส่ง URL เป็น string คือทางลัดของ Streamable HTTP transport
+        # A URL string is shorthand for the Streamable HTTP transport.
         async with Client("http://127.0.0.1:8000/mcp") as client:
             result = await client.list_tools()
             print([t.name for t in result.tools])
@@ -127,13 +127,13 @@ client เป็นเจ้าของ subprocess: ตอน shutdown มั�
       arguments: { weightKg: 70, heightM: 1.75 },
     });
 
-    // error ระดับ tool ถูกคืนมาใน result ไม่ได้ throw
+    // Tool-level errors are returned in the result, not thrown
     if (result.isError) {
       console.error('Tool error:', result.content);
       return;
     }
-    console.log(result.content);           // content block
-    console.log(result.structuredContent); // มีเมื่อ tool มี outputSchema
+    console.log(result.content);           // content blocks
+    console.log(result.structuredContent); // present if the tool has an outputSchema
     ```
   </TabItem>
   <TabItem label="Python">
@@ -207,7 +207,7 @@ client เป็นเจ้าของ subprocess: ตอน shutdown มั�
       return server;
     });
 
-    // ส่ง fetch ของ transport ตรงเข้า handler เลย ไม่ต้องเปิด port
+    // Route the transport's fetch straight into the handler — no port opened.
     const transport = new StreamableHTTPClientTransport(new URL('http://test.local/mcp'), {
       fetch: (url, init) => handler.fetch(new Request(url, init)),
     });
@@ -229,7 +229,7 @@ client เป็นเจ้าของ subprocess: ตอน shutdown มั�
         return f"Found 3 books matching {query!r}."
 
     async def test_search() -> None:
-        # ส่ง server object เข้าไปตรง ๆ: in-memory transport
+        # Pass the server object itself: in-memory transport.
         async with Client(mcp) as client:
             result = await client.call_tool("search_books", {"query": "dune"})
             assert not result.is_error
@@ -246,10 +246,10 @@ client เป็นเจ้าของ subprocess: ตอน shutdown มั�
     ```ts
     client.setRequestHandler('elicitation/create', async (request) => {
       if (request.params.mode === 'url') {
-        // แสดง URL เต็ม ขอ consent แล้วเปิดใน browser ของระบบ
+        // Show the full URL, get consent, open it in the system browser.
         return { action: 'accept' };
       }
-      // render request.params.requestedSchema เป็น form แล้วคืนสิ่งที่ผู้ใช้กรอก
+      // Render request.params.requestedSchema as a form; return what the user entered.
       return { action: 'accept', content: { city: 'Lisbon' } };
     });
     ```
@@ -261,7 +261,7 @@ client เป็นเจ้าของ subprocess: ตอน shutdown มั�
     from mcp.types import ElicitRequestParams, ElicitResult
 
     async def handle_elicitation(context: ClientRequestContext, params: ElicitRequestParams) -> ElicitResult:
-        # แสดง params.message และ params.requested_schema ให้ผู้ใช้
+        # Present params.message and params.requested_schema to the user.
         return ElicitResult(action="accept", content={"region": "eu-west-1"})
 
     async def main() -> None:

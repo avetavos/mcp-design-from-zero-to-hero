@@ -111,7 +111,7 @@ provider ส่วนใหญ่ cache prompt prefix และ array `tools` �
 **ขั้นที่ 1: generate stub จาก schema** host แปลง `inputSchema` และ `outputSchema` ของแต่ละ tool เป็น function ที่มี type
 
 ```ts
-// generate อัตโนมัติจาก tool schema ของ Logging server
+// Auto-generated from the Logging server's tool schema
 function logging_getLogs(input: { level: 'error' | 'warn' | 'info'; since: number }):
   Promise<{ entries: LogEntry[] }> {
   return mcp.callTool('logging_getLogs', input);

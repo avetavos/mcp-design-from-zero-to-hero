@@ -180,13 +180,13 @@ Call the model. If it stops with `tool_use`, execute **every** `tool_use` block 
     ```python
     import anthropic
 
-    client = anthropic.Anthropic()
+    client = anthropic.AsyncAnthropic()
 
     async def run_agent(user_text: str, tools: list[dict]):
         messages = [{"role": "user", "content": user_text}]
 
         while True:
-            response = client.messages.create(
+            response = await client.messages.create(
                 model="claude-opus-5",
                 max_tokens=16000,
                 tools=tools,

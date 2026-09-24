@@ -162,7 +162,7 @@ Variables can be auto-completed through `completion/complete`, so a picker can o
       }),
       { description: 'The README of one repository' },
       async (uri, { repo }) => ({
-        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: await readReadme(repo) }],
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: await readReadme(Array.isArray(repo) ? repo[0] : repo) }],
       }),
     );
     ```

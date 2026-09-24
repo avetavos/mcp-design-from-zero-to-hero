@@ -168,7 +168,7 @@ content block ทุกตัวแนบ `annotations` (`audience`, `priority`,
       async ({ query, limit }) => {
         const hits = catalog.filter((p) => p.name.toLowerCase().includes(query.toLowerCase()));
         if (hits.length === 0) {
-          // execution error: model อ่านข้อความนี้แล้วลองใหม่ได้
+          // execution error: the model can read this and try again
           return { content: [{ type: 'text', text: `No products match "${query}". Try a shorter substring.` }], isError: true };
         }
         const names = hits.slice(0, limit ?? 10).map((p) => p.name);
@@ -196,7 +196,7 @@ content block ทุกตัวแนบ `annotations` (`audience`, `priority`,
         """Find products by a case-insensitive substring of their name."""
         hits = [p for p in CATALOG if query.lower() in p["name"].lower()]
         if not hits:
-            # ToolError กลายเป็น isError: true โดยใช้ข้อความนี้เป็น text
+            # ToolError becomes isError: true with this message as text
             raise ToolError(f"No products match {query!r}. Try a shorter substring.")
         return "\n".join(p["name"] for p in hits[:limit])
     ```

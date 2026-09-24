@@ -124,8 +124,8 @@ SDK จัดการงานเบื้องหลังของ stream �
       { capabilities: { tools: { listChanged: true }, resources: { listChanged: true, subscribe: true } } },
     );
 
-    // การลงทะเบียน tool หลัง server เริ่มทำงานแล้วจะกระตุ้น
-    // notifications/tools/list_changed ไปยัง client ที่ subscribe ไว้
+    // Registering a tool after the server is live triggers
+    // notifications/tools/list_changed for subscribed clients.
     function enableReports() {
       server.registerTool(
         'sprint_report',

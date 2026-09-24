@@ -33,14 +33,14 @@ export const hostsDiagram = `flowchart LR
 Claude Code เพิ่ม server ด้วย `claude mcp add` flag transport เป็นตัวเลือกว่าจะเชื่อมต่อแบบไหน
 
 ```bash
-# remote server ผ่าน Streamable HTTP
+# Remote server over Streamable HTTP
 claude mcp add --transport http notion https://mcp.notion.com/mcp
 
-# remote server พร้อม bearer token แบบตายตัว
+# Remote server with a static bearer token
 claude mcp add --transport http secure-api https://api.example.com/mcp \
   --header "Authorization: Bearer your-token"
 
-# local server ผ่าน stdio — ทุกอย่างหลัง -- คือคำสั่งเปิด server
+# Local server over stdio — everything after -- is the launch command
 claude mcp add --transport stdio airtable --env AIRTABLE_API_KEY=YOUR_KEY \
   -- npx -y airtable-mcp-server
 ```
@@ -89,9 +89,9 @@ server ที่ scope เป็น project ก็แค่ entry หนึ่�
 remote server ที่ต้องใช้ OAuth จะถูก authorize แบบ interactive: รัน `/mcp` ใน session แล้วทำตาม flow ใน browser หรือใช้ `claude mcp login <name>` จาก shell ส่วน client credential ที่ลงทะเบียนไว้ล่วงหน้าใส่ได้ด้วย `--client-id` และ `--client-secret` (อ่านจาก `MCP_CLIENT_SECRET` ใน CI)
 
 ```bash
-claude mcp list            # server ที่ config ไว้ทั้งหมดพร้อมสถานะ
-claude mcp get notion      # รายละเอียดของ server ตัวเดียว
-claude mcp remove notion   # ถอดออก
+claude mcp list            # every configured server and its status
+claude mcp get notion      # details for one server
+claude mcp remove notion   # drop it
 ```
 
 ปุ่มปรับที่มีประโยชน์: `MCP_TIMEOUT=10000 claude` จำกัดเวลา startup ของ server เป็นมิลลิวินาที, `timeout` ต่อ server ใน `.mcp.json` จำกัดเวลารัน tool, `MAX_MCP_OUTPUT_TOKENS` จำกัดปริมาณ output ของ tool ที่ส่งให้ model ภายใน Claude Code tool ของคุณจะปรากฏเป็น `mcp__<server>__<tool>` ซึ่งเป็นแนวคิด namespace เดียวกับ[บทก่อนหน้า](/mcp/th/building-clients/wiring-tools-to-an-llm/) และเป็นชื่อที่คุณใช้ใน permission rule กับ hook
@@ -135,8 +135,8 @@ restart แอปหลังแก้ไข เพราะ Desktop เป็�
         {
           type: 'mcp_toolset',
           mcp_server_name: 'example-mcp',
-          default_config: { enabled: false },          // โหมด allowlist
-          configs: { get_weather: { enabled: true } }, // เปิดเฉพาะ tool นี้
+          default_config: { enabled: false },          // allowlist mode
+          configs: { get_weather: { enabled: true } }, // only this tool is exposed
         },
       ],
       messages: [{ role: 'user', content: 'What is the weather in Bangkok?' }],
@@ -176,13 +176,13 @@ connector เข้าถึงได้เฉพาะ server ที่ route �
 ระหว่างพัฒนา MCP Inspector คือ host ที่เร็วที่สุดที่จะชี้ไปที่ server ของคุณ มันรัน server ให้, แสดง tool, resource และ prompt ทุกตัว และ log traffic ดิบของ protocol
 
 ```bash
-# Web UI กับ local stdio server
+# Web UI against a local stdio server
 npx @modelcontextprotocol/inspector node build/index.js
 
-# Web UI กับ remote server
+# Web UI against a remote server
 npx @modelcontextprotocol/inspector --server-url https://api.example.com/mcp --transport http
 
-# โหมด CLI สำหรับ script และ CI
+# CLI mode for scripts and CI
 npx @modelcontextprotocol/inspector --cli node build/index.js --method tools/list
 ```
 

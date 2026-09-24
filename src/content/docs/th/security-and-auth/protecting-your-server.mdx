@@ -67,7 +67,7 @@ SDK ทั้งสองตัวให้ของพวกนี้ได้�
 
     const mcpServerUrl = new URL('https://api.example.com/mcp');
 
-    // verifier ของคุณ: ตรวจ signature, วันหมดอายุ, audience แล้วคืน AuthInfo หรือ throw
+    // Your verifier: check signature, expiry, audience; return AuthInfo or throw.
     async function verifyAccessToken(token: string): Promise<AuthInfo> {
         const claims = await verifyJwt(token, { audience: mcpServerUrl.href });
         return { token, clientId: claims.client_id, scopes: claims.scope.split(' ') };
@@ -112,7 +112,7 @@ SDK ทั้งสองตัวให้ของพวกนี้ได้�
             try:
                 claims = verify_jwt(token, audience="https://api.example.com/mcp")
             except Exception:
-                return None  # signature ผิด, หมดอายุ, audience ผิด -> 401
+                return None  # invalid signature, expired, wrong audience -> 401
             return AccessToken(
                 token=token,
                 client_id=claims["client_id"],

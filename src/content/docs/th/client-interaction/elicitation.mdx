@@ -167,7 +167,7 @@ URL mode *ไม่ใช่* วิธีที่ client ใช้ authorize �
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    // Server: ถามจากภายใน tool handler
+    // Server: ask from inside a tool handler
     server.registerTool(
       'collect_feedback',
       { description: 'Ask how something went', inputSchema: z.object({ topic: z.string() }) },
@@ -191,13 +191,13 @@ URL mode *ไม่ใช่* วิธีที่ client ใช้ authorize �
       }
     );
 
-    // Client: ตอบ elicitation request ที่ SDK ดึงออกมาจาก inputRequests
+    // Client: answer elicitation requests the SDK surfaces from inputRequests
     client.setRequestHandler('elicitation/create', async (request) => {
       if (request.params.mode === 'url') {
-        // แสดง URL, ขอ consent, เปิดใน system browser
+        // show the URL, get consent, open it in the system browser
         return { action: 'accept' };
       }
-      // render request.params.requestedSchema เป็น form
+      // render request.params.requestedSchema as a form
       return { action: 'accept', content: { rating: 5, comment: 'great' } };
     });
     ```
@@ -220,7 +220,7 @@ URL mode *ไม่ใช่* วิธีที่ client ใช้ authorize �
         comment: str = ""
 
 
-    # Server: ถามจากภายใน tool handler
+    # Server: ask from inside a tool handler
     @mcp.tool()
     async def collect_feedback(topic: str, ctx: Context) -> str:
         result = await ctx.elicit(f"How was {topic}?", schema=Feedback)
@@ -229,9 +229,9 @@ URL mode *ไม่ใช่* วิธีที่ client ใช้ authorize �
         return f"Recorded: {result.data.rating}/5 {result.data.comment!r}"
 
 
-    # Client: callback ที่ตอบ elicitation input request
+    # Client: a callback that fulfils elicitation input requests
     async def on_elicit(context: ClientRequestContext, params: ElicitRequestParams) -> ElicitResult:
-        # render params.requested_schema เป็น form; ตรงนี้ตอบอัตโนมัติเพื่อเป็นตัวอย่าง
+        # render params.requested_schema as a form; here we auto-answer
         return ElicitResult(action="accept", content={"rating": 5, "comment": "great"})
 
 

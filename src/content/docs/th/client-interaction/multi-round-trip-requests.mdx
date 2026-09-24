@@ -164,8 +164,8 @@ value ใน `inputRequests` คือ request shape ปกติของ MCP �
       'provision_database',
       { description: 'Create a database', inputSchema: z.object({ name: z.string() }) },
       async ({ name }, ctx) => {
-        // ดูเหมือน synchronous บน wire จริง ๆ จะ return input_required
-        // แล้ว handler ถูกรันใหม่ตอน retry โดยมีคำตอบพร้อมแล้ว
+        // Looks synchronous. On the wire this returns input_required,
+        // and the handler is re-run on the retry with the answer available.
         const answer = await ctx.mcpReq.elicitInput({
           mode: 'form',
           message: `Which region should ${name} live in?`,
@@ -203,8 +203,8 @@ value ใน `inputRequests` คือ request shape ปกติของ MCP �
         return Elicit(f"Which region should {name} live in?", Region)
 
 
-    # parameter แบบ Resolve จะถูกเติมจาก inputResponses ตอน retry
-    # ตัว tool จะรันก็ต่อเมื่อคำตอบมาถึงแล้วเท่านั้น
+    # The Resolve parameter is filled from inputResponses on the retry.
+    # The tool body only runs once the answer is present.
     @mcp.tool()
     async def provision_database(
         name: str, where: Annotated[Region, Resolve(ask_region)]

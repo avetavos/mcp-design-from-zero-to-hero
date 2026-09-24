@@ -138,7 +138,7 @@ resource, template และ content block ใช้ annotation รูปแบ�
 
     const server = new McpServer({ name: 'repos', version: '1.0.0' });
 
-    // resource แบบตายตัว
+    // A fixed resource
     server.registerResource(
       'guidelines',
       'docs://guidelines',
@@ -148,7 +148,7 @@ resource, template และ content block ใช้ annotation รูปแบ�
       }),
     );
 
-    // template พร้อม completion สำหรับตัวแปร {repo}
+    // A template with completion for the {repo} variable
     server.registerResource(
       'readme',
       new ResourceTemplate('repo://{repo}/readme', {
@@ -162,7 +162,7 @@ resource, template และ content block ใช้ annotation รูปแบ�
       }),
       { description: 'The README of one repository' },
       async (uri, { repo }) => ({
-        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: await readReadme(repo) }],
+        contents: [{ uri: uri.href, mimeType: 'text/markdown', text: await readReadme(Array.isArray(repo) ? repo[0] : repo) }],
       }),
     );
     ```

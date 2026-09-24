@@ -171,7 +171,7 @@ result ของ MCP คือ array `content` ของ block (`text`, `image`,
             return toToolResult(use.id, result);
           }),
         );
-        messages.push({ role: 'user', content: results }); // ผลลัพธ์ทั้งหมด ใน message เดียว
+        messages.push({ role: 'user', content: results }); // all results, one message
       }
     }
     ```
@@ -180,13 +180,13 @@ result ของ MCP คือ array `content` ของ block (`text`, `image`,
     ```python
     import anthropic
 
-    client = anthropic.Anthropic()
+    client = anthropic.AsyncAnthropic()
 
     async def run_agent(user_text: str, tools: list[dict]):
         messages = [{"role": "user", "content": user_text}]
 
         while True:
-            response = client.messages.create(
+            response = await client.messages.create(
                 model="claude-opus-5",
                 max_tokens=16000,
                 tools=tools,
@@ -209,7 +209,7 @@ result ของ MCP คือ array `content` ของ block (`text`, `image`,
                 result = await mcp_client.call_tool(tool_name, dict(block.input))
                 results.append(to_tool_result(block.id, result))
 
-            messages.append({"role": "user", "content": results})  # ผลลัพธ์ทั้งหมด ใน message เดียว
+            messages.append({"role": "user", "content": results})  # all results, one message
     ```
   </TabItem>
 </Tabs>

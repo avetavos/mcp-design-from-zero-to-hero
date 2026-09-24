@@ -72,7 +72,7 @@ sampling ให้ *server* ขอ completion จาก LLM ของ *host* —
     ```ts
     import Anthropic from '@anthropic-ai/sdk';
 
-    const anthropic = new Anthropic(); // อ่าน ANTHROPIC_API_KEY จาก environment
+    const anthropic = new Anthropic(); // reads ANTHROPIC_API_KEY from the environment
 
     async function summarize(text: string): Promise<string> {
       const msg = await anthropic.messages.create({
@@ -99,7 +99,7 @@ sampling ให้ *server* ขอ completion จาก LLM ของ *host* —
     from mcp.server import MCPServer
 
     mcp = MCPServer("changelog")
-    client = anthropic.Anthropic()  # อ่าน ANTHROPIC_API_KEY จาก environment
+    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
 
 
     @mcp.tool()
@@ -188,7 +188,7 @@ server **ต้องไม่** ส่ง `notifications/message` ให้ req
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    // stdio server: log ไป stderr ห้ามลง stdout
+    // stdio server: logs go to stderr, never stdout
     console.error(JSON.stringify({ level: 'info', msg: 'import started', files: urls.length }));
     ```
   </TabItem>
@@ -197,7 +197,7 @@ server **ต้องไม่** ส่ง `notifications/message` ให้ req
     import logging
     import sys
 
-    # stdio server: ตั้ง root logger ให้ไป stderr ครั้งเดียวตอน startup
+    # stdio server: configure the root logger to stderr once, at startup
     logging.basicConfig(stream=sys.stderr, level=logging.INFO)
     logging.getLogger("catalog").info("import started: %d files", len(urls))
     ```
